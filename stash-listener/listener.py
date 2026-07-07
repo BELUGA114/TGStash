@@ -25,6 +25,7 @@ import re
 import sys
 import time
 import traceback
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -49,6 +50,8 @@ SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 # 每次上传文件后等待的秒数，降低 Telegram 服务端感知频率
 UPLOAD_COOLDOWN_SECONDS = int(os.environ.get("UPLOAD_COOLDOWN_SECONDS", "5"))
+HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
+
 SESSION_DIR = "/data/session"
 DB_PATH = "/data/db/archive.db"
 DOWNLOAD_DIR = "/data/tmp/listener"
@@ -58,7 +61,13 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 db = ArchiveDB(DB_PATH)
-app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR)
+
+if HTTP_PROXY:
+    u = urlparse(HTTP_PROXY)
+    app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
+                 proxy=dict(scheme=u.scheme, hostname=u.hostname, port=u.port))
+else:
+    app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR)
 # 并发下载数上限，MTProto 单连接慢，2 个并行可有效提速
 _dl_sem = asyncio.Semaphore(2)
 
@@ -166,18 +175,16 @@ def parse_message_link(link: str) -> tuple[str, int]:
 
 
 async def mark_processed(message: Message, duplicate: bool):
-    """把原消息 caption 前面加处理标记，媒体本身不动"""
+    """回复原消息标记处理状态（转发的消息无法编辑，用回复形式）"""
     chat = message.chat
     if chat is None:
         return
-    assert chat.id is not None  # 频道消息一定有 id
-    prefix = "✅ 已归档（重复，未重新上传）" if duplicate else "✅ 已归档"
-    original = message.caption or ""
-    new_caption = f"{prefix}\n{original}" if original else prefix
+    assert chat.id is not None
+    text = "✅ 已归档（重复）" if duplicate else "✅ 已归档"
     try:
-        await app.edit_message_caption(chat.id, message.id, new_caption[:1024])  # Telegram caption 上限 1024 字符
+        await app.send_message(chat.id, text, reply_to_message_id=message.id)
     except Exception:
-        pass  # 转发的消息无法编辑 caption（Telegram 限制，非 bug）
+        pass
 
 
 async def archive_single(message: Message, *, mark: bool = True) -> bool:

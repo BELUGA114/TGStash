@@ -1,0 +1,35 @@
+# 生产部署
+services:
+  stash-listener:
+    image: ghcr.io/BELUGA114/TGStash:latest
+    container_name: stash-listener
+    network_mode: "host"
+    restart: unless-stopped
+    environment:
+      - TG_API_ID
+      - TG_API_HASH
+      - RECEIVE_CHAT_ID
+      - ARCHIVE_CHAT_ID
+      - HTTP_PROXY
+      - SCAN_INTERVAL_SECONDS=300
+      - BATCH_SIZE=10
+      - UPLOAD_COOLDOWN_SECONDS=5
+    volumes:
+      - /data/TGStash/session:/data/session
+      - /data/TGStash/db:/data/db
+      - /data/TGStash/tmp:/data/tmp
+
+  tdl-sync:
+    image: ghcr.io/BELUGA114/TGStash-tdl:latest
+    network_mode: "host"
+    environment:
+      - TG_API_ID
+      - TG_API_HASH
+      - ARCHIVE_CHAT_ID
+      - HTTP_PROXY
+    volumes:
+      - /data/TGStash/tdl-session:/root/.tdl
+      - /data/TGStash/db:/data/db
+      - /data/TGStash/tmp:/data/tmp
+    profiles:
+      - manual
