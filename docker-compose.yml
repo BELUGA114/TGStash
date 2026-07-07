@@ -1,0 +1,20 @@
+services:
+  stash-listener:
+    build: ./stash-listener
+    container_name: stash-listener
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data/session:/data/session   # Kurigram 的登录 session
+      - ./data/db:/data/db             # 共享 SQLite（跟 tdl-sync 共用）
+      - ./data/tmp:/data/tmp           # 下载临时目录，处理完就删
+
+  tdl-sync:
+    build: ./tdl-sync
+    container_name: tdl-sync
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data/tdl-session:/root/.tdl  # tdl 自己的登录 session，跟上面完全独立
+      - ./data/db:/data/db             # 共享同一个 SQLite 文件
+      - ./data/tmp:/data/tmp
