@@ -1,3 +1,4 @@
+# 本地开发：docker compose build && docker compose up -d
 services:
   stash-listener:
     build: ./stash-listener
@@ -5,12 +6,10 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data/session:/data/session   # Kurigram 登录 session
-      - ./data/db:/data/db             # SQLite
-      - ./data/tmp:/data/tmp           # 下载临时目录，处理完就删
+      - ./data/session:/data/session
+      - ./data/db:/data/db
+      - ./data/tmp:/data/tmp
 
-  # 备用：Pyrogram 无法覆盖的场景（如批量回溯整个频道的时间窗口导出）
-  # 使用：docker compose run --rm tdl-sync tdl -n archiver <命令>
   tdl-sync:
     build: ./tdl-sync
     env_file: .env
