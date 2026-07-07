@@ -1,0 +1,75 @@
+name: Docker Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        service:
+          - context: ./stash-listener
+            suffix: ""
+          - context: ./tdl-sync
+            suffix: "-tdl"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}${{ matrix.service.suffix }}
+          flavor: |
+            latest=true
+          tags: |
+            type=raw,value=latest
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract tag message
+        run: |
+          git fetch --tags --force
+          MSG=$(git for-each-ref --format='%(contents)' refs/tags/${{ github.ref_name }})
+          echo "TAG_MESSAGE<<EOF" >> $GITHUB_ENV
+          echo "$MSG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ env.TAG_MESSAGE }}
+          tag_name: ${{ github.ref_name }}

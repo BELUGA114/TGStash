@@ -110,4 +110,5 @@ TGStash/
 ```bash
 docker compose logs -f stash-listener
 docker compose restart stash-listener
+docker compose build; if ($?) { docker compose up -d }
 ```
