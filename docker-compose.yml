@@ -5,16 +5,18 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data/session:/data/session   # Kurigram 的登录 session
-      - ./data/db:/data/db             # 共享 SQLite（跟 tdl-sync 共用）
+      - ./data/session:/data/session   # Kurigram 登录 session
+      - ./data/db:/data/db             # SQLite
       - ./data/tmp:/data/tmp           # 下载临时目录，处理完就删
 
+  # 备用：Pyrogram 无法覆盖的场景（如批量回溯整个频道的时间窗口导出）
+  # 使用：docker compose run --rm tdl-sync tdl -n archiver <命令>
   tdl-sync:
     build: ./tdl-sync
-    container_name: tdl-sync
-    restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data/tdl-session:/root/.tdl  # tdl 自己的登录 session，跟上面完全独立
-      - ./data/db:/data/db             # 共享同一个 SQLite 文件
+      - ./data/tdl-session:/root/.tdl
+      - ./data/db:/data/db
       - ./data/tmp:/data/tmp
+    profiles:
+      - manual

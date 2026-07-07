@@ -11,4 +11,4 @@ COPY --from=tdl /usr/bin/tdl /usr/local/bin/tdl
 WORKDIR /app
 COPY db.py archiver.py ./
 
-CMD ["python", "archiver.py"]
+ENTRYPOINT ["python", "archiver.py"]
