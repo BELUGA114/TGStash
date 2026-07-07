@@ -31,9 +31,13 @@ from db import ArchiveDB
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
-RECEIVE_CHAT = os.environ["RECEIVE_CHAT_ID"]
-ARCHIVE_CHAT = os.environ["ARCHIVE_CHAT_ID"]
+RECEIVE_CHAT = int(os.environ["RECEIVE_CHAT_ID"])
+ARCHIVE_CHAT = int(os.environ["ARCHIVE_CHAT_ID"])
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
+# 每轮最多处理的消息数。宁可慢不可冒险——账号比速度重要
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
+# 每次上传文件后等待的秒数，降低 Telegram 服务端感知频率
+UPLOAD_COOLDOWN_SECONDS = int(os.environ.get("UPLOAD_COOLDOWN_SECONDS", "5"))
 
 SESSION_DIR = "/data/session"
 DB_PATH = "/data/db/archive.db"
@@ -167,6 +171,7 @@ async def archive_single(message: Message):
             archived_message_id=sent.id,
         )
         await mark_processed(message, duplicate=False)
+        await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
@@ -244,6 +249,8 @@ async def archive_group(messages: list[Message]):
                     archived_message_id=sent.id,
                 )
 
+        if to_upload:
+            await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
         for message in new_messages:
             await archive_single(message)
         for item in to_upload:
@@ -267,7 +274,14 @@ async def scan_once():
     if not new_messages:
         return
 
+    total = len(new_messages)
+    # 限制每轮处理量，剩余留给下轮，避免短时间大量上传触发 Telegram 风控
+    if total > BATCH_SIZE:
+        new_messages = new_messages[:BATCH_SIZE]
+        print(f"[listener] 待处理 {total} 条，本轮处理 {BATCH_SIZE} 条，剩余 {total - BATCH_SIZE} 条下轮继续")
+
     handled_groups = set()
+    processed = 0
     for msg in new_messages:
         if msg.media_group_id:
             if msg.media_group_id in handled_groups:
@@ -278,13 +292,18 @@ async def scan_once():
             await archive_group(group)
             handled_groups.add(msg.media_group_id)
             db.set_checkpoint(RECEIVE_CHAT, max(m.id for m in group))
+            processed += len(group)
             continue
 
         kind, _ = get_media(msg)
         if kind:
             await archive_single(msg)
+            processed += 1
         # 非媒体消息（纯文本等）不归档，但依然推进 checkpoint，避免反复扫描
         db.set_checkpoint(RECEIVE_CHAT, msg.id)
+
+    if processed:
+        print(f"[listener] 本轮完成：处理 {processed} 条消息")
 
 
 async def main():
