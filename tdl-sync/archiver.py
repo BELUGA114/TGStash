@@ -1,35 +1,24 @@
 """
-路径二：重点（含禁止转发）频道 -> tdl 批量导出/下载 -> 去重 -> tdl up 到私有备份频道
+路径二：手动备份禁止转发的消息
 
-跟路径一是完全独立的 checkpoint 和独立的 tdl session，用时间窗口而不是消息 id
-做增量：每个频道记录 last_run_at，每轮处理 [last_run_at, 现在] 这个区间，
-成功后把 last_run_at 推进到这一轮的结束时间。
+用法：python archiver.py <消息链接>
 
-首次跑某个频道时（last_run_at 为空）只回溯 INITIAL_BACKFILL_DAYS 天，
-不会從频道第一条消息开始全量导出。
+支持两种 t.me 链接格式：
+  https://t.me/<username>/<msg_id>      公开用户名
+  https://t.me/c/<channel_id>/<msg_id>  私有频道（需已加入）
 
-已知的简化 / 后续可以增强的点：
-  - 这条路径没有拿到 Telegram 的 file_unique_id（tdl 的导出 JSON 没有解析），
-    去重完全靠下载后的 SHA-256，够用但比路径一的双层去重弱一点
-  - caption / 发送者这些元数据这一版没有回填（tdl 的导出 JSON 结构没有解析），
-    messages 表里这条路径的记录 caption 是空的，全文搜索搜不到这部分内容，
-    只能按文件名/来源频道定位；想要更完整的元数据可以在这基础上加一个
-    用 Kurigram 读 get_messages(chat, message_id) 回填的步骤
+流程：解析链接 → tdl 导出单条消息 → 下载媒体 → SHA-256 去重 → 上传备份频道 → 写 DB
 """
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
-import time
-from datetime import datetime, timezone
 
 from db import ArchiveDB
 
 ARCHIVE_CHAT = os.environ["ARCHIVE_CHAT_ID"]
-PRIORITY_CHANNELS = [c.strip() for c in os.environ.get("PRIORITY_CHANNELS", "").split(",") if c.strip()]
-SCAN_INTERVAL_SECONDS = int(os.environ.get("TDL_SCAN_INTERVAL_HOURS", "6")) * 3600
-INITIAL_BACKFILL_DAYS = int(os.environ.get("INITIAL_BACKFILL_DAYS", "30"))
 TDL_NAMESPACE = os.environ.get("TDL_NAMESPACE", "archiver")
 
 DB_PATH = "/data/db/archive.db"
@@ -57,46 +46,64 @@ def sha256_of_file(path: str) -> str:
     return h.hexdigest()
 
 
-def process_channel(chat: str):
-    last_run_iso = db.get_last_run(chat)
-    if last_run_iso is None:
-        start_ts = int(time.time()) - INITIAL_BACKFILL_DAYS * 86400
-    else:
-        start_ts = int(datetime.fromisoformat(last_run_iso).timestamp())
-    end_ts = int(time.time())
+def parse_message_link(link: str) -> tuple[str, int]:
+    """解析 t.me 链接，返回 (chat_identifier, message_id)
 
-    # 时间窗口太短时跳过：tdl 的时间过滤在窗口边界附近可能漏消息，
-    # 留 60 秒最小间隔保证每次导出有足够的覆盖
-    if end_ts - start_ts < 60:
-        return
+    https://t.me/username/123    → ("@username", 123)
+    https://t.me/c/123456/123    → ("-100123456", 123)
+    """
+    link = link.strip().split("?")[0].rstrip("/")
 
-    chat_workdir = os.path.join(WORK_DIR, chat.replace("/", "_").replace("@", ""))
-    download_dir = os.path.join(chat_workdir, "downloads")
-    export_path = os.path.join(chat_workdir, "export.json")
+    # 私有频道：t.me/c/<channel_id>/<msg_id>
+    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)$", link)
+    if m:
+        return (f"-100{m.group(1)}", int(m.group(2)))
+
+    # 公开用户名：t.me/<username>/<msg_id>
+    m = re.match(r"https?://t\.me/([^/]+)/(\d+)$", link)
+    if m:
+        return (f"@{m.group(1)}", int(m.group(2)))
+
+    raise ValueError(f"无法解析链接：{link}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法：python archiver.py <消息链接>")
+        sys.exit(1)
+
+    link = sys.argv[1]
+    chat, message_id = parse_message_link(link)
+
+    db.ensure_channel(chat, "tdl_bulk")
+
+    chat_slug = chat.replace("/", "_").replace("@", "")
+    export_path = os.path.join(WORK_DIR, f"{chat_slug}_{message_id}.json")
+    download_dir = os.path.join(WORK_DIR, chat_slug, str(message_id))
     os.makedirs(download_dir, exist_ok=True)
 
-    print(f"[{chat}] 导出 {start_ts} -> {end_ts}（{(end_ts - start_ts) // 3600} 小时）")
+    # 按消息 ID 导出单条消息的 JSON
+    print(f"导出 {chat}/{message_id}")
     run_tdl(
-        "chat", "export", "-c", chat, "-T", "time",
-        "-i", f"{start_ts},{end_ts}", "-o", export_path,
+        "chat", "export", "-c", chat, "-T", "id",
+        "-i", str(message_id), "-o", export_path,
     )
 
-    print(f"[{chat}] 下载媒体")
+    # 下载导出结果中的媒体文件
+    print("下载媒体")
     run_tdl(
         "dl", "-f", export_path, "-d", download_dir,
         "--skip-same", "--continue",
         "--template", "{{.MessageID}}_{{.FileName}}",
     )
 
+    # 去重 → 上传 → 记录
     new_count, dup_count = 0, 0
     for fname in sorted(os.listdir(download_dir)):
         fpath = os.path.join(download_dir, fname)
         if not os.path.isfile(fpath):
             continue
 
-        # 文件命名模板是 {{.MessageID}}_{{.FileName}}，
-        # 用第一个下划线分割就能取出 message_id
-        message_id = fname.split("_", 1)[0]
         sha256 = sha256_of_file(fpath)
         size = os.path.getsize(fpath)
 
@@ -105,10 +112,10 @@ def process_channel(chat: str):
             os.remove(fpath)
             continue
 
-        print(f"[{chat}] 上传新文件 {fname}")
+        print(f"上传 {fname}")
         run_tdl("up", "-p", fpath, "-c", ARCHIVE_CHAT)
 
-        # 这条路径拿不到真正的 Telegram file_unique_id，用 chat+message_id+哈希
+        # tdl 拿不到真正的 Telegram file_unique_id，用 chat+message_id+哈希
         # 拼一个稳定且唯一的替代 key，跟路径一的真实 file_unique_id 共用同一张去重表
         synthetic_id = f"tdl:{chat}:{message_id}:{sha256[:16]}"
 
@@ -123,7 +130,7 @@ def process_channel(chat: str):
         )
         db.record_message(
             source_chat_id=chat,
-            source_message_id=int(message_id) if message_id.isdigit() else None,
+            source_message_id=message_id,
             source_channel_title=chat,
             caption=None,
             file_unique_id=synthetic_id,
@@ -132,26 +139,13 @@ def process_channel(chat: str):
         new_count += 1
         os.remove(fpath)
 
-    db.set_last_run(chat, datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat())
-    print(f"[{chat}] 完成：新增 {new_count}，重复跳过 {dup_count}")
-
-
-def main():
-    for chat in PRIORITY_CHANNELS:
-        db.ensure_channel(chat, "tdl_bulk")
-
-    print(f"[tdl-sync] 监控频道：{PRIORITY_CHANNELS}，每 {SCAN_INTERVAL_SECONDS}s 跑一轮")
-    while True:
-        for chat in PRIORITY_CHANNELS:
-            try:
-                process_channel(chat)
-            except Exception as e:
-                print(f"[{chat}] 出错，本轮跳过，下轮重试：{e}", file=sys.stderr)
-        time.sleep(SCAN_INTERVAL_SECONDS)
+    if new_count:
+        print(f"完成：新增 {new_count} 个文件")
+    elif dup_count:
+        print(f"已完成：{dup_count} 个文件已存在，跳过")
+    else:
+        print("这条消息没有可下载的媒体文件")
 
 
 if __name__ == "__main__":
-    if not PRIORITY_CHANNELS:
-        print("未配置 PRIORITY_CHANNELS，退出", file=sys.stderr)
-        sys.exit(1)
     main()

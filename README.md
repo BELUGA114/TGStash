@@ -1,18 +1,20 @@
 # Telegram 个人归档系统
 
-把 Telegram 上的媒体文件自动归档到私有备份频道，支持全文搜索。两条采集路径覆盖不同的使用场景。
+把 Telegram 上的媒体文件归档到私有备份频道，支持全文搜索。
 
-- **路径一（手动转发）**：转发到"接收频道" → 自动下载、去重、上传到"私有备份频道"，原消息打上 `✅ 已归档` 标记
-- **路径二（禁止转发频道）**：`tdl` 定时批量导出 → 下载、去重、上传到同一个私有备份频道
+- **路径一（转发媒体）**：转发到接收频道 → 自动下载、去重、上传到备份频道，原消息打上 `✅ 已归档`
+- **路径二（转发链接）**：禁止转发的消息，复制链接发到接收频道 → 自动下载、去重、上传
+
+两条路径共享同一套去重管道（file_unique_id + SHA-256），路径二自动处理媒体组。
 
 ## 准备工作
 
 1. 去 <https://my.telegram.org> 申请 `api_id` / `api_hash`
 2. 建两个频道：
-   - **接收频道**：手动转发内容进来的地方
+   - **接收频道**：转发内容和链接进来的地方
    - **私有备份频道**：最终归档存放的地方
-3. 把闲置账号加进这两个频道，都设为**管理员**（接收频道需要管理员权限才能编辑别人转发的消息；备份频道需要权限才能发消息）
-4. 把"禁止转发重点频道"也加进去（只需要普通成员权限，能看到消息即可）
+3. 把闲置账号加进这两个频道，都设为**管理员**
+4. 路径二的频道也加进去（只需要普通成员权限）
 
 ## 部署
 
@@ -24,30 +26,69 @@ cp .env.example .env
 # 2. 构建
 docker compose build
 
-# 3. 登录（两个服务各自一次）
-#    路径一：交互式输入手机号 + 验证码
+# 3. 登录（交互式输入手机号 + 验证码）
 docker compose run --rm stash-listener python login.py
-#    路径二：二选一
-docker compose run --rm tdl-sync tdl -n archiver login -T code   # 验证码登录
-docker compose run --rm tdl-sync tdl -n archiver login -T qr     # 二维码登录
 
-# 4. 获取频道 ID
-docker compose run --rm tdl-sync tdl -n archiver chat ls
+# 4. 获取频道 ID（登录后运行）
+docker compose run --rm stash-listener python -c "
+import os, asyncio
+from pyrogram import Client
+API_ID = int(os.environ['TG_API_ID'])
+API_HASH = os.environ['TG_API_HASH']
+async def main():
+    app = Client('listener', api_id=API_ID, api_hash=API_HASH, workdir='/data/session')
+    async with app:
+        async for d in app.get_dialogs():
+            if d.chat.id < 0:
+                print(f'{d.chat.id}  {d.chat.title}')
+asyncio.run(main())
+"
 
-# 5. 把频道 ID 填回 .env（RECEIVE_CHAT_ID / ARCHIVE_CHAT_ID / PRIORITY_CHANNELS）
+# 5. 把接收频道和备份频道的 ID 填回 .env（RECEIVE_CHAT_ID / ARCHIVE_CHAT_ID）
 
 # 6. 启动
 docker compose up -d
 docker compose logs -f
 ```
 
-## 搜索归档
+## 使用
+
+### 路径一：转发媒体
+
+往接收频道转发带媒体的消息，等待扫描间隔后自动归档，原消息打上 `✅ 已归档`。
+
+### 路径二：转发链接
+
+禁止转发的消息 → 复制链接 → 把链接作为文本发到接收频道。支持两种格式：
+
+```
+https://t.me/username/123       公开用户名
+https://t.me/c/123456/123       私有频道
+```
+
+自动处理媒体组——链接指向相册中的某张照片时，整组一起归档，各自 caption 保留。原链接消息打上 `✅ 已归档`。
+
+## 搜索
 
 ```bash
 docker compose exec stash-listener python search.py 关键词
 ```
 
-搜索基于 SQLite FTS5 + trigram 分词器，**关键词至少 3 个字符**（2 字词搜不到）。trigram 是对中文的折中方案——SQLite 默认分词器依赖空格分词，对中文无效。
+FTS5 + trigram 分词器，**关键词至少 3 个字符**。
+
+## 备用工具
+
+`tdl-sync` 容器保留用于 Pyrogram 无法覆盖的特殊场景（如按时间窗口批量导出整个频道）：
+
+```bash
+# 先登录一次
+docker compose run --rm tdl-sync tdl -n archiver login -T qr
+
+# 列出对话
+docker compose run --rm tdl-sync tdl -n archiver chat ls
+```
+
+`tdl-sync` 不会随 `docker compose up` 自动启动，需要时用 `docker compose run --rm` 手动执行。
 
 ## 目录结构
 
@@ -55,33 +96,18 @@ docker compose exec stash-listener python search.py 关键词
 TGStash/
 ├── .env                  # 配置文件
 ├── docker-compose.yml
-├── stash-listener/       # 路径一
-├── tdl-sync/             # 路径二
-└── data/                 # 运行时数据（挂载到容器）
+├── stash-listener/       # 主服务（路径一 + 路径二）
+├── tdl-sync/             # 备用工具
+└── data/                 # 运行时数据
     ├── session/          #   Kurigram 登录 session
-    ├── tdl-session/      #   tdl 登录 session
     ├── db/
     │   └── archive.db    #   共享数据库（唯一需要备份的文件）
-    └── tmp/              #   下载临时目录，处理完自动清空
+    └── tmp/              #   临时目录，处理完自动清空
 ```
 
-`data/db/archive.db` 是唯一需要长期备份的文件。它不是归档本体（本体是私有备份频道里的消息），但丢了这个库会失去去重能力和全文索引，需要重新扫描才能重建。
-
-## 已知限制
-
-- **路径二缺少元数据**：tdl 导出 JSON 未解析，`messages` 表里路径二的记录搜不到 caption 和发送者，只能按文件名和来源频道定位。后续可以用 Kurigram 的 `get_messages()` 回填
-- **全文搜索是 FTS5**：内容多了想要更好的中文分词可以接入 Meilisearch，`messages` 表数据直接同步，不用改采集逻辑
-
-## 运维命令
+## 运维
 
 ```bash
-# 看日志
 docker compose logs -f stash-listener
-docker compose logs -f tdl-sync
-
-# 重启服务
 docker compose restart stash-listener
-
-# 排查 tdl 问题
-docker compose run --rm tdl-sync tdl -n archiver chat ls
 ```

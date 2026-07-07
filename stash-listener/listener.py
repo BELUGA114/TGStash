@@ -1,24 +1,35 @@
 """
-路径一：手动转发 -> 接收频道 -> 定时批量脚本 -> 私有备份频道
+两条路径共享同一个接收频道，每 SCAN_INTERVAL_SECONDS 扫描一次：
 
-每 SCAN_INTERVAL_SECONDS 跑一次：
-  1. 用 min_id + reverse=True 拉取接收频道里 checkpoint 之后的新消息（旧到新）
-  2. media_group 的消息整组一起处理，单条消息单独处理
-  3. 先查 file_unique_id，命中直接判重；没命中就下载后算 SHA-256 再查一次
-  4. 新文件：上传到私有备份频道，写 files + messages 两张表
-     重复文件：跳过上传，只记录
-  5. 不论新旧，原消息 caption 前面都加 "✅ 已归档" 或 "✅ 已归档（重复）" 标记
-  6. 每处理完一条就把 checkpoint 推进到这条消息的 id，异常时中断，
-     下次从上一个成功的 checkpoint 继续，不会漏也不会重复归档
+路径一（转发媒体）：
+  1. min_id + reverse=True 拉取 checkpoint 之后的新消息（旧到新）
+  2. media_group 整组处理，单条单独处理
+  3. file_unique_id 判重（快速通道）→ 下载 → SHA-256 判重（精确通道）
+  4. 新文件上传备份频道 + 写 DB，重复文件跳过上传只记录
+  5. 原消息 caption 加 "✅ 已归档" 标记
+  6. 每处理完一条推进 checkpoint，异常中断下次从成功处继续
+
+路径二（转发 t.me 链接）：
+  1. 检测文本消息中的 t.me 链接
+  2. parse_message_link() 解析出 chat + message_id
+  3. Pyrogram get_messages() 获取消息（你是成员，可直接下载）
+  4. 媒体组 → get_media_group() 整组处理；单条 → archive_single()
+  5. 复用路径一的 file_unique_id/SHA-256 双层去重 → 上传 → 写 DB
+  6. 原消息编辑为 "✅ 已归档"
 """
 
 import asyncio
 import hashlib
 import os
+import re
 import sys
+import time
 import traceback
 
+from PIL import Image
+
 from pyrogram.client import Client
+from pyrogram.errors import PhotoExtInvalid
 from pyrogram.types import (
     Message,
     InputMediaPhoto,
@@ -38,7 +49,6 @@ SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 # 每次上传文件后等待的秒数，降低 Telegram 服务端感知频率
 UPLOAD_COOLDOWN_SECONDS = int(os.environ.get("UPLOAD_COOLDOWN_SECONDS", "5"))
-
 SESSION_DIR = "/data/session"
 DB_PATH = "/data/db/archive.db"
 DOWNLOAD_DIR = "/data/tmp/listener"
@@ -88,12 +98,69 @@ def sha256_of_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _fix_media_format(path: str, kind: str | None) -> str:
+    """下载后的文件格式可能与 Telegram 声称的类型不匹配。
+
+    - WebP/PNG/GIF → 转 JPEG，保证 Telegram 内联展示
+    - 无后缀文件 → 检测格式后补上后缀
+    - 非 photo 类型 → 原样返回"""
+    if kind != "photo":
+        return path
+    try:
+        with Image.open(path) as img:
+            fmt = img.format  # 'JPEG', 'WEBP', 'PNG', 'GIF', etc.
+            ext = os.path.splitext(path)[1]
+
+            # 非 JPEG 格式统一转为 JPEG，Telegram 才能内联显示
+            if fmt in ("WEBP", "PNG", "GIF"):
+                new_path = path + ".jpg"
+                if img.mode in ("RGBA", "P", "PA"):
+                    img = img.convert("RGB")
+                img.save(new_path, "JPEG", quality=95)
+                os.remove(path)
+                print(f"  └─ 格式转换 {fmt} → JPEG")
+                return new_path
+
+            # 本身就是 JPEG 但文件没有后缀，补上
+            if fmt == "JPEG" and not ext:
+                new_path = path + ".jpg"
+                os.rename(path, new_path)
+                print(f"  └─ 补后缀 {fmt}")
+                return new_path
+
+            # 其他图片格式但无后缀，统一加 .jpg
+            if not ext:
+                new_path = path + ".jpg"
+                os.rename(path, new_path)
+                print(f"  └─ 补后缀 {fmt or '未知'}")
+                return new_path
+    except Exception:
+        pass
+    return path
+
+
 def sender_name(message: Message) -> str:
     if message.from_user:
         return message.from_user.first_name or str(message.from_user.id)
     if message.sender_chat:
         return message.sender_chat.title or str(message.sender_chat.id)
     return ""
+
+
+def parse_message_link(link: str) -> tuple[str, int]:
+    """解析 t.me 链接，返回 (chat_identifier, message_id)
+
+    https://t.me/username/123    → ("@username", 123)
+    https://t.me/c/123456/123    → ("-100123456", 123)
+    """
+    link = link.strip().split("?")[0].rstrip("/")
+    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)$", link)
+    if m:
+        return (f"-100{m.group(1)}", int(m.group(2)))
+    m = re.match(r"https?://t\.me/([^/]+)/(\d+)$", link)
+    if m:
+        return (f"@{m.group(1)}", int(m.group(2)))
+    raise ValueError(f"无法解析链接：{link}")
 
 
 async def mark_processed(message: Message, duplicate: bool):
@@ -107,27 +174,41 @@ async def mark_processed(message: Message, duplicate: bool):
     new_caption = f"{prefix}\n{original}" if original else prefix
     try:
         await app.edit_message_caption(chat.id, message.id, new_caption[:1024])  # Telegram caption 上限 1024 字符
-    except Exception as e:
-        print(f"[warn] 编辑消息 {message.id} 的 caption 失败（可能是纯文本消息或权限问题）：{e}")
+    except Exception:
+        pass  # 转发的消息无法编辑 caption（Telegram 限制，非 bug）
 
 
-async def archive_single(message: Message):
+async def archive_single(message: Message, *, mark: bool = True) -> bool:
+    """处理单条媒体消息。返回 True 表示成功（含跳过重复），False 表示需下轮重试。"""
     kind, media = get_media(message)
     if not media:
-        return
+        return True
 
     file_unique_id = media.file_unique_id
 
     if db.find_by_unique_id(file_unique_id):
-        await mark_processed(message, duplicate=True)
-        return
+        if mark:
+            await mark_processed(message, duplicate=True)
+        print(f"  └─ 跳过重复 {message.id} ({kind})")
+        return True
 
-    # file_name 末尾的下划线是故意的：Pyrogram 会自动补扩展名，
-    # 用 message.id 前缀 + 下划线可以避免它猜错扩展名
-    local_path = await app.download_media(message=message, file_name=os.path.join(DOWNLOAD_DIR, f"{message.id}_"))  # type: ignore[call-overload]
+    # 每条消息下载到独立子目录，文件名保持原名（上传时不会带 num_ 前缀）
+    msg_dir = os.path.join(DOWNLOAD_DIR, str(message.id))
+    os.makedirs(msg_dir, exist_ok=True)
+    orig_name = getattr(media, "file_name", None)
+    dl_name = orig_name or f"{message.id}_"
+    try:
+        local_path = await app.download_media(message=message, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
+    except Exception:
+        # 下载失败不推进 checkpoint，下轮重试
+        print(f"[warn] 下载 {message.id} 失败，下轮重试", file=sys.stderr)
+        return False
     try:
         sha256 = sha256_of_file(local_path)
         size = os.path.getsize(local_path)
+
+        # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
+        local_path = _fix_media_format(local_path, kind)
 
         dup = db.find_by_sha256(sha256)
         if dup:
@@ -140,14 +221,20 @@ async def archive_single(message: Message):
                 source="manual_forward",
                 source_channel=RECEIVE_CHAT,
             )
-            await mark_processed(message, duplicate=True)
-            return
+            if mark:
+                await mark_processed(message, duplicate=True)
+            return True
 
         caption = message.caption or ""
         if kind is None:
-            return
+            return True
         send = getattr(app, SEND_METHOD[kind])
-        sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+        try:
+            sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+        except PhotoExtInvalid:
+            # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
+            sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+        assert sent is not None and sent.id is not None
 
         db.record_file(
             file_unique_id=file_unique_id,
@@ -170,14 +257,23 @@ async def archive_single(message: Message):
             archived_chat_id=ARCHIVE_CHAT,
             archived_message_id=sent.id,
         )
-        await mark_processed(message, duplicate=False)
+        if mark:
+            await mark_processed(message, duplicate=False)
+        print(f"  └─ 归档 {message.id} ({kind})")
         await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
+            # 清理空子目录
+            try:
+                os.rmdir(os.path.dirname(local_path))
+            except OSError:
+                pass
+
+    return True
 
 
-async def archive_group(messages: list[Message]):
+async def archive_group(messages: list[Message], *, mark: bool = True):
     """媒体组：整组一起下载、按顺序打包成一条 send_media_group 上传，保持相册形态"""
     to_upload: list[tuple] = []
     dup_messages = []
@@ -193,11 +289,22 @@ async def archive_group(messages: list[Message]):
                 dup_messages.append(message)
                 continue
 
-            # file_name 末尾的下划线是故意的：Pyrogram 会自动补扩展名
-            local_path = await app.download_media(message=message, file_name=os.path.join(DOWNLOAD_DIR, f"{message.id}_"))  # type: ignore[call-overload]
+            msg_dir = os.path.join(DOWNLOAD_DIR, str(message.id))
+            os.makedirs(msg_dir, exist_ok=True)
+            orig_name = getattr(media, "file_name", None)
+            dl_name = orig_name or f"{message.id}_"
+            try:
+                local_path = await app.download_media(message=message, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
+            except Exception:
+                # 单文件下载失败（超时/网络问题）跳过该文件，不阻塞整组
+                print(f"[warn] 下载 {message.id} 失败，跳过", file=sys.stderr)
+                continue
             local_paths.append(local_path)
             sha256 = sha256_of_file(local_path)
             size = os.path.getsize(local_path)
+
+            local_path = _fix_media_format(local_path, kind)
+            local_paths[-1] = local_path
 
             dup = db.find_by_sha256(sha256)
             if dup:
@@ -221,11 +328,20 @@ async def archive_group(messages: list[Message]):
             to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message))
 
         if to_upload:
-            input_media = [
-                INPUT_MEDIA_CLASS[kind](path, caption=(m.caption or "") if i == 0 else "")
-                for i, (kind, _, _, _, path, m) in enumerate(to_upload)
-            ]
-            sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
+            try:
+                input_media = [
+                    INPUT_MEDIA_CLASS[kind](path, caption=(m.caption or "") if i == 0 else "")
+                    for i, (kind, _, _, _, path, m) in enumerate(to_upload)
+                ]
+                sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
+            except PhotoExtInvalid:
+                # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
+                input_media = [
+                    InputMediaDocument(path, caption=(m.caption or "") if i == 0 else "")
+                    for i, (_, _, _, _, path, m) in enumerate(to_upload)
+                ]
+                sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
+
             for (kind, file_unique_id, sha256, size, _, message), sent in zip(to_upload, sent_list):
                 db.record_file(
                     file_unique_id=file_unique_id,
@@ -251,16 +367,92 @@ async def archive_group(messages: list[Message]):
 
         if to_upload:
             await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
+            print(f"  └─ 归档媒体组 {len(to_upload)} 张")
         for message in new_messages:
-            await archive_single(message)
-        for item in to_upload:
-            await mark_processed(item[5], duplicate=False)  # item[5] 是 Message 对象
-        for message in dup_messages:
-            await mark_processed(message, duplicate=True)
+            await archive_single(message, mark=mark)
+        if mark:
+            for item in to_upload:
+                await mark_processed(item[5], duplicate=False)  # item[5] 是 Message 对象
+            for message in dup_messages:
+                await mark_processed(message, duplicate=True)
     finally:
         for p in local_paths:
             if os.path.exists(p):
                 os.remove(p)
+                try:
+                    os.rmdir(os.path.dirname(p))
+                except OSError:
+                    pass
+
+
+async def process_link_message(message: Message):
+    """处理包含 t.me 链接的文本消息：Pyrogram 直接获取消息 → 复用路径一的去重+上传管道
+
+    你是频道成员，Pyrogram 可以直接下载（不能"转发"但能"读取+下载"）。
+    支持媒体组——检测到 media_group_id 后拉取整组，每张照片的 caption 一并保留。
+    返回实际归档的文件数。"""
+    text = message.text or ""
+    raw_links = re.findall(r"https?://t\.me/\S+", text)
+    seen = set()
+    links: list[str] = []
+    for link in raw_links:
+        link = link.rstrip(".,;:!?)")
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
+
+    archived = 0
+    for link in links:
+        try:
+            chat, msg_id = parse_message_link(link)
+        except ValueError:
+            continue
+
+        try:
+            msg = await app.get_messages(chat, msg_id)
+            if msg is None:
+                print(f"[warn] 消息 {link} 不可访问或已删除", file=sys.stderr)
+                continue
+
+            # 媒体组：拉整组，复用 archive_group()
+            if msg.media_group_id:
+                group = await app.get_media_group(chat, msg_id)
+                group = sorted(group, key=lambda m: m.id)
+                # mark=False：不编辑源频道消息，最终只标记接收频道里的链接消息
+                await archive_group(group, mark=False)
+                archived += len(group)
+                print(f"  └─ 链接 {link} → 媒体组 {len(group)} 张")
+            else:
+                kind, _ = get_media(msg)
+                if kind:
+                    if await archive_single(msg, mark=False):
+                        archived += 1
+                        print(f"  └─ 链接 {link} → {kind}")
+                    else:
+                        print(f"  └─ 链接 {link} → 下载失败")
+                else:
+                    print(f"  └─ 链接 {link} → 无媒体")
+        except Exception:
+            print(f"[warn] 处理链接 {link} 失败", file=sys.stderr)
+            traceback.print_exc()
+
+    # 只有确实归档了文件才打标记
+    if archived > 0:
+        try:
+            chat = message.chat
+            if chat is not None and chat.id is not None:
+                await app.edit_message_text(chat.id, message.id,
+                    f"✅ 已归档\n{text}"[:4096])
+        except Exception:
+            pass
+
+    return archived
+
+
+def _has_tme_link(message: Message) -> bool:
+    """检查消息文本是否包含 t.me 链接"""
+    text = message.text or message.caption or ""
+    return bool(re.search(r"https?://t\.me/", text))
 
 
 async def scan_once():
@@ -272,7 +464,7 @@ async def scan_once():
         new_messages.append(msg)
 
     if not new_messages:
-        return
+        return 0
 
     total = len(new_messages)
     # 限制每轮处理量，剩余留给下轮，避免短时间大量上传触发 Telegram 风控
@@ -285,7 +477,6 @@ async def scan_once():
     for msg in new_messages:
         if msg.media_group_id:
             if msg.media_group_id in handled_groups:
-                db.set_checkpoint(RECEIVE_CHAT, msg.id)
                 continue
             group = await app.get_media_group(msg.chat.id, msg.id)
             group = sorted(group, key=lambda m: m.id)
@@ -297,27 +488,48 @@ async def scan_once():
 
         kind, _ = get_media(msg)
         if kind:
-            await archive_single(msg)
-            processed += 1
-        # 非媒体消息（纯文本等）不归档，但依然推进 checkpoint，避免反复扫描
+            if await archive_single(msg):
+                processed += 1
+            else:
+                # 下载失败，不推进 checkpoint，下轮重试
+                continue
+        elif _has_tme_link(msg):
+            n = await process_link_message(msg)
+            if n > 0:
+                processed += 1
+        # 非媒体且无链接的消息不归档，但依然推进 checkpoint，避免反复扫描
         db.set_checkpoint(RECEIVE_CHAT, msg.id)
 
     if processed:
         print(f"[listener] 本轮完成：处理 {processed} 条消息")
+    return processed
 
 
 async def main():
     async with app:
         db.ensure_channel(RECEIVE_CHAT, "manual_forward")
         me = await app.get_me()
-        print(f"[listener] 已登录：{me.first_name} (id={me.id})，每 {SCAN_INTERVAL_SECONDS}s 扫描一次")
+        print(f"[listener] 已登录：{me.first_name} (id={me.id})，冷却间隔 {SCAN_INTERVAL_SECONDS}s")
+        last_processed_at = 0.0
+
         while True:
             try:
-                await scan_once()
+                elapsed = time.time() - last_processed_at
+                if elapsed < SCAN_INTERVAL_SECONDS:
+                    wait = SCAN_INTERVAL_SECONDS - elapsed
+                    print(f"[listener] 冷却中，{wait:.0f}s 后扫描")
+                    await asyncio.sleep(wait)
+
+                n = await scan_once()
+                if n > 0:
+                    last_processed_at = time.time()
+                else:
+                    print(f"[listener] 无新消息，{SCAN_INTERVAL_SECONDS}s 后再查")
+                    await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             except Exception:
                 print("[listener] 本轮扫描出错：", file=sys.stderr)
                 traceback.print_exc()
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
