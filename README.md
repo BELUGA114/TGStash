@@ -5,9 +5,9 @@
 ## 特性
 
 - **双路径归档**：转发媒体自动处理，禁止转发的消息发链接即可归档
-- **双层去重**：file_unique_id 快速判重 + SHA-256 精确判重，不会重复上传
-- **媒体组完整保留**：相册/多图消息整组打包上传，维持原始排版
-- **格式自动修复**：WebP/PNG/GIF 自动转 JPEG，保证客户端内联浏览
+- **双层去重**：file_unique_id + SHA-256 判断重复，不会重复上传
+- **媒体组完整保留**：整组媒体打包上传，维持原始排版
+- **格式自动修复**：WebP/PNG 自动转 JPEG，保证正确回传
 - **账号安全优先**：较为极端的限流机制，账号最重要
 
 
@@ -24,11 +24,13 @@
 ### 本地部署
 
 ```bash
-git clone <repo>
+git clone https://github.com/BELUGA114/TGStash.git
 cd TGStash
 cp .env.example .env
 # 编辑 .env，填入 TG_API_ID 和 TG_API_HASH
 ```
+
+构建并登录生成 session 文件
 
 ```bash
 docker compose build
@@ -51,13 +53,13 @@ TG_API_ID=          # 必填
 TG_API_HASH=        # 必填
 RECEIVE_CHAT_ID=    # 必填
 ARCHIVE_CHAT_ID=    # 必填
-HTTP_PROXY=         # 可选，形如 http://host:port
+HTTP_PROXY=         # http://host:port
 SCAN_INTERVAL_SECONDS=300
 BATCH_SIZE=10
 UPLOAD_COOLDOWN_SECONDS=5
 ```
 
-首次使用需要先登录生成 session 文件。在本地机器上跑一次 login 生成 `data/session/` 目录，上传到服务器的 `./data/session/` 即可。容器启动后会自动复用。
+首次使用需要先登录生成 session 文件。在本地机器上跑一次 login 生成 `data/session/` 目录，上传到服务器的 `./data/session/` 即可
 
 
 ### 获取频道 ID
@@ -109,15 +111,15 @@ https://t.me/c/123456/123    私有频道（需已加入）
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `TG_API_ID` | — | 必填，来自 my.telegram.org |
-| `TG_API_HASH` | — | 必填 |
+| `TG_API_HASH` | — | 必填，同上 |
 | `RECEIVE_CHAT_ID` | — | 必填，接收频道 ID（`-100` 前缀） |
-| `ARCHIVE_CHAT_ID` | — | 必填，备份频道 ID |
+| `ARCHIVE_CHAT_ID` | — | 必填，备份频道 ID（`-100` 前缀） |
 | `SCAN_INTERVAL_SECONDS` | `300` | 处理后的冷却间隔，同时也决定无消息时的轮询周期 |
 | `BATCH_SIZE` | `10` | 每轮最多处理的消息数，超出留给下轮 |
 | `UPLOAD_COOLDOWN_SECONDS` | `5` | 每次上传后的等待时间 |
-| `HTTP_PROXY` | — | HTTP 代理地址，形如 `http://127.0.0.1:10086`。不需要则留空 |
+| `HTTP_PROXY` | — | HTTP 代理地址，形如 `http://127.0.0.1:10086`，不需要则留空 |
 
-Docker 容器内 `127.0.0.1` 指向容器自身而非宿主机——如果代理在本机，可使用 `host.docker.internal`（Windows/Mac）或宿主机 IP：
+Docker 容器内 `127.0.0.1` 指向容器自身而非宿主机——如果代理在本机，可使用 `host.docker.internal`（Windows/Mac）或宿主机 IP
 
 
 ## 搜索
@@ -153,7 +155,7 @@ TGStash/
     └── tmp/                  #   下载临时目录，处理完自动清空
 ```
 
-`data/db/archive.db` 需要备份的文件，丢失后去重能力和全文索引需要重建，但归档本体（备份频道里的消息）不受影响
+`data/db/archive.db` 需要备份并持久化的文件，丢失后去重能力和全文索引需要重建，但归档本体（备份频道里的消息）不受影响
 
 
 ## 备用工具
