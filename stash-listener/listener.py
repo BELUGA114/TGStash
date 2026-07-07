@@ -109,12 +109,20 @@ def sha256_of_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _fix_media_format(path: str, kind: str | None) -> str:
+def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
     """下载后的文件格式可能与 Telegram 声称的类型不匹配。
 
     - WebP/PNG/GIF → 转 JPEG，保证 Telegram 内联展示
-    - 无后缀文件 → 检测格式后补上后缀
-    - 非 photo 类型 → 原样返回"""
+    - 无后缀视频/图片 → 补后缀，否则 Telegram 解析不出缩略图和时长"""
+    if kind == "video":
+        if not os.path.splitext(path)[1]:
+            suffix = ".mp4" if "mp4" in (mime_type or "") else ".mp4"
+            new_path = path + suffix
+            os.rename(path, new_path)
+            print(f"  └─ 补后缀 video → {suffix}")
+            return new_path
+        return path
+
     if kind != "photo":
         return path
     try:
@@ -217,7 +225,7 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
         size = os.path.getsize(local_path)
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
-        local_path = _fix_media_format(local_path, kind)
+        local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
 
         dup = db.find_by_sha256(sha256)
         if dup:
@@ -337,7 +345,7 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
         sha256 = sha256_of_file(local_path)
         size = os.path.getsize(local_path)
 
-        local_path = _fix_media_format(local_path, kind)
+        local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
         local_paths[-1] = local_path
 
         dup = db.find_by_sha256(sha256)
