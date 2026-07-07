@@ -24,9 +24,12 @@ cp .env.example .env
 # 2. 构建
 docker compose build
 
-# 3. 登录（两个服务各自一次，会提示手机号 + 验证码）
+# 3. 登录（两个服务各自一次）
+#    路径一：交互式输入手机号 + 验证码
 docker compose run --rm stash-listener python login.py
-docker compose run --rm tdl-sync tdl -n archiver login
+#    路径二：二选一
+docker compose run --rm tdl-sync tdl -n archiver login -T code   # 验证码登录
+docker compose run --rm tdl-sync tdl -n archiver login -T qr     # 二维码登录
 
 # 4. 获取频道 ID
 docker compose run --rm tdl-sync tdl -n archiver chat ls
