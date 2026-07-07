@@ -59,6 +59,8 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 db = ArchiveDB(DB_PATH)
 app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR)
+# 并发下载数上限，MTProto 单连接慢，2 个并行可有效提速
+_dl_sem = asyncio.Semaphore(2)
 
 MEDIA_ATTRS = ("document", "video", "photo", "audio", "animation", "voice", "video_note")
 
@@ -228,12 +230,22 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
         caption = message.caption or ""
         if kind is None:
             return True
-        send = getattr(app, SEND_METHOD[kind])
-        try:
-            sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
-        except PhotoExtInvalid:
-            # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
-            sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+        # 视频需要显式传入时长和分辨率，否则 Telegram 可能无法生成缩略图、时长显示 00:00
+        if kind == "video":
+            sent = await app.send_video(
+                ARCHIVE_CHAT, local_path,
+                duration=media.duration,
+                width=media.width,
+                height=media.height,
+                caption=caption,
+            )
+        else:
+            send = getattr(app, SEND_METHOD[kind])
+            try:
+                sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+            except PhotoExtInvalid:
+                # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
+                sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
         assert sent is not None and sent.id is not None
 
         db.record_file(
@@ -274,59 +286,76 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
 
 
 async def archive_group(messages: list[Message], *, mark: bool = True):
-    """媒体组：整组一起下载、按顺序打包成一条 send_media_group 上传，保持相册形态"""
+    """媒体组：并行下载（最多 2 个）→ 顺序处理 → 打包成 send_media_group 上传"""
     to_upload: list[tuple] = []
     dup_messages = []
     new_messages = []
     local_paths = []
 
+    # 阶段一：准备下载任务，跳过重复
+    downloads: list[tuple] = []
+    for message in messages:
+        kind, media = get_media(message)
+        if not media or kind is None:
+            continue
+        if db.find_by_unique_id(media.file_unique_id):
+            dup_messages.append(message)
+            continue
+
+        msg_dir = os.path.join(DOWNLOAD_DIR, str(message.id))
+        os.makedirs(msg_dir, exist_ok=True)
+        orig_name = getattr(media, "file_name", None)
+        dl_name = orig_name or f"{message.id}_"
+        downloads.append((message, kind, msg_dir, dl_name, media))
+
+    # 阶段二：并行下载（Semaphore 限流，最多 2 个同时）
+    async def _dl_one(msg, msg_dir, dl_name):
+        async with _dl_sem:
+            return await app.download_media(message=msg, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
+
+    results = await asyncio.gather(
+        *[_dl_one(msg, md, dn) for msg, _, md, dn, _ in downloads],
+        return_exceptions=True,
+    )
+
+    # 阶段三：顺序处理（SHA-256 / 去重 / 格式转换）
+    for (message, kind, msg_dir, dl_name, media), result in zip(downloads, results):
+        if isinstance(result, BaseException):
+            print(f"[warn] 下载 {message.id} 失败，跳过", file=sys.stderr)
+            continue
+
+        local_path = result
+        local_paths.append(local_path)
+
+        sha256 = sha256_of_file(local_path)
+        size = os.path.getsize(local_path)
+
+        local_path = _fix_media_format(local_path, kind)
+        local_paths[-1] = local_path
+
+        dup = db.find_by_sha256(sha256)
+        if dup:
+            db.record_file(
+                file_unique_id=media.file_unique_id,
+                sha256=sha256,
+                size=size,
+                archived_chat_id=dup["archived_chat_id"],
+                archived_message_id=dup["archived_message_id"],
+                source="manual_forward",
+                source_channel=RECEIVE_CHAT,
+            )
+            dup_messages.append(message)
+            continue
+
+        if kind not in INPUT_MEDIA_CLASS:
+            # 语音/视频留言等不支持编组的类型，退回单条处理
+            new_messages.append(message)
+            continue
+
+        to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message))
+
+    # 阶段四：上传 + 清理
     try:
-        for message in messages:
-            kind, media = get_media(message)
-            if not media:
-                continue
-            if db.find_by_unique_id(media.file_unique_id):
-                dup_messages.append(message)
-                continue
-
-            msg_dir = os.path.join(DOWNLOAD_DIR, str(message.id))
-            os.makedirs(msg_dir, exist_ok=True)
-            orig_name = getattr(media, "file_name", None)
-            dl_name = orig_name or f"{message.id}_"
-            try:
-                local_path = await app.download_media(message=message, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
-            except Exception:
-                # 单文件下载失败（超时/网络问题）跳过该文件，不阻塞整组
-                print(f"[warn] 下载 {message.id} 失败，跳过", file=sys.stderr)
-                continue
-            local_paths.append(local_path)
-            sha256 = sha256_of_file(local_path)
-            size = os.path.getsize(local_path)
-
-            local_path = _fix_media_format(local_path, kind)
-            local_paths[-1] = local_path
-
-            dup = db.find_by_sha256(sha256)
-            if dup:
-                db.record_file(
-                    file_unique_id=media.file_unique_id,
-                    sha256=sha256,
-                    size=size,
-                    archived_chat_id=dup["archived_chat_id"],
-                    archived_message_id=dup["archived_message_id"],
-                    source="manual_forward",
-                    source_channel=RECEIVE_CHAT,
-                )
-                dup_messages.append(message)
-                continue
-
-            if kind not in INPUT_MEDIA_CLASS:
-                # 语音/视频留言等不支持编组的类型，退回单条处理
-                new_messages.append(message)
-                continue
-
-            to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message))
-
         if to_upload:
             try:
                 input_media = [
@@ -375,6 +404,7 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
                 await mark_processed(item[5], duplicate=False)  # item[5] 是 Message 对象
             for message in dup_messages:
                 await mark_processed(message, duplicate=True)
+
     finally:
         for p in local_paths:
             if os.path.exists(p):
