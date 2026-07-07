@@ -4,6 +4,7 @@
 
 ## 特性
 
+- **防资源被封禁**：接收后重新上传至私密频道，去除来源，防止 DMCA 发力
 - **双路径归档**：转发媒体自动处理，禁止转发的消息发链接即可归档
 - **双层去重**：file_unique_id + SHA-256 判断重复，不会重复上传
 - **媒体组完整保留**：整组媒体打包上传，维持原始排版
@@ -16,9 +17,8 @@
 ### 准备工作
 
 1. 在 <https://my.telegram.org> 申请 `api_id` / `api_hash`
-2. 创建两个频道——接收频道（转发入口）和备份频道（归档终点）
-3. 将闲置账号加入两个频道，设为**管理员**
-4. 路径二的目标频道也加入（普通成员即可）
+2. 创建两个频道——接收频道（转发入口）和私密的备份频道（洗掉来源，归档终点）
+3. 最好是有一个闲置账号（专门跑备份），将该账号加入上述两个频道，设为**管理员**
 
 
 ### 本地部署
@@ -34,7 +34,7 @@ cp .env.example .env
 
 ```bash
 docker compose build
-docker compose run --rm stash-listener python login.py   # 交互式登录
+docker compose run --rm stash-listener python login.py   # 登录你备份用的账号
 docker compose up -d
 ```
 
