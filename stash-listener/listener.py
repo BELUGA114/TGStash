@@ -66,9 +66,11 @@ db = ArchiveDB(DB_PATH)
 if HTTP_PROXY:
     u = urlparse(HTTP_PROXY)
     app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
+                 max_concurrent_transmissions=2,
                  proxy=dict(scheme=u.scheme, hostname=u.hostname, port=u.port))
 else:
-    app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR)
+    app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
+                 max_concurrent_transmissions=2)
 # 并发下载数上限，MTProto 单连接慢，2 个并行可有效提速
 _dl_sem = asyncio.Semaphore(2)
 
