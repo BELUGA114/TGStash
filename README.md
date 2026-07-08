@@ -1,6 +1,6 @@
 # TGStash
 
-一个轻量的 Telegram 个人媒体归档系统，将 Telegram 上的媒体文件自动备份到私有频道
+一个轻量的 Telegram 个人媒体归档系统，将 Telegram 上指定的媒体文件自动备份到私有频道
 
 ## 特性
 
