@@ -1,7 +1,7 @@
 # 生产部署
 services:
   stash-listener:
-    image: ghcr.io/BELUGA114/TGStash:latest
+    image: ghcr.io/beluga114/tgstash:latest
     container_name: stash-listener
     network_mode: "host"
     restart: unless-stopped
@@ -20,7 +20,7 @@ services:
       - /data/TGStash/tmp:/data/tmp
 
   tdl-sync:
-    image: ghcr.io/BELUGA114/TGStash-tdl:latest
+    image: ghcr.io/beluga114/tgstash-tdl:latest
     network_mode: "host"
     environment:
       - TG_API_ID
