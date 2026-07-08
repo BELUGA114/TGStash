@@ -37,6 +37,7 @@ from pyrogram.types import (
     InputMediaVideo,
     InputMediaDocument,
     InputMediaAudio,
+    ReplyParameters,
 )
 
 from db import ArchiveDB
@@ -190,7 +191,7 @@ async def mark_processed(message: Message, duplicate: bool):
     assert chat.id is not None
     text = "✅ 已归档（重复）" if duplicate else "✅ 已归档"
     try:
-        await app.send_message(chat.id, text, reply_to_message_id=message.id)
+        await app.send_message(chat.id, text, reply_parameters=ReplyParameters(message_id=message.id))
     except Exception:
         pass
 
