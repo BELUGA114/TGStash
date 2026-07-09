@@ -363,6 +363,12 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
                     "width": getattr(media, "width", 0) or 0,
                     "height": getattr(media, "height", 0) or 0,
                 }
+            elif meta["duration"] == 0:
+                # ffprobe 有时拿不到 duration（moov atom 在末尾、截断文件等），
+                # 但源消息元数据可能有正确的值——宁可回退也比传 0 强
+                source_dur = getattr(media, "duration", 0) or 0
+                if source_dur:
+                    meta["duration"] = source_dur
 
             thumb_path = os.path.join(msg_dir, "thumb.jpg")
             thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
@@ -515,6 +521,12 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
                     "width": getattr(media, "width", 0) or 0,
                     "height": getattr(media, "height", 0) or 0,
                 }
+            elif meta["duration"] == 0:
+                # ffprobe 有时拿不到 duration（moov atom 在末尾、截断文件等），
+                # 但源消息元数据可能有正确的值——宁可回退也比传 0 强
+                source_dur = getattr(media, "duration", 0) or 0
+                if source_dur:
+                    meta["duration"] = source_dur
 
             thumb_path = os.path.join(msg_dir, "thumb.jpg")
             thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)

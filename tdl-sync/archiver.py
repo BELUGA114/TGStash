@@ -11,6 +11,7 @@
 """
 
 import hashlib
+import logging
 import os
 import re
 import subprocess
@@ -23,6 +24,14 @@ TDL_NAMESPACE = os.environ.get("TDL_NAMESPACE", "archiver")
 
 DB_PATH = "/data/db/archive.db"
 WORK_DIR = "/data/tmp/tdl"
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -69,7 +78,7 @@ def parse_message_link(link: str) -> tuple[str, int]:
 
 def main():
     if len(sys.argv) < 2:
-        print("用法：python archiver.py <消息链接>")
+        logger.info("用法：python archiver.py <消息链接>")
         sys.exit(1)
 
     link = sys.argv[1]
@@ -83,14 +92,14 @@ def main():
     os.makedirs(download_dir, exist_ok=True)
 
     # 按消息 ID 导出单条消息的 JSON
-    print(f"导出 {chat}/{message_id}")
+    logger.info("导出 %s/%s", chat, message_id)
     run_tdl(
         "chat", "export", "-c", chat, "-T", "id",
         "-i", str(message_id), "-o", export_path,
     )
 
     # 下载导出结果中的媒体文件
-    print("下载媒体")
+    logger.info("下载媒体")
     run_tdl(
         "dl", "-f", export_path, "-d", download_dir,
         "--skip-same", "--continue",
@@ -112,7 +121,7 @@ def main():
             os.remove(fpath)
             continue
 
-        print(f"上传 {fname}")
+        logger.info("上传 %s", fname)
         run_tdl("up", "-p", fpath, "-c", ARCHIVE_CHAT)
 
         # tdl 拿不到真正的 Telegram file_unique_id，用 chat+message_id+哈希
@@ -140,11 +149,11 @@ def main():
         os.remove(fpath)
 
     if new_count:
-        print(f"完成：新增 {new_count} 个文件")
+        logger.info("完成：新增 %s 个文件", new_count)
     elif dup_count:
-        print(f"已完成：{dup_count} 个文件已存在，跳过")
+        logger.info("已完成：%s 个文件已存在，跳过", dup_count)
     else:
-        print("这条消息没有可下载的媒体文件")
+        logger.info("这条消息没有可下载的媒体文件")
 
 
 if __name__ == "__main__":
