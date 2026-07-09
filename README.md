@@ -8,7 +8,7 @@
 - **双路径归档**：转发媒体自动处理，禁止转发的消息发链接即可归档
 - **双层去重**：file_unique_id + SHA-256 判断重复，不会重复上传
 - **媒体组完整保留**：整组媒体打包上传，维持原始排版
-- **格式自动修复**：WebP/PNG 自动转 JPEG，保证正确回传
+- **视频友好**：用本地 ffprobe 重测元数据、ffmpeg 抽帧，解决 Telegram 服务端可能不生成缩略图、时长为 0 的问题
 - **账号安全优先**：较为极端的限流机制，账号最重要
 
 
@@ -118,6 +118,7 @@ https://t.me/c/123456/123    私有频道（需已加入）
 | `BATCH_SIZE` | `10` | 每轮最多处理的消息数，超出留给下轮 |
 | `UPLOAD_COOLDOWN_SECONDS` | `5` | 每次上传后的等待时间 |
 | `HTTP_PROXY` | — | HTTP 代理地址，形如 `http://127.0.0.1:10086`，不需要则留空 |
+| `LOG_LEVEL` | `INFO` | 日志级别：DEBUG / INFO / WARNING / ERROR |
 
 Docker 容器内 `127.0.0.1` 指向容器自身而非宿主机——如果代理在本机，可使用 `host.docker.internal`（Windows/Mac）或宿主机 IP
 

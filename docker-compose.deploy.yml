@@ -14,6 +14,7 @@ services:
       - SCAN_INTERVAL_SECONDS=300
       - BATCH_SIZE=10
       - UPLOAD_COOLDOWN_SECONDS=5
+      - LOG_LEVEL
     volumes:
       - /data/TGStash/session:/data/session
       - /data/TGStash/db:/data/db
