@@ -25,6 +25,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR)

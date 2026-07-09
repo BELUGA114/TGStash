@@ -83,6 +83,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
 MIN_PLAUSIBLE_SIZE = 1024  # 1KB；网络中断留下的文件通常离谱地小或是 0 字节
 
 MEDIA_ATTRS = ("document", "video", "photo", "audio", "animation", "voice", "video_note")
