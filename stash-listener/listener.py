@@ -24,8 +24,9 @@ import os
 import re
 import sys
 import time
-import traceback
 from urllib.parse import urlparse
+
+import json, logging, shutil, subprocess
 
 from PIL import Image
 
@@ -74,6 +75,16 @@ else:
 # 并发下载数上限，MTProto 单连接慢，2 个并行可有效提速
 _dl_sem = asyncio.Semaphore(2)
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+MIN_PLAUSIBLE_SIZE = 1024  # 1KB；网络中断留下的文件通常离谱地小或是 0 字节
+
 MEDIA_ATTRS = ("document", "video", "photo", "audio", "animation", "voice", "video_note")
 
 # 各媒体类型对应的发送方法名 / 媒体组 InputMedia 类
@@ -112,6 +123,21 @@ def sha256_of_file(path: str) -> str:
     return h.hexdigest()
 
 
+def verify_download_size(local_path: str, expected_size) -> None:
+    """基线校验：抓最离谱的截断情况，不追求精确匹配。
+    expected_size 拿不到就只做最小体积检查，不当作可疑信号。"""
+    actual_size = os.path.getsize(local_path)
+
+    if actual_size < MIN_PLAUSIBLE_SIZE:
+        raise RuntimeError(f"文件小到不合理（{actual_size} 字节），大概率下载中断")
+
+    if expected_size:
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"文件大小对不上（期望 {expected_size}，实际 {actual_size}），疑似下载不完整"
+            )
+
+
 def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
     """下载后的文件格式可能与 Telegram 声称的类型不匹配。
 
@@ -122,7 +148,7 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
             suffix = ".mp4" if "mp4" in (mime_type or "") else ".mp4"
             new_path = path + suffix
             os.rename(path, new_path)
-            print(f"  └─ 补后缀 video → {suffix}")
+            logger.info("补后缀 video → %s", suffix)
             return new_path
         return path
 
@@ -140,25 +166,93 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
                     img = img.convert("RGB")
                 img.save(new_path, "JPEG", quality=95)
                 os.remove(path)
-                print(f"  └─ 格式转换 {fmt} → JPEG")
+                logger.info("格式转换 %s → JPEG", fmt)
                 return new_path
 
             # 本身就是 JPEG 但文件没有后缀，补上
             if fmt == "JPEG" and not ext:
                 new_path = path + ".jpg"
                 os.rename(path, new_path)
-                print(f"  └─ 补后缀 {fmt}")
+                logger.info("补后缀 %s", fmt)
                 return new_path
 
             # 其他图片格式但无后缀，统一加 .jpg
             if not ext:
                 new_path = path + ".jpg"
                 os.rename(path, new_path)
-                print(f"  └─ 补后缀 {fmt or '未知'}")
+                logger.info("补后缀 %s", fmt or "未知")
                 return new_path
     except Exception:
         pass
     return path
+
+
+def probe_video(path: str) -> dict | None:
+    """用 ffprobe 量出真实的 duration/width/height。
+    Telegram 对大文件可能解析不出元数据（duration=0），不能信任源消息自带的值。
+    任何失败都返回 None，调用方看到 None 回退到源消息元数据 → 0，不阻塞归档。"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        info = json.loads(result.stdout)
+        stream = next((s for s in info["streams"] if s.get("codec_type") == "video"), None)
+        if stream is None:
+            logger.warning("ffprobe 没解析出视频流：%s", path)
+            return None
+        duration = int(float(info.get("format", {}).get("duration", 0)))
+        return {
+            "duration": duration,
+            "width": stream.get("width", 0),
+            "height": stream.get("height", 0),
+        }
+    except FileNotFoundError:
+        logger.error("ffprobe 可执行文件不存在，检查镜像是否装了 ffmpeg")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.warning("ffprobe 处理失败（退出码 %s）：%s：%s",
+                       e.returncode, path, (e.stderr or "")[:200])
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe 超时（30s）：%s", path)
+        return None
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning("ffprobe 输出解析失败：%s：%s", path, e)
+        return None
+
+
+def make_thumbnail(video_path: str, thumb_path: str,
+                   timestamp: str = "00:00:01") -> str | None:
+    """用 ffmpeg 抽一帧当缩略图。
+    Telegram 对大文件不保证生成缩略图，Pyrogram send_video 的 thumb 参数
+    是唯一可靠途径——客户端主动提供缩略图，不指望服务端。
+    画质从 5 递减到 31 重试；任何失败返回 None，不阻塞归档。"""
+    for q in (5, 10, 20, 31):
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-ss", timestamp, "-i", video_path,
+                 "-vframes", "1",
+                 "-vf", "scale=320:320:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                 "-q:v", str(q), thumb_path],
+                capture_output=True, timeout=20,
+            )
+        except FileNotFoundError:
+            logger.error("ffmpeg 可执行文件不存在，检查镜像是否装了 ffmpeg")
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning("ffmpeg 截图超时（20s），放弃：%s", video_path)
+            return None  # 超时卡在解码上，换 -q:v 不会变快，直接跳出循环
+
+        if result.returncode == 0 and os.path.exists(thumb_path):
+            if os.path.getsize(thumb_path) <= 200 * 1024:
+                return thumb_path
+
+    # 所有画质档位都试过了仍超标（320px 下极少发生），放弃
+    if os.path.exists(thumb_path):
+        os.remove(thumb_path)
+    return None
 
 
 def sender_name(message: Message) -> str:
@@ -209,7 +303,7 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
     if db.find_by_unique_id(file_unique_id):
         if mark:
             await mark_processed(message, duplicate=True)
-        print(f"  └─ 跳过重复 {message.id} ({kind})")
+        logger.info("跳过重复 %s (%s)", message.id, kind)
         return True
 
     # 每条消息下载到独立子目录，文件名保持原名（上传时不会带 num_ 前缀）
@@ -217,18 +311,30 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
     os.makedirs(msg_dir, exist_ok=True)
     orig_name = getattr(media, "file_name", None)
     dl_name = orig_name or f"{message.id}_"
+
+    # 下载（下载失败 = 不推进 checkpoint，下轮重试）
     try:
         local_path = await app.download_media(message=message, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
+        if local_path is None:
+            logger.warning("下载 %s 返回 None，下轮重试", message.id)
+            return False
     except Exception:
-        # 下载失败不推进 checkpoint，下轮重试
-        print(f"[warn] 下载 {message.id} 失败，下轮重试", file=sys.stderr)
+        logger.warning("下载 %s 失败，下轮重试", message.id)
         return False
+
+    # 显式追踪所有临时文件，finally 统一清理
+    temp_files = [local_path]
+
     try:
+        # 文件完整性校验（抛 RuntimeError → return False，不推进 checkpoint）
+        verify_download_size(local_path, getattr(media, "file_size", None))
+
         sha256 = sha256_of_file(local_path)
         size = os.path.getsize(local_path)
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
         local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
+        temp_files[0] = local_path  # _fix_media_format 可能改了路径（WebP→JPEG），跟踪新文件
 
         dup = db.find_by_sha256(sha256)
         if dup:
@@ -246,18 +352,33 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
             return True
 
         caption = message.caption or ""
-        if kind is None:
-            return True
-        # 视频需要显式传入时长和分辨率，否则 Telegram 可能无法生成缩略图、时长显示 00:00
+
+        # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
+        thumb_path = None
         if kind == "video":
+            meta = await asyncio.to_thread(probe_video, local_path)
+            if meta is None:
+                meta = {
+                    "duration": getattr(media, "duration", 0) or 0,
+                    "width": getattr(media, "width", 0) or 0,
+                    "height": getattr(media, "height", 0) or 0,
+                }
+
+            thumb_path = os.path.join(msg_dir, "thumb.jpg")
+            thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
+            if thumb_path:
+                temp_files.append(thumb_path)
+
             sent = await app.send_video(
                 ARCHIVE_CHAT, local_path,
-                duration=media.duration,
-                width=media.width,
-                height=media.height,
+                duration=meta["duration"],
+                width=meta["width"],
+                height=meta["height"],
+                thumb=thumb_path,  # type: ignore[arg-type]
                 caption=caption,
             )
         else:
+            assert kind is not None
             send = getattr(app, SEND_METHOD[kind])
             try:
                 sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
@@ -289,16 +410,22 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
         )
         if mark:
             await mark_processed(message, duplicate=False)
-        print(f"  └─ 归档 {message.id} ({kind})")
+        logger.info("归档 %s (%s)", message.id, kind)
         await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
+
+    except RuntimeError:
+        # verify_download_size 抛出的校验失败，不推进 checkpoint，下轮重试
+        logger.warning("文件校验失败 %s，下轮重试", message.id)
+        return False
     finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-            # 清理空子目录
-            try:
-                os.rmdir(os.path.dirname(local_path))
-            except OSError:
-                pass
+        for p in temp_files:
+            if os.path.exists(p):
+                os.remove(p)
+                # 清理空子目录
+                try:
+                    os.rmdir(os.path.dirname(p))
+                except OSError:
+                    pass
 
     return True
 
@@ -308,7 +435,7 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
     to_upload: list[tuple] = []
     dup_messages = []
     new_messages = []
-    local_paths = []
+    temp_files = []  # 显式追踪所有临时文件（视频 + 缩略图），finally 统一清理
 
     # 阶段一：准备下载任务，跳过重复
     downloads: list[tuple] = []
@@ -336,20 +463,27 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
         return_exceptions=True,
     )
 
-    # 阶段三：顺序处理（SHA-256 / 去重 / 格式转换）
+    # 阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）
     for (message, kind, msg_dir, dl_name, media), result in zip(downloads, results):
         if isinstance(result, BaseException):
-            print(f"[warn] 下载 {message.id} 失败，跳过", file=sys.stderr)
+            logger.warning("下载 %s 失败，跳过", message.id)
             continue
 
         local_path = result
-        local_paths.append(local_path)
+        temp_files.append(local_path)
+
+        # 文件完整性校验（失败跳过本条，不阻塞整组）
+        try:
+            verify_download_size(local_path, getattr(media, "file_size", None))
+        except RuntimeError:
+            logger.warning("文件校验失败 %s，跳过", message.id)
+            continue
 
         sha256 = sha256_of_file(local_path)
         size = os.path.getsize(local_path)
 
         local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
-        local_paths[-1] = local_path
+        temp_files[-1] = local_path  # _fix_media_format 可能改了路径，更新追踪
 
         dup = db.find_by_sha256(sha256)
         if dup:
@@ -370,26 +504,57 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
             new_messages.append(message)
             continue
 
-        to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message))
+        # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
+        thumb_path = None
+        meta = {}
+        if kind == "video":
+            meta = await asyncio.to_thread(probe_video, local_path)
+            if meta is None:
+                meta = {
+                    "duration": getattr(media, "duration", 0) or 0,
+                    "width": getattr(media, "width", 0) or 0,
+                    "height": getattr(media, "height", 0) or 0,
+                }
+
+            thumb_path = os.path.join(msg_dir, "thumb.jpg")
+            thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
+            if thumb_path:
+                temp_files.append(thumb_path)
+
+        # to_upload: 从 6 元素扩到 8 元素（+thumb_path +meta）
+        to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message, thumb_path, meta))
 
     # 阶段四：上传 + 清理
     try:
         if to_upload:
+            # 构造 InputMedia 列表，video 类型传入 thumb/duration/width/height
+            input_media = []
+            for i, (kind, _, _, _, path, m, thumb, meta) in enumerate(to_upload):
+                caption = (m.caption or "") if i == 0 else ""
+                if kind == "video":
+                    input_media.append(InputMediaVideo(
+                        path,
+                        caption=caption,
+                        duration=meta["duration"],
+                        width=meta["width"],
+                        height=meta["height"],
+                        thumb=thumb,
+                    ))
+                else:
+                    input_media.append(INPUT_MEDIA_CLASS[kind](path, caption=caption))
+
             try:
-                input_media = [
-                    INPUT_MEDIA_CLASS[kind](path, caption=(m.caption or "") if i == 0 else "")
-                    for i, (kind, _, _, _, path, m) in enumerate(to_upload)
-                ]
                 sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
             except PhotoExtInvalid:
                 # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
+                # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
                 input_media = [
                     InputMediaDocument(path, caption=(m.caption or "") if i == 0 else "")
-                    for i, (_, _, _, _, path, m) in enumerate(to_upload)
+                    for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
                 ]
                 sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
 
-            for (kind, file_unique_id, sha256, size, _, message), sent in zip(to_upload, sent_list):
+            for (kind, file_unique_id, sha256, size, _, message, thumb, meta), sent in zip(to_upload, sent_list):
                 db.record_file(
                     file_unique_id=file_unique_id,
                     sha256=sha256,
@@ -414,17 +579,17 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
 
         if to_upload:
             await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
-            print(f"  └─ 归档媒体组 {len(to_upload)} 张")
+            logger.info("归档媒体组 %s 张", len(to_upload))
         for message in new_messages:
             await archive_single(message, mark=mark)
         if mark:
             for item in to_upload:
-                await mark_processed(item[5], duplicate=False)  # item[5] 是 Message 对象
+                await mark_processed(item[5], duplicate=False)  # item[5] 仍是 Message 对象
             for message in dup_messages:
                 await mark_processed(message, duplicate=True)
 
     finally:
-        for p in local_paths:
+        for p in temp_files:
             if os.path.exists(p):
                 os.remove(p)
                 try:
@@ -459,7 +624,7 @@ async def process_link_message(message: Message):
         try:
             msg = await app.get_messages(chat, msg_id)
             if msg is None:
-                print(f"[warn] 消息 {link} 不可访问或已删除", file=sys.stderr)
+                logger.warning("消息 %s 不可访问或已删除", link)
                 continue
 
             # 媒体组：拉整组，复用 archive_group()
@@ -469,20 +634,19 @@ async def process_link_message(message: Message):
                 # mark=False：不编辑源频道消息，最终只标记接收频道里的链接消息
                 await archive_group(group, mark=False)
                 archived += len(group)
-                print(f"  └─ 链接 {link} → 媒体组 {len(group)} 张")
+                logger.info("链接 %s → 媒体组 %s 张", link, len(group))
             else:
                 kind, _ = get_media(msg)
                 if kind:
                     if await archive_single(msg, mark=False):
                         archived += 1
-                        print(f"  └─ 链接 {link} → {kind}")
+                        logger.info("链接 %s → %s", link, kind)
                     else:
-                        print(f"  └─ 链接 {link} → 下载失败")
+                        logger.info("链接 %s → 下载失败", link)
                 else:
-                    print(f"  └─ 链接 {link} → 无媒体")
+                    logger.info("链接 %s → 无媒体", link)
         except Exception:
-            print(f"[warn] 处理链接 {link} 失败", file=sys.stderr)
-            traceback.print_exc()
+            logger.warning("处理链接 %s 失败", link, exc_info=True)
 
     # 只有确实归档了文件才打标记
     if archived > 0:
@@ -518,7 +682,7 @@ async def scan_once():
     # 限制每轮处理量，剩余留给下轮，避免短时间大量上传触发 Telegram 风控
     if total > BATCH_SIZE:
         new_messages = new_messages[:BATCH_SIZE]
-        print(f"[listener] 待处理 {total} 条，本轮处理 {BATCH_SIZE} 条，剩余 {total - BATCH_SIZE} 条下轮继续")
+        logger.info("待处理 %s 条，本轮处理 %s 条，剩余 %s 条下轮继续", total, BATCH_SIZE, total - BATCH_SIZE)
 
     handled_groups = set()
     processed = 0
@@ -549,15 +713,20 @@ async def scan_once():
         db.set_checkpoint(RECEIVE_CHAT, msg.id)
 
     if processed:
-        print(f"[listener] 本轮完成：处理 {processed} 条消息")
+        logger.info("本轮完成：处理 %s 条消息", processed)
     return processed
 
 
 async def main():
+    # 启动预检：ffmpeg/ffprobe 缺失时直接退出，让 Docker 重启
+    if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
+        logger.error("ffmpeg/ffprobe 未安装，退出")
+        sys.exit(1)
+
     async with app:
         db.ensure_channel(RECEIVE_CHAT, "manual_forward")
         me = await app.get_me()
-        print(f"[listener] 已登录：{me.first_name} (id={me.id})，冷却间隔 {SCAN_INTERVAL_SECONDS}s")
+        logger.info("已登录：%s (id=%s)，冷却间隔 %ss", me.first_name, me.id, SCAN_INTERVAL_SECONDS)
         last_processed_at = 0.0
 
         while True:
@@ -565,18 +734,17 @@ async def main():
                 elapsed = time.time() - last_processed_at
                 if elapsed < SCAN_INTERVAL_SECONDS:
                     wait = SCAN_INTERVAL_SECONDS - elapsed
-                    print(f"[listener] 冷却中，{wait:.0f}s 后扫描")
+                    logger.debug("冷却中，%.0fs 后扫描", wait)
                     await asyncio.sleep(wait)
 
                 n = await scan_once()
                 if n > 0:
                     last_processed_at = time.time()
                 else:
-                    print(f"[listener] 无新消息，{SCAN_INTERVAL_SECONDS}s 后再查")
+                    logger.debug("无新消息，%ss 后再查", SCAN_INTERVAL_SECONDS)
                     await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             except Exception:
-                print("[listener] 本轮扫描出错：", file=sys.stderr)
-                traceback.print_exc()
+                logger.error("本轮扫描出错", exc_info=True)
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
