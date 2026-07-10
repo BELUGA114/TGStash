@@ -28,6 +28,7 @@ services:
       - TG_API_HASH
       - ARCHIVE_CHAT_ID
       - HTTP_PROXY
+      - LOG_LEVEL
     volumes:
       - /data/TGStash/tdl-session:/root/.tdl
       - /data/TGStash/db:/data/db
