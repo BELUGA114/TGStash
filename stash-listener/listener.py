@@ -151,7 +151,7 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
             suffix = ".mp4" if "mp4" in (mime_type or "") else ".mp4"
             new_path = path + suffix
             os.rename(path, new_path)
-            logger.info("补后缀 video → %s", suffix)
+            logger.debug("补后缀 video → %s", suffix)
             return new_path
         return path
 
@@ -169,21 +169,21 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
                     img = img.convert("RGB")
                 img.save(new_path, "JPEG", quality=95)
                 os.remove(path)
-                logger.info("格式转换 %s → JPEG", fmt)
+                logger.debug("格式转换 %s → JPEG", fmt)
                 return new_path
 
             # 本身就是 JPEG 但文件没有后缀，补上
             if fmt == "JPEG" and not ext:
                 new_path = path + ".jpg"
                 os.rename(path, new_path)
-                logger.info("补后缀 %s", fmt)
+                logger.debug("补后缀 %s", fmt)
                 return new_path
 
             # 其他图片格式但无后缀，统一加 .jpg
             if not ext:
                 new_path = path + ".jpg"
                 os.rename(path, new_path)
-                logger.info("补后缀 %s", fmt or "未知")
+                logger.debug("补后缀 %s", fmt or "未知")
                 return new_path
     except Exception:
         pass
@@ -315,9 +315,12 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
     orig_name = getattr(media, "file_name", None)
     dl_name = orig_name or f"{message.id}_"
 
+    logger.info("开始处理 %s (%s)", message.id, kind)
+
     # 下载（下载失败 = 不推进 checkpoint，下轮重试）
     try:
         local_path = await app.download_media(message=message, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
+        logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
         if local_path is None:
             logger.warning("下载 %s 返回 None，下轮重试", message.id)
             return False
@@ -331,9 +334,11 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
     try:
         # 文件完整性校验（抛 RuntimeError → return False，不推进 checkpoint）
         verify_download_size(local_path, getattr(media, "file_size", None))
+        logger.debug("校验通过 %s", message.id)
 
         sha256 = sha256_of_file(local_path)
         size = os.path.getsize(local_path)
+        logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
         local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
@@ -359,8 +364,10 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
         # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
         thumb_path = None
         if kind == "video":
+            logger.debug("ffprobe 探测 %s ...", message.id)
             meta = await asyncio.to_thread(probe_video, local_path)
             if meta is None:
+                logger.debug("ffprobe %s 失败，回退源消息元数据", message.id)
                 meta = {
                     "duration": getattr(media, "duration", 0) or 0,
                     "width": getattr(media, "width", 0) or 0,
@@ -372,12 +379,17 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
                 source_dur = getattr(media, "duration", 0) or 0
                 if source_dur:
                     meta["duration"] = source_dur
+                    logger.debug("ffprobe %s duration=0，回退源数据 duration=%s", message.id, source_dur)
+            logger.debug("ffprobe %s: duration=%s, %sx%s", message.id, meta["duration"], meta["width"], meta["height"])
 
+            logger.debug("生成缩略图 %s ...", message.id)
             thumb_path = os.path.join(msg_dir, "thumb.jpg")
             thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
             if thumb_path:
+                logger.debug("缩略图 %s: %s (%s bytes)", message.id, thumb_path, os.path.getsize(thumb_path))
                 temp_files.append(thumb_path)
 
+            logger.debug("上传视频 %s ...", message.id)
             sent = await app.send_video(
                 ARCHIVE_CHAT, local_path,
                 duration=meta["duration"],
@@ -388,11 +400,13 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
             )
         else:
             assert kind is not None
+            logger.debug("上传 %s %s ...", kind, message.id)
             send = getattr(app, SEND_METHOD[kind])
             try:
                 sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
             except PhotoExtInvalid:
                 # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
+                logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
                 sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
         assert sent is not None and sent.id is not None
 
@@ -480,6 +494,7 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
 
         local_path = result
         temp_files.append(local_path)
+        logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
 
         # 文件完整性校验（失败跳过本条，不阻塞整组）
         try:
@@ -487,9 +502,11 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
         except RuntimeError:
             logger.warning("文件校验失败 %s，跳过", message.id)
             continue
+        logger.debug("校验通过 %s", message.id)
 
         sha256 = sha256_of_file(local_path)
         size = os.path.getsize(local_path)
+        logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
         local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
         temp_files[-1] = local_path  # _fix_media_format 可能改了路径，更新追踪
@@ -517,8 +534,10 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
         thumb_path = None
         meta = {}
         if kind == "video":
+            logger.debug("ffprobe 探测 %s ...", message.id)
             meta = await asyncio.to_thread(probe_video, local_path)
             if meta is None:
+                logger.debug("ffprobe %s 失败，回退源消息元数据", message.id)
                 meta = {
                     "duration": getattr(media, "duration", 0) or 0,
                     "width": getattr(media, "width", 0) or 0,
@@ -530,10 +549,14 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
                 source_dur = getattr(media, "duration", 0) or 0
                 if source_dur:
                     meta["duration"] = source_dur
+                    logger.debug("ffprobe %s duration=0，回退源数据 duration=%s", message.id, source_dur)
+            logger.debug("ffprobe %s: duration=%s, %sx%s", message.id, meta["duration"], meta["width"], meta["height"])
 
+            logger.debug("生成缩略图 %s ...", message.id)
             thumb_path = os.path.join(msg_dir, "thumb.jpg")
             thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
             if thumb_path:
+                logger.debug("缩略图 %s: %s (%s bytes)", message.id, thumb_path, os.path.getsize(thumb_path))
                 temp_files.append(thumb_path)
 
         # to_upload: 从 6 元素扩到 8 元素（+thumb_path +meta）
@@ -558,11 +581,13 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
                 else:
                     input_media.append(INPUT_MEDIA_CLASS[kind](path, caption=caption))
 
+            logger.debug("上传媒体组 %s 条 ...", len(to_upload))
             try:
                 sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
             except PhotoExtInvalid:
                 # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
                 # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
+                logger.debug("PhotoExtInvalid，回退整组 send_document")
                 input_media = [
                     InputMediaDocument(path, caption=(m.caption or "") if i == 0 else "")
                     for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
@@ -657,7 +682,7 @@ async def process_link_message(message: Message):
                         archived += 1
                         logger.info("链接 %s → %s", link, kind)
                     else:
-                        logger.info("链接 %s → 下载失败", link)
+                        logger.warning("链接 %s → 下载失败", link)
                 else:
                     logger.info("链接 %s → 无媒体", link)
         except Exception:
