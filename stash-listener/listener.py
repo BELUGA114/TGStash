@@ -712,7 +712,8 @@ async def scan_once():
     new_messages = []
     # reverse=True 让消息从旧到新排列——配合 min_id checkpoint 机制，
     # 每处理完一条就推进 checkpoint，中途崩溃可以从最后成功的那条继续
-    async for msg in app.get_chat_history(RECEIVE_CHAT, min_id=last_id, reverse=True):
+    # min_id 在 Pyrogram 是包含边界 >=，+1 确保不重复拉取已 checkpoint 的消息
+    async for msg in app.get_chat_history(RECEIVE_CHAT, min_id=last_id + 1, reverse=True):
         new_messages.append(msg)
 
     if not new_messages:
