@@ -359,7 +359,8 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
                 await mark_processed(message, duplicate=True)
             return True
 
-        caption = message.caption or ""
+        # 转发到频道的文档类消息（.iso/.apk），文本可能在 text 而非 caption 字段
+        caption = message.caption or message.text or ""
 
         # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
         thumb_path = None
@@ -459,6 +460,17 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
     dup_messages = []
     new_messages = []
     temp_files = []  # 显式追踪所有临时文件（视频 + 缩略图），finally 统一清理
+
+    # 媒体组的 caption 由 Telegram 只存在第一条消息上。提前抓取，
+    # 以防第一条被去重/下载失败/校验失败过滤后 caption 丢失。
+    # 转发到频道的文档类消息，文本可能在 text 而非 caption 字段。
+    # 多条转发消息被 Telegram 编组后，各自可能带独立文字，全部收集。
+    caps = []
+    for m in messages:
+        cap = (m.caption or m.text or "").strip()
+        if cap and cap not in caps:
+            caps.append(cap)
+    group_caption = "\n".join(caps)
 
     # 阶段一：准备下载任务，跳过重复
     downloads: list[tuple] = []
@@ -565,61 +577,106 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
     # 阶段四：上传 + 清理
     try:
         if to_upload:
-            # 构造 InputMedia 列表，video 类型传入 thumb/duration/width/height
-            input_media = []
-            for i, (kind, _, _, _, path, m, thumb, meta) in enumerate(to_upload):
-                caption = (m.caption or "") if i == 0 else ""
-                if kind == "video":
-                    input_media.append(InputMediaVideo(
-                        path,
+            # 多条消息各有独立文字（转发文档被 Telegram 编组）→ 拆组单独上传，
+            # 每条带自己的 caption，还原 "文件A+文字A、文件B+文字B" 的原始布局
+            if len(caps) > 1:
+                for kind, file_unique_id, sha256, size, local_path, message, thumb_path, meta in to_upload:
+                    caption = message.caption or message.text or ""
+                    if kind == "video":
+                        sent = await app.send_video(
+                            ARCHIVE_CHAT, local_path,
+                            duration=meta["duration"],
+                            width=meta["width"],
+                            height=meta["height"],
+                            thumb=thumb_path,
+                            caption=caption,
+                        )
+                    else:
+                        send = getattr(app, SEND_METHOD[kind])
+                        try:
+                            sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+                        except PhotoExtInvalid:
+                            logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
+                            sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+                    assert sent is not None and sent.id is not None
+
+                    db.record_file(
+                        file_unique_id=file_unique_id,
+                        sha256=sha256,
+                        size=size,
+                        archived_chat_id=ARCHIVE_CHAT,
+                        archived_message_id=sent.id,
+                        source="manual_forward",
+                        source_channel=RECEIVE_CHAT,
+                    )
+                    db.record_message(
+                        source_chat_id=RECEIVE_CHAT,
+                        source_message_id=message.id,
+                        source_channel_title=message.chat.title if message.chat else None,
+                        sender=sender_name(message),
+                        sent_at=message.date.isoformat() if message.date else None,
                         caption=caption,
-                        duration=meta["duration"],
-                        width=meta["width"],
-                        height=meta["height"],
-                        thumb=thumb,
-                    ))
-                else:
-                    input_media.append(INPUT_MEDIA_CLASS[kind](path, caption=caption))
+                        file_unique_id=file_unique_id,
+                        media_group_id=message.media_group_id,
+                        archived_chat_id=ARCHIVE_CHAT,
+                        archived_message_id=sent.id,
+                    )
+                    await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
+                logger.info("归档媒体组（拆组）%s 条", len(to_upload))
+            else:
+                # 普通媒体组：共用一条 caption，send_media_group 打包上传
+                input_media = []
+                for i, (kind, _, _, _, path, m, thumb, meta) in enumerate(to_upload):
+                    caption = group_caption if i == 0 else ""
+                    if kind == "video":
+                        input_media.append(InputMediaVideo(
+                            path,
+                            caption=caption,
+                            duration=meta["duration"],
+                            width=meta["width"],
+                            height=meta["height"],
+                            thumb=thumb,
+                        ))
+                    else:
+                        input_media.append(INPUT_MEDIA_CLASS[kind](path, caption=caption))
 
-            logger.debug("上传媒体组 %s 条 ...", len(to_upload))
-            try:
-                sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
-            except PhotoExtInvalid:
-                # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
-                # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
-                logger.debug("PhotoExtInvalid，回退整组 send_document")
-                input_media = [
-                    InputMediaDocument(path, caption=(m.caption or "") if i == 0 else "")
-                    for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
-                ]
-                sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
+                logger.debug("上传媒体组 %s 条 ...", len(to_upload))
+                try:
+                    sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
+                except PhotoExtInvalid:
+                    # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
+                    # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
+                    logger.debug("PhotoExtInvalid，回退整组 send_document")
+                    input_media = [
+                        InputMediaDocument(path, caption=group_caption if i == 0 else "")
+                        for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
+                    ]
+                    sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
 
-            for (kind, file_unique_id, sha256, size, _, message, thumb, meta), sent in zip(to_upload, sent_list):
-                db.record_file(
-                    file_unique_id=file_unique_id,
-                    sha256=sha256,
-                    size=size,
-                    archived_chat_id=ARCHIVE_CHAT,
-                    archived_message_id=sent.id,
-                    source="manual_forward",
-                    source_channel=RECEIVE_CHAT,
-                )
-                db.record_message(
-                    source_chat_id=RECEIVE_CHAT,
-                    source_message_id=message.id,
-                    source_channel_title=message.chat.title if message.chat else None,
-                    sender=sender_name(message),
-                    sent_at=message.date.isoformat() if message.date else None,
-                    caption=message.caption or "",
-                    file_unique_id=file_unique_id,
-                    media_group_id=message.media_group_id,
-                    archived_chat_id=ARCHIVE_CHAT,
-                    archived_message_id=sent.id,
-                )
-
-        if to_upload:
-            await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
-            logger.info("归档媒体组 %s 张", len(to_upload))
+                for (kind, file_unique_id, sha256, size, _, message, thumb, meta), sent in zip(to_upload, sent_list):
+                    db.record_file(
+                        file_unique_id=file_unique_id,
+                        sha256=sha256,
+                        size=size,
+                        archived_chat_id=ARCHIVE_CHAT,
+                        archived_message_id=sent.id,
+                        source="manual_forward",
+                        source_channel=RECEIVE_CHAT,
+                    )
+                    db.record_message(
+                        source_chat_id=RECEIVE_CHAT,
+                        source_message_id=message.id,
+                        source_channel_title=message.chat.title if message.chat else None,
+                        sender=sender_name(message),
+                        sent_at=message.date.isoformat() if message.date else None,
+                        caption=group_caption,
+                        file_unique_id=file_unique_id,
+                        media_group_id=message.media_group_id,
+                        archived_chat_id=ARCHIVE_CHAT,
+                        archived_message_id=sent.id,
+                    )
+                await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
+                logger.info("归档媒体组 %s 张", len(to_upload))
         for message in new_messages:
             await archive_single(message, mark=mark)
         if mark:
