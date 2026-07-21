@@ -132,4 +132,4 @@ docker compose run --rm stash-listener python scripts/test_db.py                
 
 ## 许可证
 
-[MIT](LICENSE)
+[AGPL-3.0](LICENSE)
