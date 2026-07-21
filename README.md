@@ -1,6 +1,6 @@
 # TGStash
 
-轻量 Telegram 个人媒体归档——自动备份到私有频道，去除来源、支持全文搜索。
+轻量 Telegram 个人媒体归档——自动备份到私有频道，去除来源、支持全文搜索
 
 ## 特性
 
@@ -12,18 +12,27 @@
 
 ## 快速开始
 
-### 准备
+### 1. 准备
 
 1. [my.telegram.org](https://my.telegram.org) 申请 `api_id` / `api_hash`
 2. 创建两个频道：接收频道（入口）、备份频道（终点，**私有**）
 3. 准备一个 Telegram 账号，加入两个频道并设为管理员
 
-### 部署
+### 2. 本地部署
+
+复制 `.env.example` 为 `.env`，填写凭据
+
+```env
+TG_API_ID=your_api_id
+TG_API_HASH=your_api_hash
+RECEIVE_CHAT_ID=your_receive_chat_id    # 接收频道的 chat id（获取频道 ID 后填写）
+ARCHIVE_CHAT_ID=your_archive_chat_id    # 备份频道的 chat id（获取频道 ID 后填写）
+HTTP_PROXY=http://host:port             # 代理地址
+```
+
+启动容器
 
 ```bash
-git clone https://github.com/BELUGA114/TGStash.git
-cd TGStash
-cp .env.example .env    # 编辑填入 TG_API_ID / TG_API_HASH / 频道 ID
 docker compose build
 docker compose run --rm stash-listener python login.py
 docker compose up -d
@@ -32,37 +41,29 @@ docker compose up -d
 获取频道 ID（登录后容器内运行）：
 
 ```bash
-docker compose run --rm stash-listener python -c "
-import os, asyncio
-from pyrogram import Client
-async def main():
-    app = Client('listener', api_id=int(os.environ['TG_API_ID']), api_hash=os.environ['TG_API_HASH'], workdir='/data/session')
-    async with app:
-        async for d in app.get_dialogs():
-            if d.chat.id < 0: print(f'{d.chat.id}  {d.chat.title}')
-asyncio.run(main())"
+docker compose run --rm stash-listener python scripts/get_chat_ids.py
 ```
 
-填入 `.env` 的 `RECEIVE_CHAT_ID` / `ARCHIVE_CHAT_ID` 后执行
+添加 `-100` 前缀后填入 `.env` 的 `RECEIVE_CHAT_ID` / `ARCHIVE_CHAT_ID` 后执行
 
 ```bash
 docker compose restart stash-listener
 ```
 
-### 服务器部署
+### 3. 服务器部署
 
-使用 `docker-compose.deploy.yml`，镜像从 GitHub Container Registry 拉取，无需本地构建。首次需在本地跑一次 
+使用 `docker-compose.deploy.yml`，镜像从 GitHub Container Registry 拉取或本地构建，首次需在本地运行 
 
 ```bash
 docker compose run --rm stash-listener python login.py 
 ```
 
-生成 `data/session/`，上传到服务器同路径
+生成 `data/session/`，将其上传到服务器同路径
 
 ## 使用
 
 - **路径一（转发）**：向接收频道转发媒体消息，扫描间隔后自动归档，原消息下方回复 `✅ 已归档`
-- **路径二（链接）**：复制消息链接发到接收频道。支持 `t.me/username/123`（公开）和 `t.me/c/数字/123`（私有，需已加入）。媒体组整组保留，原链接原地编辑
+- **路径二（链接）**：复制消息链接发到接收频道。支持 `t.me/username/123`（公开）和 `t.me/c/数字/123`（私有，账号需已加入），原链接原地编辑添加 `✅ 已归档`
 
 ## 配置
 
@@ -88,27 +89,41 @@ docker compose exec stash-listener python search.py 关键词
 
 FTS5 + trigram 分词器。关键词需要至少 3 个字符
 
-## 运维
+## 备用工具
+
+`tdl-sync`（不随 `up` 启动）——基于 [tdl](https://github.com/iyear/tdl)（Go 实现）的备用归档通道，与主服务共享 `archive.db` 去重库：
+
+- **定位**：主服务 Pyrogram 无法拉取某些频道的媒体时（如限流、格式兼容），用 tdl 作为替代下载通道
+- **用法**：直接在容器内运行 `archiver.py`，传 t.me 链接即可，复用在同一个去重库
 
 ```bash
-docker compose logs -f stash-listener    # 实时日志
-docker compose restart stash-listener    # 重启
-docker compose down                      # 停止
-```
-
-### 备用工具
-
-`tdl-sync`（不随 `up` 启动）：
-
-```bash
-docker compose run --rm tdl-sync tdl -n archiver login -T qr
+# 首次登录（将 code 改为 qr 即可扫码登录）
+docker compose run --rm tdl-sync tdl -n archiver login -T code
+# 列出现有会话
 docker compose run --rm tdl-sync tdl -n archiver chat ls
+# 归档单条消息
+docker compose run --rm tdl-sync python archiver.py https://t.me/c/1234567890/123
 ```
+
+## 调试工具
+
+`scripts/` 目录下的辅助脚本（容器内运行）：
+
+```bash
+docker compose run --rm stash-listener python scripts/get_chat_ids.py           # 列出频道 ID
+docker compose run --rm stash-listener python scripts/delete_message.py 12345   # 删除消息记录并回退 checkpoint
+docker compose run --rm stash-listener python scripts/test_db.py                # db.py 单元测试（需要 pytest）
+```
+
+- **get_chat_ids.py** — 列出当前账号加入的所有频道 ID 和标题，用于填写 `.env`
+- **delete_message.py** — 按 `source_message_id` 删除数据库记录并回退 checkpoint，下次扫描时重新归档。支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
+- **test_db.py** — `db.py` 单元测试，覆盖 schema/checkpoint/去重/FTS5/并发场景
 
 ## 目录结构
 
 ```
 ├── stash-listener/    # 主服务（listener/login/search/db）
+├── scripts/           # 辅助脚本（get_chat_ids/delete_message/test_db）
 ├── tdl-sync/          # 备用批量导出工具
 ├── data/              # 运行时（session/db/tmp，需持久化 db/）
 ├── .env.example       # 配置模板
