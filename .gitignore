@@ -22,6 +22,8 @@ build/
 CLAUDE.md
 .claude/
 docs/
+AGENTS.md
+.codex/
 
 # IDE
 .vscode/
