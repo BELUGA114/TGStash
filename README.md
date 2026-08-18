@@ -35,6 +35,9 @@ HTTP_PROXY=http://host:port             # 代理地址
 ```bash
 docker compose build
 docker compose run --rm stash-listener python login.py
+# tdl 也需要单独登录一次（与 Pyrogram 是两套 session）
+docker compose run --rm stash-listener tdl -n archiver login -T qr    #二维码登录
+docker compose run --rm stash-listener tdl -n archiver login -T code    #验证码登录
 docker compose up -d
 ```
 
@@ -77,6 +80,10 @@ docker compose run --rm stash-listener python login.py
 | `BATCH_SIZE` | `10` | 每轮最多处理消息数 |
 | `UPLOAD_COOLDOWN_SECONDS` | `5` | 每次上传后等待（秒） |
 | `HTTP_PROXY` | — | 代理地址，如 `http://host:port` |
+| `TDL_NAMESPACE` | `archiver` | tdl session 命名空间 |
+| `TDL_THREADS` | `4` | tdl 单文件分块下载线程数上限 |
+| `TDL_LIMIT` | `2` | tdl 同时下载的任务数 |
+| `TDL_TIMEOUT_SECONDS` | `0` | tdl 进程超时，0 表示不超时 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
@@ -88,22 +95,6 @@ docker compose exec stash-listener python search.py 关键词
 ```
 
 FTS5 + trigram 分词器。关键词需要至少 3 个字符
-
-## 备用工具
-
-`tdl-sync`（不随 `up` 启动）——基于 [tdl](https://github.com/iyear/tdl)（Go 实现）的备用归档通道，与主服务共享 `archive.db` 去重库：
-
-- **定位**：主服务 Pyrogram 无法拉取某些频道的媒体时（如限流、格式兼容），用 tdl 作为替代下载通道
-- **用法**：直接在容器内运行 `archiver.py`，传 t.me 链接即可，复用在同一个去重库
-
-```bash
-# 首次登录（将 code 改为 qr 即可扫码登录）
-docker compose run --rm tdl-sync tdl -n archiver login -T code
-# 列出现有会话
-docker compose run --rm tdl-sync tdl -n archiver chat ls
-# 归档单条消息
-docker compose run --rm tdl-sync python archiver.py https://t.me/c/1234567890/123
-```
 
 ## 调试工具
 
@@ -122,10 +113,9 @@ docker compose run --rm stash-listener python scripts/test_db.py                
 ## 目录结构
 
 ```
-├── stash-listener/    # 主服务（listener/login/search/db）
-├── scripts/           # 辅助脚本（get_chat_ids/delete_message/test_db）
-├── tdl-sync/          # 备用批量导出工具
-├── data/              # 运行时（session/db/tmp，需持久化 db/）
+├── stash-listener/    # 主服务（listener/tdl_downloader/login/search/db）
+├── scripts/           # 辅助脚本（get_chat_ids/delete_message/test_db/test_tdl_downloader）
+├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
 ├── .env.example       # 配置模板
 └── docker-compose.yml
 ```

@@ -11,27 +11,16 @@ services:
       - RECEIVE_CHAT_ID
       - ARCHIVE_CHAT_ID
       - HTTP_PROXY
+      - TDL_NAMESPACE
+      - TDL_THREADS
+      - TDL_LIMIT
+      - TDL_TIMEOUT_SECONDS
       - SCAN_INTERVAL_SECONDS=300
       - BATCH_SIZE=10
       - UPLOAD_COOLDOWN_SECONDS=5
       - LOG_LEVEL
     volumes:
       - /data/TGStash/session:/data/session
-      - /data/TGStash/db:/data/db
-      - /data/TGStash/tmp:/data/tmp
-
-  tdl-sync:
-    image: ghcr.io/beluga114/tgstash-tdl:latest
-    network_mode: "host"
-    environment:
-      - TG_API_ID
-      - TG_API_HASH
-      - ARCHIVE_CHAT_ID
-      - HTTP_PROXY
-      - LOG_LEVEL
-    volumes:
       - /data/TGStash/tdl-session:/root/.tdl
       - /data/TGStash/db:/data/db
       - /data/TGStash/tmp:/data/tmp
-    profiles:
-      - manual

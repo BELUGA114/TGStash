@@ -15,8 +15,6 @@ jobs:
         service:
           - context: ./stash-listener
             suffix: ""
-          - context: ./tdl-sync
-            suffix: "-tdl"
 
     steps:
       - uses: actions/checkout@v4

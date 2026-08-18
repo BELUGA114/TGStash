@@ -1,3 +1,5 @@
+FROM iyear/tdl:latest AS tdl
+
 # 编译阶段：用完整镜像编译 TgCrypto（无预编译 wheel）
 FROM python:3.12 AS builder
 WORKDIR /app
@@ -19,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /install /usr/local
+COPY --from=tdl /usr/bin/tdl /usr/local/bin/tdl
 COPY --from=ffmpeg-fetcher /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
-COPY db.py listener.py login.py search.py ./
+COPY db.py listener.py tdl_downloader.py login.py search.py ./
 CMD ["python", "-u", "listener.py"]
