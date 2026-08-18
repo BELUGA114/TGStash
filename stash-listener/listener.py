@@ -42,6 +42,7 @@ from pyrogram.types import (
 )
 
 from db import ArchiveDB
+from tdl_downloader import TDLDownloader
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -53,6 +54,10 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 # 每次上传文件后等待的秒数，降低 Telegram 服务端感知频率
 UPLOAD_COOLDOWN_SECONDS = int(os.environ.get("UPLOAD_COOLDOWN_SECONDS", "5"))
 HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
+TDL_NAMESPACE = os.environ.get("TDL_NAMESPACE", "archiver")
+TDL_THREADS = int(os.environ.get("TDL_THREADS", "4"))
+TDL_LIMIT = int(os.environ.get("TDL_LIMIT", "2"))
+TDL_TIMEOUT_SECONDS = int(os.environ.get("TDL_TIMEOUT_SECONDS", "0"))
 
 SESSION_DIR = "/data/session"
 DB_PATH = "/data/db/archive.db"
@@ -74,6 +79,14 @@ else:
                  max_concurrent_transmissions=2)
 # 并发下载数上限，MTProto 单连接慢，2 个并行可有效提速
 _dl_sem = asyncio.Semaphore(2)
+
+tdl_downloader = TDLDownloader(
+    namespace=TDL_NAMESPACE,
+    threads=TDL_THREADS,
+    limit=TDL_LIMIT,
+    timeout=TDL_TIMEOUT_SECONDS,
+    proxy=HTTP_PROXY,
+)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
@@ -295,7 +308,12 @@ async def mark_processed(message: Message, duplicate: bool):
         pass
 
 
-async def archive_single(message: Message, *, mark: bool = True) -> bool:
+async def archive_single(
+    message: Message,
+    *,
+    mark: bool = True,
+    tme_link: str | None = None,
+) -> bool:
     """处理单条媒体消息。返回 True 表示成功（含跳过重复），False 表示需下轮重试。"""
     kind, media = get_media(message)
     if not media:
@@ -317,16 +335,24 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
 
     logger.info("开始处理 %s (%s)", message.id, kind)
 
-    # 下载（下载失败 = 不推进 checkpoint，下轮重试）
+    # 下载：tdl 并行分块，失败自动回退 Pyrogram；下载失败不推进 checkpoint
+    links = {message.id: tme_link} if tme_link else None
     try:
-        local_path = await app.download_media(message=message, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
-        logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
-        if local_path is None:
-            logger.warning("下载 %s 返回 None，下轮重试", message.id)
-            return False
+        paths = await tdl_downloader.download(
+            [message],
+            msg_dir,
+            fallback=lambda m, path: app.download_media(message=m, file_name=path),  # type: ignore[call-overload]
+            links=links,
+            fallback_paths={message.id: os.path.join(msg_dir, dl_name)},
+        )
     except Exception:
         logger.warning("下载 %s 失败，下轮重试", message.id)
         return False
+    local_path = paths.get(message.id)
+    if local_path is None:
+        logger.warning("下载 %s 失败，下轮重试", message.id)
+        return False
+    logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
 
     # 显式追踪所有临时文件，finally 统一清理
     temp_files = [local_path]
@@ -454,7 +480,12 @@ async def archive_single(message: Message, *, mark: bool = True) -> bool:
     return True
 
 
-async def archive_group(messages: list[Message], *, mark: bool = True):
+async def archive_group(
+    messages: list[Message],
+    *,
+    mark: bool = True,
+    tme_links: dict[int, str] | None = None,
+):
     """媒体组：并行下载（最多 2 个）→ 顺序处理 → 打包成 send_media_group 上传"""
     to_upload: list[tuple] = []
     dup_messages = []
@@ -488,23 +519,46 @@ async def archive_group(messages: list[Message], *, mark: bool = True):
         dl_name = orig_name or f"{message.id}_"
         downloads.append((message, kind, msg_dir, dl_name, media))
 
-    # 阶段二：并行下载（Semaphore 限流，最多 2 个同时）
-    async def _dl_one(msg, msg_dir, dl_name):
-        async with _dl_sem:
-            return await app.download_media(message=msg, file_name=os.path.join(msg_dir, dl_name))  # type: ignore[call-overload]
+    # 阶段二：tdl 并行分块下载；缺失或失败的文件回退 Pyrogram（Semaphore 限流）
+    paths: dict[int, str] = {}
+    if downloads:
+        first_msg = downloads[0][0]
+        batch_dir = os.path.join(
+            DOWNLOAD_DIR,
+            f"batch_{abs(first_msg.chat.id)}_{first_msg.id}_{len(downloads)}",
+        )
+        os.makedirs(batch_dir, exist_ok=True)
+        fallback_paths = {
+            m.id: os.path.join(md, dn)
+            for m, _, md, dn, _ in downloads
+        }
 
-    results = await asyncio.gather(
-        *[_dl_one(msg, md, dn) for msg, _, md, dn, _ in downloads],
-        return_exceptions=True,
-    )
+        async def _fallback(message, path):
+            async with _dl_sem:
+                return await app.download_media(message=message, file_name=path)  # type: ignore[call-overload]
+
+        paths = await tdl_downloader.download(
+            [m for m, _, _, _, _ in downloads],
+            batch_dir,
+            fallback=_fallback,
+            links=tme_links,
+            fallback_paths=fallback_paths,
+        )
 
     # 阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）
-    for (message, kind, msg_dir, dl_name, media), result in zip(downloads, results):
-        if isinstance(result, BaseException):
+    for message, kind, msg_dir, dl_name, media in downloads:
+        local_path = paths.get(message.id)
+        if local_path is None:
             logger.warning("下载 %s 失败，跳过", message.id)
             continue
 
-        local_path = result
+        # tdl 成功时文件在 batch_dir，msg_dir 已无用途，避免残留空目录
+        if os.path.dirname(local_path) != msg_dir:
+            try:
+                os.rmdir(msg_dir)
+            except OSError:
+                pass
+
         temp_files.append(local_path)
         logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
 
@@ -729,13 +783,13 @@ async def process_link_message(message: Message):
                 group = await app.get_media_group(chat, msg_id)
                 group = sorted(group, key=lambda m: m.id)
                 # mark=False：不编辑源频道消息，最终只标记接收频道里的链接消息
-                await archive_group(group, mark=False)
+                await archive_group(group, mark=False, tme_links={msg.id: link})
                 archived += len(group)
                 logger.info("链接 %s → 媒体组 %s 张", link, len(group))
             else:
                 kind, _ = get_media(msg)
                 if kind:
-                    if await archive_single(msg, mark=False):
+                    if await archive_single(msg, mark=False, tme_link=link):
                         archived += 1
                         logger.info("链接 %s → %s", link, kind)
                     else:
