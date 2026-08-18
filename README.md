@@ -1,6 +1,6 @@
 # TGStash
 
-轻量 Telegram 个人媒体归档——自动备份到私有频道，去除来源、支持全文搜索
+轻量 Telegram 个人媒体归档——自动备份到私有频道并去除来源，基于 [Kurigram](https://github.com/KurimuzonAkuma/kurigram) 和 [tdl](https://github.com/iyear/tdl) 实现
 
 ## 特性
 
@@ -34,9 +34,9 @@ HTTP_PROXY=http://host:port             # 代理地址
 
 ```bash
 docker compose build
-# Pyrogram 登录
+# Kurigram 登录
 docker compose run --rm stash-listener python login.py
-# tdl 也需要单独登录一次（与 Pyrogram 是两套 session）
+# tdl 也需要单独登录一次（与 Kurigram 是两套 session）
 docker compose run --rm stash-listener tdl -n archiver login -T qr    # 二维码登录
 docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证码登录
 docker compose up -d
@@ -59,7 +59,11 @@ docker compose restart stash-listener
 使用 `docker-compose.deploy.yml`，镜像从 GitHub Container Registry 拉取或本地构建，首次需在本地运行 
 
 ```bash
-docker compose run --rm stash-listener python login.py 
+# Kurigram 登录
+docker compose run --rm stash-listener python login.py
+# tdl 登录
+docker compose run --rm stash-listener tdl -n archiver login -T qr    # 二维码
+docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证码
 ```
 
 生成 `data/session/`，将其上传到服务器同路径
@@ -124,4 +128,11 @@ docker compose run --rm stash-listener python scripts/test_db.py                
 
 ## 许可证
 
-[AGPL-3.0](LICENSE)
+本项目整体以 [AGPL-3.0](LICENSE) 发布。第三方组件保留各自许可证：
+
+| 组件 | 许可证 |
+|---|---|
+| Kurigram | LGPL-3.0-or-later（随包同时提供 GPL-3.0 `COPYING` 与 LGPL-3.0 `COPYING.lesser`） |
+| tdl | AGPL-3.0 |
+| Pillow | MIT-CMU |
+| ffmpeg / ffprobe | LGPL（BtbN 静态构建） |
