@@ -146,6 +146,22 @@ def test_proxy_threads_limit_template_args(tmp_path):
     assert paths[42].endswith("42_fallback")
 
 
+def test_delay_default_and_custom(tmp_path):
+    delays = []
+
+    async def runner(cmd):
+        delays.append(cmd[cmd.index("--delay") + 1])
+
+    msg = _msg(42)
+    asyncio.run(TDLDownloader(runner=runner).download([msg], str(tmp_path), _fallback))
+    assert delays == ["1s"]
+
+    asyncio.run(
+        TDLDownloader(delay=2.5, runner=runner).download([msg], str(tmp_path), _fallback)
+    )
+    assert delays == ["1s", "2.5s"]
+
+
 def test_fallback_paths_used(tmp_path):
     async def runner(cmd):
         pass

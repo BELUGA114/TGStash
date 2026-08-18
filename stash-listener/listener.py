@@ -57,6 +57,7 @@ HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
 TDL_NAMESPACE = os.environ.get("TDL_NAMESPACE", "archiver")
 TDL_THREADS = int(os.environ.get("TDL_THREADS", "4"))
 TDL_LIMIT = int(os.environ.get("TDL_LIMIT", "2"))
+TDL_DELAY_SECONDS = int(os.environ.get("TDL_DELAY_SECONDS", "1"))
 TDL_TIMEOUT_SECONDS = int(os.environ.get("TDL_TIMEOUT_SECONDS", "0"))
 
 SESSION_DIR = "/data/session"
@@ -84,6 +85,7 @@ tdl_downloader = TDLDownloader(
     namespace=TDL_NAMESPACE,
     threads=TDL_THREADS,
     limit=TDL_LIMIT,
+    delay=TDL_DELAY_SECONDS,
     timeout=TDL_TIMEOUT_SECONDS,
     proxy=HTTP_PROXY,
 )
