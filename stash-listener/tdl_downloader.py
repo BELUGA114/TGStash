@@ -74,6 +74,7 @@ class TDLDownloader:
         namespace: str = "archiver",
         threads: int = 4,
         limit: int = 2,
+        delay: float = 1.0,
         timeout: float = 0,
         proxy: str = "",
         tdl_binary: str = "tdl",
@@ -82,6 +83,7 @@ class TDLDownloader:
         self._namespace = namespace
         self._threads = threads
         self._limit = limit
+        self._delay = delay
         self._timeout = timeout if timeout > 0 else None
         self._proxy = proxy
         self._tdl_binary = tdl_binary
@@ -174,6 +176,8 @@ class TDLDownloader:
             str(self._threads),
             "--limit",
             str(self._limit),
+            "--delay",
+            f"{self._delay:g}s",
         ]
         if self._proxy:
             cmd += ["--proxy", self._proxy]

@@ -34,10 +34,11 @@ HTTP_PROXY=http://host:port             # 代理地址
 
 ```bash
 docker compose build
+# Pyrogram 登录
 docker compose run --rm stash-listener python login.py
 # tdl 也需要单独登录一次（与 Pyrogram 是两套 session）
-docker compose run --rm stash-listener tdl -n archiver login -T qr    #二维码登录
-docker compose run --rm stash-listener tdl -n archiver login -T code    #验证码登录
+docker compose run --rm stash-listener tdl -n archiver login -T qr    # 二维码登录
+docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证码登录
 docker compose up -d
 ```
 
@@ -83,6 +84,7 @@ docker compose run --rm stash-listener python login.py
 | `TDL_NAMESPACE` | `archiver` | tdl session 命名空间 |
 | `TDL_THREADS` | `4` | tdl 单文件分块下载线程数上限 |
 | `TDL_LIMIT` | `2` | tdl 同时下载的任务数 |
+| `TDL_DELAY_SECONDS` | `1` | tdl 每个下载任务之间的间隔（秒） |
 | `TDL_TIMEOUT_SECONDS` | `0` | tdl 进程超时，0 表示不超时 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 
