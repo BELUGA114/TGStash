@@ -10,16 +10,16 @@ services:
       - TG_API_HASH
       - RECEIVE_CHAT_ID
       - ARCHIVE_CHAT_ID
-      - HTTP_PROXY
-      - TDL_NAMESPACE
-      - TDL_THREADS
-      - TDL_LIMIT
-      - TDL_DELAY_SECONDS
-      - TDL_TIMEOUT_SECONDS
-      - SCAN_INTERVAL_SECONDS=300
-      - BATCH_SIZE=10
-      - UPLOAD_COOLDOWN_SECONDS=5
-      - LOG_LEVEL
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - TDL_NAMESPACE=${TDL_NAMESPACE:-archiver}
+      - TDL_THREADS=${TDL_THREADS:-4}
+      - TDL_LIMIT=${TDL_LIMIT:-2}
+      - TDL_DELAY_SECONDS=${TDL_DELAY_SECONDS:-1}
+      - TDL_TIMEOUT_SECONDS=${TDL_TIMEOUT_SECONDS:-0}
+      - SCAN_INTERVAL_SECONDS=${SCAN_INTERVAL_SECONDS:-300}
+      - BATCH_SIZE=${BATCH_SIZE:-10}
+      - UPLOAD_COOLDOWN_SECONDS=${UPLOAD_COOLDOWN_SECONDS:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - /data/TGStash/session:/data/session
       - /data/TGStash/tdl-session:/root/.tdl
