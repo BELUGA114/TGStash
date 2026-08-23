@@ -9,10 +9,6 @@ from pathlib import Path
 
 import pytest
 
-# 把项目根目录加入 sys.path，让 test 能 import db
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "stash-listener"))
 from db import ArchiveDB, SCHEMA
 
 

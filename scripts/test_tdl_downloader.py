@@ -4,12 +4,9 @@ tdl_downloader.py 单元测试
 """
 import asyncio
 import os
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "stash-listener"))
-from tdl_downloader import TDLDownloader, make_tme_link  # noqa: E402
+from tdl_downloader import TDLDownloader, make_tme_link
 
 
 def _msg(message_id, chat_id=-1001234567890):
