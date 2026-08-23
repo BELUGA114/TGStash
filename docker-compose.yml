@@ -1,7 +1,9 @@
 # 本地开发：docker compose build && docker compose up -d
 services:
   stash-listener:
-    build: ./stash-listener
+    build:
+      context: .
+      dockerfile: stash-listener/Dockerfile
     container_name: stash-listener
     restart: unless-stopped
     env_file: .env

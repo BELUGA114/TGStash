@@ -3,7 +3,7 @@ FROM iyear/tdl:latest AS tdl
 # 编译阶段：用完整镜像编译 TgCrypto（无预编译 wheel）
 FROM python:3.12 AS builder
 WORKDIR /app
-COPY requirements.txt .
+COPY stash-listener/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # 使用静态编译的 ffmpeg
@@ -23,5 +23,6 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY --from=tdl /usr/bin/tdl /usr/local/bin/tdl
 COPY --from=ffmpeg-fetcher /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
-COPY db.py listener.py tdl_downloader.py login.py search.py ./
+COPY stash-listener/db.py stash-listener/listener.py stash-listener/tdl_downloader.py stash-listener/login.py stash-listener/search.py ./
+COPY scripts/ ./scripts/
 CMD ["python", "-u", "listener.py"]

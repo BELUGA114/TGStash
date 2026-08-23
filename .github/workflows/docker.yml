@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         service:
-          - context: ./stash-listener
+          - context: .
             suffix: ""
 
     steps:
