@@ -109,12 +109,19 @@ FTS5 + trigram 分词器。关键词需要至少 3 个字符
 ```bash
 docker compose run --rm stash-listener python scripts/get_chat_ids.py           # 列出频道 ID
 docker compose run --rm stash-listener python scripts/delete_message.py 12345   # 删除消息记录并回退 checkpoint
-docker compose run --rm stash-listener python scripts/test_db.py                # db.py 单元测试（需要 pytest）
 ```
 
 - **get_chat_ids.py** — 列出当前账号加入的所有频道 ID 和标题，用于填写 `.env`
-- **delete_message.py** — 按 `source_message_id` 删除数据库记录并回退 checkpoint，下次扫描时重新归档。支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
-- **test_db.py** — `db.py` 单元测试，覆盖 schema/checkpoint/去重/FTS5/并发场景
+- **delete_message.py** — 按 `source_message_id` 删除数据库记录并回退 checkpoint，支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
+
+## 本地开发
+
+测试使用 pytest，覆盖 `db.py`（schema/checkpoint/去重/FTS5/并发场景）与 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
+
+```bash
+python -m pip install pytest
+python -m pytest
+```
 
 ## 目录结构
 
