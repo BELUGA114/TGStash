@@ -1,14 +1,14 @@
 # TGStash
 
-轻量 Telegram 个人媒体归档——自动备份到私有频道并去除来源，基于 [Kurigram](https://github.com/KurimuzonAkuma/kurigram) 和 [tdl](https://github.com/iyear/tdl) 实现
+轻量 Telegram 个人媒体归档工具——自动备份到私有频道并去除来源，基于 [Kurigram](https://github.com/KurimuzonAkuma/kurigram) 和 [tdl](https://github.com/iyear/tdl) 实现
 
 ## 特性
 
-- **双路径归档**：转发媒体自动处理，禁止转发的频道发 t.me 链接即可
-- **双层去重**：file_unique_id + SHA-256，不会重复上传
-- **媒体组保留**：整组打包上传，维持原始排版
-- **视频友好**：本地 ffprobe 重测元数据 + ffmpeg 抽帧缩略图，解决大文件无缩略图/时长显示 00:00
-- **账号安全**：保守限流（BATCH_SIZE/上传冷却/扫描间隔），账号 > 速度
+- **双路径归档**：转发媒体自动处理，禁止转发的消息发 t.me 链接即可
+- **高速下载**：使用 [tdl](https://github.com/iyear/tdl) 并行分块下载
+- **媒体组保留**：整组合并为一条消息上传，维持原始排版
+- **视频友好**：使用 ffprobe 重测元数据 + ffmpeg 抽帧缩略图，解决大文件无缩略图/时长显示 00:00
+- **账号安全**：保守限流（BATCH_SIZE/上传冷却/扫描间隔），账号 > 响应速度
 
 ## 快速开始
 
@@ -132,7 +132,7 @@ docker compose run --rm stash-listener python scripts/test_db.py                
 
 | 组件 | 许可证 |
 |---|---|
-| Kurigram | LGPL-3.0-or-later（随包同时提供 GPL-3.0 `COPYING` 与 LGPL-3.0 `COPYING.lesser`） |
+| Kurigram | LGPL-3.0-or-later |
 | tdl | AGPL-3.0 |
 | Pillow | MIT-CMU |
 | ffmpeg / ffprobe | LGPL（BtbN 静态构建） |
