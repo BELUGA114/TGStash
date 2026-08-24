@@ -675,6 +675,23 @@ async def archive_group(
         thumb_path = None
         meta = {}
         if kind == "video":
+            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过）
+            if VIDEO_COMPRESS_ENABLED and size >= VIDEO_COMPRESS_MIN_SIZE_MB * 1024 * 1024:
+                compressed = os.path.join(msg_dir, "compressed.mp4")
+                logger.info("压缩媒体组视频 %s (%s bytes) → CRF %s ...",
+                            message.id, size, VIDEO_COMPRESS_CRF)
+                ok = await asyncio.to_thread(
+                    compress_video, local_path, compressed, VIDEO_COMPRESS_CRF
+                )
+                if ok and os.path.exists(compressed) and os.path.getsize(compressed) < size:
+                    temp_files.append(compressed)
+                    logger.info("压缩完成 %s → %s bytes（原始 %s bytes）",
+                                message.id, os.path.getsize(compressed), size)
+                    local_path = compressed
+                else:
+                    if os.path.exists(compressed):
+                        os.remove(compressed)
+                    logger.info("压缩失败或未变小，回退原始 %s", message.id)
             logger.debug("ffprobe 探测 %s ...", message.id)
             meta = await asyncio.to_thread(probe_video, local_path)
             if meta is None:
