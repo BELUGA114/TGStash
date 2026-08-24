@@ -41,7 +41,7 @@ from pyrogram.types import (
     ReplyParameters,
 )
 
-from compress_video import compress_video
+from compress_video import maybe_compress_video
 from db import ArchiveDB
 from tdl_downloader import TDLDownloader
 
@@ -433,23 +433,13 @@ async def archive_single(
         # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
         thumb_path = None
         if kind == "video":
-            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过）
-            if VIDEO_COMPRESS_ENABLED and size >= VIDEO_COMPRESS_MIN_SIZE_MB * 1024 * 1024:
-                compressed = os.path.join(msg_dir, "compressed.mp4")
-                logger.info("压缩视频 %s (%s bytes) → CRF %s ...",
-                            message.id, size, VIDEO_COMPRESS_CRF)
-                ok = await asyncio.to_thread(
-                    compress_video, local_path, compressed, VIDEO_COMPRESS_CRF
+            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过；失败/未变小回退原始）
+            if VIDEO_COMPRESS_ENABLED:
+                local_path = await asyncio.to_thread(
+                    maybe_compress_video,
+                    local_path, temp_files,
+                    VIDEO_COMPRESS_ENABLED, VIDEO_COMPRESS_MIN_SIZE_MB, VIDEO_COMPRESS_CRF,
                 )
-                if ok and os.path.exists(compressed) and os.path.getsize(compressed) < size:
-                    temp_files.append(compressed)
-                    logger.info("压缩完成 %s → %s bytes（原始 %s bytes）",
-                                message.id, os.path.getsize(compressed), size)
-                    local_path = compressed
-                else:
-                    if os.path.exists(compressed):
-                        os.remove(compressed)
-                    logger.info("压缩失败或未变小，回退原始 %s", message.id)
             logger.debug("ffprobe 探测 %s ...", message.id)
             meta = await asyncio.to_thread(probe_video, local_path)
             if meta is None:
@@ -675,23 +665,13 @@ async def archive_group(
         thumb_path = None
         meta = {}
         if kind == "video":
-            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过）
-            if VIDEO_COMPRESS_ENABLED and size >= VIDEO_COMPRESS_MIN_SIZE_MB * 1024 * 1024:
-                compressed = os.path.join(msg_dir, "compressed.mp4")
-                logger.info("压缩媒体组视频 %s (%s bytes) → CRF %s ...",
-                            message.id, size, VIDEO_COMPRESS_CRF)
-                ok = await asyncio.to_thread(
-                    compress_video, local_path, compressed, VIDEO_COMPRESS_CRF
+            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过；失败/未变小回退原始）
+            if VIDEO_COMPRESS_ENABLED:
+                local_path = await asyncio.to_thread(
+                    maybe_compress_video,
+                    local_path, temp_files,
+                    VIDEO_COMPRESS_ENABLED, VIDEO_COMPRESS_MIN_SIZE_MB, VIDEO_COMPRESS_CRF,
                 )
-                if ok and os.path.exists(compressed) and os.path.getsize(compressed) < size:
-                    temp_files.append(compressed)
-                    logger.info("压缩完成 %s → %s bytes（原始 %s bytes）",
-                                message.id, os.path.getsize(compressed), size)
-                    local_path = compressed
-                else:
-                    if os.path.exists(compressed):
-                        os.remove(compressed)
-                    logger.info("压缩失败或未变小，回退原始 %s", message.id)
             logger.debug("ffprobe 探测 %s ...", message.id)
             meta = await asyncio.to_thread(probe_video, local_path)
             if meta is None:

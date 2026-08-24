@@ -1,5 +1,6 @@
 """视频压缩模块测试：注入假 ffmpeg，不真正转码。"""
 import asyncio
+import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -75,34 +76,20 @@ def _stub_message(msg_id: int) -> object:
     )
 
 
-def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_path):
-    # 开启压缩 + 阈值 0（任何视频都触发）
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
-
-    msg = _stub_message(9001)
+def _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert=None):
+    """跑一遍 archive_single 视频路径，fake 下载返回 src_video，mock 压缩与上传。"""
     sent = SimpleNamespace(id=7777)  # archive_single 需要 sent.id 落库
-    calls = {"compress": 0}
-
-    # verify_download_size 要求文件 ≥1KB 且存在，fake 下载返回真实文件
-    src_video = tmp_path / "src.mp4"
-    src_video.write_bytes(b"\x00" * 2048)
 
     async def fake_download(messages, *a, **k):
         return {messages[0].id: str(src_video)}
 
-    def fake_compress(src, dst, crf):
-        # 实现里用 asyncio.to_thread 调 compress_video（同步函数丢线程池），
-        # 所以这里也必须是同步函数，否则 to_thread 拿到的是协程对象
-        calls["compress"] += 1
-        return False  # 压缩失败 → 回退原始
-
     async def fake_send_video(chat, path, **k):
-        assert path == str(src_video)  # 回退后上传原始
+        if send_assert:
+            send_assert(path)
         return sent
 
     monkeypatch.setattr(listener.tdl_downloader, "download", fake_download)
-    monkeypatch.setattr(listener, "compress_video", fake_compress)
+    monkeypatch.setattr(cv, "compress_video", fake_compress)
     monkeypatch.setattr(listener.app, "send_video", fake_send_video)
     monkeypatch.setattr(listener.db, "find_by_sha256", lambda *a, **k: None)
     monkeypatch.setattr(listener.db, "find_by_unique_id", lambda *a, **k: None)
@@ -110,4 +97,108 @@ def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_p
     monkeypatch.setattr(listener.db, "record_message", lambda *a, **k: None)
 
     assert asyncio.run(listener.archive_single(msg, mark=False)) is True
+
+
+def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_path):
+    # 开启压缩 + 阈值 0（任何视频都触发）
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
+
+    msg = _stub_message(9001)
+    calls = {"compress": 0}
+
+    # verify_download_size 要求文件 ≥1KB 且存在，fake 下载返回真实文件
+    src_video = tmp_path / "src.mp4"
+    src_video.write_bytes(b"\x00" * 2048)
+
+    def fake_compress(src, dst, crf):
+        calls["compress"] += 1
+        return False  # 压缩失败 → 回退原始
+
+    _run_single_archive(
+        msg, src_video, fake_compress, monkeypatch,
+        send_assert=lambda path: path == str(src_video),  # 回退后上传原始
+    )
     assert calls["compress"] == 1
+
+
+def test_single_video_compress_smaller_uses_compressed(monkeypatch, tmp_path):
+    # 压缩成功且更小 → 用压缩版上传
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
+
+    msg = _stub_message(9001)
+    src_video = tmp_path / "src.mp4"
+    src_video.write_bytes(b"\x00" * 4096)
+
+    def fake_compress(src, dst, crf):
+        # 模拟 ffmpeg 写出更小的压缩产物
+        with open(dst, "wb") as f:
+            f.write(b"\x00" * 1024)
+        return True
+
+    def send_assert(path):
+        assert path != str(src_video)  # 上传的是压缩版
+        assert path.endswith("compressed.mp4")
+
+    _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert)
+
+
+def test_single_video_compress_larger_falls_back(monkeypatch, tmp_path):
+    # 压缩成功但产物≥原始 → 回退原始
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
+
+    msg = _stub_message(9001)
+    src_video = tmp_path / "src.mp4"
+    src_video.write_bytes(b"\x00" * 2048)
+
+    def fake_compress(src, dst, crf):
+        with open(dst, "wb") as f:
+            f.write(b"\x00" * 4096)  # 比原始大 → 回退
+        return True
+
+    _run_single_archive(
+        msg, src_video, fake_compress, monkeypatch,
+        send_assert=lambda path: path == str(src_video),
+    )
+
+
+def test_compress_video_not_called_below_threshold(monkeypatch, tmp_path):
+    # 关闭压缩 → 不调用 compress_video，直接走原管道
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", False)
+
+    msg = _stub_message(9001)
+    src_video = tmp_path / "src.mp4"
+    src_video.write_bytes(b"\x00" * 2048)
+    calls = {"compress": 0}
+
+    def fake_compress(src, dst, crf):
+        calls["compress"] += 1
+        return False
+
+    _run_single_archive(
+        msg, src_video, fake_compress, monkeypatch,
+        send_assert=lambda path: path == str(src_video),
+    )
+    assert calls["compress"] == 0
+
+
+def test_compress_output_lands_in_source_dir(tmp_path):
+    # 回归：媒体组 tdl 文件在 batch_dir（msg_dir 已被清理），压缩产物必须落在
+    # local_path 所在目录，否则 ffmpeg 因目标目录不存在而恒失败
+    src = tmp_path / "batch" / "src.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"\x00" * 2048)
+    temp_files = []
+
+    def fake_compress(src_path, dst_path, crf):
+        assert os.path.dirname(dst_path) == os.path.dirname(src_path)  # 同目录
+        with open(dst_path, "wb") as f:
+            f.write(b"\x00" * 1024)
+        return True
+
+    with patch("compress_video.compress_video", fake_compress):
+        out = cv.maybe_compress_video(str(src), temp_files, True, 0, 28)
+    assert out == str(src.parent / "compressed.mp4")
+    assert temp_files == [str(src.parent / "compressed.mp4")]
