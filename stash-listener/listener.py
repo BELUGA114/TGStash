@@ -380,13 +380,15 @@ async def archive_single(
             links=links,
             fallback_paths={message.id: os.path.join(msg_dir, dl_name)},
         )
-    except Exception:
+    except Exception as e:
         logger.warning("下载 %s 失败，下轮重试", message.id)
-        return False
+        outcome = await _record_failure(message, "download", str(e))
+        return False if outcome == "retry" else True
     local_path = paths.get(message.id)
     if local_path is None:
         logger.warning("下载 %s 失败，下轮重试", message.id)
-        return False
+        outcome = await _record_failure(message, "download", "tdl 返回空路径")
+        return False if outcome == "retry" else True
     logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
 
     # 显式追踪所有临时文件，finally 统一清理
@@ -495,13 +497,15 @@ async def archive_single(
         )
         if mark:
             await mark_processed(message, duplicate=False)
+        _clear_failure(message)
         logger.info("归档 %s (%s)", message.id, kind)
         await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
 
-    except RuntimeError:
+    except RuntimeError as e:
         # verify_download_size 抛出的校验失败，不推进 checkpoint，下轮重试
         logger.warning("文件校验失败 %s，下轮重试", message.id)
-        return False
+        outcome = await _record_failure(message, "verify", str(e))
+        return False if outcome == "retry" else True
     finally:
         for p in temp_files:
             if os.path.exists(p):

@@ -186,3 +186,38 @@ class TestRecordFailure:
         # 不应抛异常
         asyncio.run(listener.alert_failure(msg, "测试告警"))
         asyncio.run(listener.alert_failure(None, "无 chat 的告警"))  # chat None 也安全
+
+
+class TestArchiveSingleFailure:
+    def test_single_download_failure_reports_retry(self, monkeypatch):
+        """下载失败：record_failure → 返回 False（不推进 checkpoint）"""
+        from tdl_downloader import TDLDownloader
+
+        captured = {}
+
+        class FakeTDLSingle:
+            async def download(self, messages, dir, fallback=None, links=None, fallback_paths=None):
+                captured["called"] = True
+                return {}
+
+        monkeypatch.setattr(listener, "tdl_downloader", FakeTDLSingle())
+        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 3)
+        monkeypatch.setattr(listener, "db", SimpleNamespace(
+            find_by_unique_id=lambda x: None,
+            increment_failure=lambda c, m, s, e: 1,
+            mark_failure_skipped=lambda *a: None,
+            delete_failure=lambda *a: None,
+        ))
+        sent = []
+        async def fake_send_message(chat_id, text, reply_parameters=None):
+            sent.append(text)
+            return SimpleNamespace(id=1)
+        monkeypatch.setattr(listener, "app", SimpleNamespace(send_message=fake_send_message))
+
+        msg = _stub_message(42)
+        msg.photo = SimpleNamespace(file_unique_id="uniq-42")  # 无媒体会提前 return True，到不了下载分支
+        result = asyncio.run(listener.archive_single(msg))
+
+        assert result is False
+        assert captured["called"] is True
+        assert len(sent) == 1
