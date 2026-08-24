@@ -59,6 +59,8 @@ TDL_THREADS = int(os.environ.get("TDL_THREADS", "4"))
 TDL_LIMIT = int(os.environ.get("TDL_LIMIT", "2"))
 TDL_DELAY_SECONDS = int(os.environ.get("TDL_DELAY_SECONDS", "1"))
 TDL_TIMEOUT_SECONDS = int(os.environ.get("TDL_TIMEOUT_SECONDS", "0"))
+# 同一条消息累计失败多少次后跳过/剔除（满 N 轮告警并推进，避免卡住 checkpoint）
+RETRY_MAX_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "3"))
 
 SESSION_DIR = "/data/session"
 DB_PATH = "/data/db/archive.db"
@@ -308,6 +310,37 @@ async def mark_processed(message: Message, duplicate: bool):
         await app.send_message(chat.id, text, reply_parameters=ReplyParameters(message_id=message.id))
     except Exception:
         pass
+
+
+async def alert_failure(message: Message, text: str):
+    """在接收频道回复原消息提醒归档失败。尽力而为，失败仅记日志。"""
+    chat = message.chat if message is not None else None
+    if chat is None or chat.id is None:
+        return
+    try:
+        await app.send_message(chat.id, text, reply_parameters=ReplyParameters(message_id=message.id))
+    except Exception:
+        logger.debug("失败告警发送失败", exc_info=True)
+
+
+async def _record_failure(message: Message, stage: str, error: str) -> str:
+    """记录一次失败并决定后续动作。返回 'retry'（未满 N 轮，不推进 checkpoint）或 'skip'（已满 N 轮，跳过/剔除）。"""
+    chat_id = str(message.chat.id) if message.chat and message.chat.id else str(RECEIVE_CHAT)
+    msg_id = message.id
+    count = db.increment_failure(chat_id, msg_id, stage, error)
+    if count == 1:
+        await alert_failure(message, f"⚠️ 归档失败，将自动重试（共 {RETRY_MAX_ATTEMPTS} 次）。阶段: {stage}")
+    if count >= RETRY_MAX_ATTEMPTS:
+        db.mark_failure_skipped(chat_id, msg_id, f"重试 {count} 次仍失败: {stage}")
+        await alert_failure(message, f"⚠️ 归档失败 {count} 次，已跳过。原消息保留。阶段: {stage}，最近错误: {error}")
+        return "skip"
+    return "retry"
+
+
+def _clear_failure(message: Message):
+    """归档成功后自愈：清除该消息的失败记录（如有）。"""
+    chat_id = str(message.chat.id) if message.chat and message.chat.id else str(RECEIVE_CHAT)
+    db.delete_failure(chat_id, message.id)
 
 
 async def archive_single(
