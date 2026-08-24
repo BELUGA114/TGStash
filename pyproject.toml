@@ -1,3 +1,4 @@
 [tool.pytest.ini_options]
 testpaths = ["scripts"]
 pythonpath = ["stash-listener"]
+filterwarnings = ["ignore:There is no current event loop:DeprecationWarning"]
