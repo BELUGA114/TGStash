@@ -86,18 +86,17 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 | `SCAN_INTERVAL_SECONDS` | `300` | 扫描间隔（秒） |
 | `BATCH_SIZE` | `10` | 每轮最多处理消息数 |
 | `UPLOAD_COOLDOWN_SECONDS` | `5` | 每次上传后等待（秒） |
-| `HTTP_PROXY` | — | 代理地址，如 `http://host:port` |
+| `RETRY_MAX_ATTEMPTS` | `3` | 同一条消息归档失败 N 次后跳过/剔除（记录 + 接收频道回复告警，原消息保留） |
 | `TDL_NAMESPACE` | `archiver` | tdl session 命名空间 |
 | `TDL_THREADS` | `4` | tdl 单文件分块下载线程数上限 |
 | `TDL_LIMIT` | `2` | tdl 同时下载的任务数 |
 | `TDL_DELAY_SECONDS` | `1` | tdl 每个下载任务之间的间隔（秒） |
 | `TDL_TIMEOUT_SECONDS` | `0` | tdl 进程超时，0 表示不超时 |
-| `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
-| `RETRY_MAX_ATTEMPTS` | `3` | 同一条消息归档失败 N 次后跳过/剔除（记录 + 接收频道回复告警，原消息保留） |
 | `VIDEO_COMPRESS_ENABLED` | `false` | 是否启用视频压缩（H.264 CRF 恒定质量转码） |
 | `VIDEO_COMPRESS_MIN_SIZE_MB` | `100` | 超过此体积(MB)的视频才触发压缩 |
 | `VIDEO_COMPRESS_CRF` | `28` | H.264 CRF 恒定质量值，越小质量越高体积越大 |
-
+| `HTTP_PROXY` | — | 代理地址，如 `http://host:port` |
+| `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
 
 ## 搜索
