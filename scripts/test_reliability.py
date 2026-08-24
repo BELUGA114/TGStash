@@ -221,3 +221,21 @@ class TestArchiveSingleFailure:
         assert result is False
         assert captured["called"] is True
         assert len(sent) == 1
+
+
+class TestArchiveGroupCheckpoint:
+    def test_scan_once_not_advance_when_pending_failure(self, monkeypatch):
+        """组内有未满 N 轮的失败：不推进 checkpoint"""
+        monkeypatch.setattr(listener, "db", SimpleNamespace(
+            get_checkpoint=lambda c: 0,
+            pending_failures=lambda: ["-1001234567890:41"],
+            set_checkpoint=lambda c, m: set_calls.append(m),
+            ensure_channel=lambda *a: None,
+        ))
+        set_calls = []
+
+        msgs = [_stub_message(41), _stub_message(42)]
+        result = asyncio.run(listener._advance_group_checkpoint(msgs))
+
+        assert result is False
+        assert set_calls == []
