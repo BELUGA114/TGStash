@@ -2,13 +2,15 @@
 可靠性补课单元测试
 覆盖：archive_failures 表的记录/累计/跳过/自愈/待处理查询
 """
+import asyncio
 import os
-import sqlite3
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
 from db import ArchiveDB, SCHEMA
+import listener
 
 
 @pytest.fixture
@@ -95,18 +97,6 @@ class TestFailures:
         assert pending == ["-100123:41"]
 
 
-import asyncio
-import os
-import sys
-from types import SimpleNamespace
-
-# 让测试能 import listener 模块（与 test_db 同一运行方式）
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stash-listener"))
-
-import listener
-from db import ArchiveDB as RealDB
-
-
 def _stub_message(message_id, chat_id=-1001234567890, caption=None, text=None):
     return SimpleNamespace(
         id=message_id,
@@ -191,8 +181,6 @@ class TestRecordFailure:
 class TestArchiveSingleFailure:
     def test_single_download_failure_reports_retry(self, monkeypatch):
         """下载失败：record_failure → 返回 False（不推进 checkpoint）"""
-        from tdl_downloader import TDLDownloader
-
         captured = {}
 
         class FakeTDLSingle:
@@ -255,20 +243,3 @@ class TestArchiveGroupCheckpoint:
 
         assert result is True
         assert set_calls == [42]  # 推进到组内最大消息 id
-
-    def test_scan_once_advance_after_self_heal(self, monkeypatch):
-        """失败成员后来成功（自愈清除失败记录）：不再阻塞推进"""
-        set_calls = []
-        # 模拟：失败已通过 _clear_failure 清除，pending_failures 为空
-        monkeypatch.setattr(listener, "db", SimpleNamespace(
-            get_checkpoint=lambda c: 0,
-            pending_failures=lambda: [],
-            set_checkpoint=lambda c, m: set_calls.append(m),
-            ensure_channel=lambda *a: None,
-        ))
-
-        msgs = [_stub_message(41), _stub_message(42)]
-        result = asyncio.run(listener._advance_group_checkpoint(msgs))
-
-        assert result is True
-        assert set_calls == [42]
