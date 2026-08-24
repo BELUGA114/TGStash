@@ -73,6 +73,23 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(rowid, caption, source_channel_title, sender)
     VALUES (new.id, new.caption, new.source_channel_title, new.sender);
 END;
+
+CREATE TABLE IF NOT EXISTS archive_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_chat_id TEXT NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    failure_stage TEXT NOT NULL,   -- 'download' | 'verify' | 'convert' | 'upload' | 'unknown'
+    last_error TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'retrying',  -- 'retrying' | 'skipped'
+    first_failed_at TEXT,
+    last_failed_at TEXT,
+    skipped_at TEXT,
+    skipped_reason TEXT,
+    UNIQUE(source_chat_id, source_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_failures_status
+    ON archive_failures(status);
 """
 
 
@@ -220,3 +237,57 @@ class ArchiveDB:
                    ORDER BY rank LIMIT ?""",
                 (query, limit),
             ).fetchall()
+
+    def get_failure(self, source_chat_id, source_message_id: int):
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            return con.execute(
+                "SELECT * FROM archive_failures WHERE source_chat_id=? AND source_message_id=?",
+                (str(source_chat_id), source_message_id),
+            ).fetchone()
+
+    def increment_failure(self, source_chat_id, source_message_id: int, failure_stage: str, last_error: str):
+        """累计一次失败；不存在则插入。返回该消息当前的累计次数。"""
+        with self._connect() as con:
+            con.execute(
+                """INSERT INTO archive_failures
+                   (source_chat_id, source_message_id, failure_stage, last_error,
+                    attempt_count, status, first_failed_at, last_failed_at)
+                   VALUES (?,?,?,?,1,'retrying',?,?)
+                   ON CONFLICT(source_chat_id, source_message_id) DO UPDATE SET
+                       attempt_count = attempt_count + 1,
+                       last_error = excluded.last_error,
+                       failure_stage = excluded.failure_stage,
+                       last_failed_at = excluded.last_failed_at,
+                       status = 'retrying'""",
+                (str(source_chat_id), source_message_id, failure_stage, last_error, _now(), _now()),
+            )
+            row = con.execute(
+                "SELECT attempt_count FROM archive_failures WHERE source_chat_id=? AND source_message_id=?",
+                (str(source_chat_id), source_message_id),
+            ).fetchone()
+            return row[0]
+
+    def mark_failure_skipped(self, source_chat_id, source_message_id: int, reason: str):
+        with self._connect() as con:
+            con.execute(
+                """UPDATE archive_failures
+                   SET status='skipped', skipped_at=?, skipped_reason=?
+                   WHERE source_chat_id=? AND source_message_id=?""",
+                (_now(), reason, str(source_chat_id), source_message_id),
+            )
+
+    def delete_failure(self, source_chat_id, source_message_id: int):
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM archive_failures WHERE source_chat_id=? AND source_message_id=?",
+                (str(source_chat_id), source_message_id),
+            )
+
+    def pending_failures(self) -> list[str]:
+        """返回所有仍在重试中的失败消息，格式 'chat:msg'。"""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT source_chat_id, source_message_id FROM archive_failures WHERE status='retrying'"
+            ).fetchall()
+            return [f"{r[0]}:{r[1]}" for r in rows]
