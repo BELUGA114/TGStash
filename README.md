@@ -8,6 +8,7 @@
 - **高速下载**：使用 [tdl](https://github.com/iyear/tdl) 并行分块下载
 - **媒体组保留**：整组合并为一条消息上传，维持原始排版
 - **视频友好**：使用 ffprobe 重测元数据 + ffmpeg 抽帧缩略图，解决大文件无缩略图/时长显示 00:00
+- **视频压缩（可选）**：启用后超过体积阈值的视频用 ffmpeg H.264 CRF 转码归档，压缩产物比原始小才用压缩版，小视频/压缩不划算的保持原样
 - **账号安全**：保守限流（BATCH_SIZE/上传冷却/扫描间隔），账号 > 响应速度
 
 ## 快速开始
@@ -93,6 +94,9 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 | `TDL_TIMEOUT_SECONDS` | `0` | tdl 进程超时，0 表示不超时 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 | `RETRY_MAX_ATTEMPTS` | `3` | 同一条消息归档失败 N 次后跳过/剔除（记录 + 接收频道回复告警，原消息保留） |
+| `VIDEO_COMPRESS_ENABLED` | `false` | 是否启用视频压缩（H.264 CRF 恒定质量转码） |
+| `VIDEO_COMPRESS_MIN_SIZE_MB` | `100` | 超过此体积(MB)的视频才触发压缩 |
+| `VIDEO_COMPRESS_CRF` | `28` | H.264 CRF 恒定质量值，越小质量越高体积越大 |
 
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
 
