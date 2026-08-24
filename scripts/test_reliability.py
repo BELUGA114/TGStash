@@ -93,3 +93,96 @@ class TestFailures:
         db.mark_failure_skipped("-100123", 42, "skip")
         pending = db.pending_failures()
         assert pending == ["-100123:41"]
+
+
+import asyncio
+import os
+import sys
+from types import SimpleNamespace
+
+# 让测试能 import listener 模块（与 test_db 同一运行方式）
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stash-listener"))
+
+import listener
+from db import ArchiveDB as RealDB
+
+
+def _stub_message(message_id, chat_id=-1001234567890, caption=None, text=None):
+    return SimpleNamespace(
+        id=message_id,
+        chat=SimpleNamespace(id=chat_id, title="接收频道"),
+        caption=caption,
+        text=text,
+        media_group_id=None,
+    )
+
+
+class TestRecordFailure:
+    def test_record_failure_first_alert_and_retry(self, db: ArchiveDB, monkeypatch):
+        """首次失败：告警一次，返回 retry（不推进 checkpoint）"""
+        sent = []
+        async def fake_send_message(chat_id, text, reply_parameters=None):
+            sent.append(text)
+            return SimpleNamespace(id=1)
+        monkeypatch.setattr(listener, "app", SimpleNamespace(send_message=fake_send_message))
+        monkeypatch.setattr(listener, "db", db)
+
+        msg = _stub_message(42)
+        result = asyncio.run(listener._record_failure(msg, "download", "tdl 失败"))
+
+        assert result == "retry"
+        assert len(sent) == 1
+        assert "归档失败" in sent[0]
+        row = db.get_failure("-1001234567890", 42)
+        assert row["attempt_count"] == 1
+        assert row["status"] == "retrying"
+
+    def test_record_failure_at_max_skips(self, db: ArchiveDB, monkeypatch):
+        """满 RETRY_MAX_ATTEMPTS：标记 skipped + 告警，返回 skip"""
+        sent = []
+        async def fake_send_message(chat_id, text, reply_parameters=None):
+            sent.append(text)
+            return SimpleNamespace(id=1)
+        monkeypatch.setattr(listener, "app", SimpleNamespace(send_message=fake_send_message))
+        monkeypatch.setattr(listener, "db", db)
+        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 3)
+
+        msg = _stub_message(42)
+        for _ in range(2):
+            asyncio.run(listener._record_failure(msg, "download", "err"))
+        sent.clear()
+        result = asyncio.run(listener._record_failure(msg, "download", "err"))
+
+        assert result == "skip"
+        row = db.get_failure("-1001234567890", 42)
+        assert row["status"] == "skipped"
+        assert len(sent) == 1
+        assert "已跳过" in sent[0]
+
+    def test_record_failure_midway_no_extra_alert(self, db: ArchiveDB, monkeypatch):
+        """中间轮次不再告警（只首次和满 N 轮各一条）"""
+        sent = []
+        async def fake_send_message(chat_id, text, reply_parameters=None):
+            sent.append(text)
+            return SimpleNamespace(id=1)
+        monkeypatch.setattr(listener, "app", SimpleNamespace(send_message=fake_send_message))
+        monkeypatch.setattr(listener, "db", db)
+        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 5)
+
+        msg = _stub_message(42)
+        asyncio.run(listener._record_failure(msg, "download", "err"))
+        asyncio.run(listener._record_failure(msg, "download", "err"))
+        asyncio.run(listener._record_failure(msg, "download", "err"))
+
+        assert len(sent) == 1  # 只有首次那一条
+
+    def test_alert_failure_send_fails_does_not_raise(self, db: ArchiveDB, monkeypatch):
+        """告警发送失败不影响归档流程（尽力而为）"""
+        async def fake_send_message(chat_id, text, reply_parameters=None):
+            raise RuntimeError("network down")
+        monkeypatch.setattr(listener, "app", SimpleNamespace(send_message=fake_send_message))
+
+        msg = _stub_message(42)
+        # 不应抛异常
+        asyncio.run(listener.alert_failure(msg, "测试告警"))
+        asyncio.run(listener.alert_failure(None, "无 chat 的告警"))  # chat None 也安全
