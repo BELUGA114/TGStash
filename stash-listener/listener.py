@@ -454,24 +454,34 @@ async def archive_single(
                 temp_files.append(thumb_path)
 
             logger.debug("上传视频 %s ...", message.id)
-            sent = await app.send_video(
-                ARCHIVE_CHAT, local_path,
-                duration=meta["duration"],
-                width=meta["width"],
-                height=meta["height"],
-                thumb=thumb_path,  # type: ignore[arg-type]
-                caption=caption,
-            )
+            try:
+                sent = await app.send_video(
+                    ARCHIVE_CHAT, local_path,
+                    duration=meta["duration"],
+                    width=meta["width"],
+                    height=meta["height"],
+                    thumb=thumb_path,  # type: ignore[arg-type]
+                    caption=caption,
+                )
+            except Exception as e:
+                logger.warning("上传视频 %s 失败，记录待重试", message.id, exc_info=True)
+                outcome = await _record_failure(message, "upload", str(e))
+                return False if outcome == "retry" else True
         else:
             assert kind is not None
             logger.debug("上传 %s %s ...", kind, message.id)
             send = getattr(app, SEND_METHOD[kind])
             try:
-                sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
-            except PhotoExtInvalid:
-                # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
-                logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
-                sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+                try:
+                    sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+                except PhotoExtInvalid:
+                    # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
+                    logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
+                    sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+            except Exception as e:
+                logger.warning("上传 %s %s 失败，记录待重试", kind, message.id, exc_info=True)
+                outcome = await _record_failure(message, "upload", str(e))
+                return False if outcome == "retry" else True
         assert sent is not None and sent.id is not None
 
         db.record_file(
@@ -925,8 +935,10 @@ async def scan_once():
             if await archive_single(msg):
                 processed += 1
             else:
-                # 下载失败，不推进 checkpoint，下轮重试
-                continue
+                # 失败未满 N 轮：本轮不推进 checkpoint，且必须停止处理后续消息，
+                # 否则下一条会把 checkpoint 推进过这条失败消息，导致它永远不被重试
+                logger.debug("消息 %s 需重试，本轮停止推进 checkpoint", msg.id)
+                break
         elif _has_tme_link(msg):
             n = await process_link_message(msg)
             if n > 0:
