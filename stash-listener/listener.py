@@ -677,22 +677,27 @@ async def archive_group(
             if len(caps) > 1:
                 for kind, file_unique_id, sha256, size, local_path, message, thumb_path, meta in to_upload:
                     caption = message.caption or message.text or ""
-                    if kind == "video":
-                        sent = await app.send_video(
-                            ARCHIVE_CHAT, local_path,
-                            duration=meta["duration"],
-                            width=meta["width"],
-                            height=meta["height"],
-                            thumb=thumb_path,
-                            caption=caption,
-                        )
-                    else:
-                        send = getattr(app, SEND_METHOD[kind])
-                        try:
-                            sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
-                        except PhotoExtInvalid:
-                            logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
-                            sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+                    try:
+                        if kind == "video":
+                            sent = await app.send_video(
+                                ARCHIVE_CHAT, local_path,
+                                duration=meta["duration"],
+                                width=meta["width"],
+                                height=meta["height"],
+                                thumb=thumb_path,
+                                caption=caption,
+                            )
+                        else:
+                            send = getattr(app, SEND_METHOD[kind])
+                            try:
+                                sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+                            except PhotoExtInvalid:
+                                logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
+                                sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+                    except Exception as e:
+                        logger.warning("拆组上传 %s 失败，记录待重试", message.id, exc_info=True)
+                        await _record_failure(message, "upload", str(e))
+                        return False
                     assert sent is not None and sent.id is not None
 
                     db.record_file(
@@ -737,16 +742,23 @@ async def archive_group(
 
                 logger.debug("上传媒体组 %s 条 ...", len(to_upload))
                 try:
-                    sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
-                except PhotoExtInvalid:
-                    # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
-                    # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
-                    logger.debug("PhotoExtInvalid，回退整组 send_document")
-                    input_media = [
-                        InputMediaDocument(path, caption=group_caption if i == 0 else "")
-                        for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
-                    ]
-                    sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
+                    try:
+                        sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)
+                    except PhotoExtInvalid:
+                        # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
+                        # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
+                        logger.debug("PhotoExtInvalid，回退整组 send_document")
+                        input_media = [
+                            InputMediaDocument(path, caption=group_caption if i == 0 else "")
+                            for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
+                        ]
+                        sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
+                except Exception as e:
+                    # 整组上传失败：记录待重试（挂在组内第一条待上传消息上），本轮不推进 checkpoint
+                    logger.warning("媒体组上传失败，记录待重试", exc_info=True)
+                    if to_upload:
+                        await _record_failure(to_upload[0][5], "upload", str(e))
+                    return False
 
                 for (kind, file_unique_id, sha256, size, _, message, thumb, meta), sent in zip(to_upload, sent_list):
                     db.record_file(
@@ -779,13 +791,6 @@ async def archive_group(
                 await mark_processed(item[5], duplicate=False)  # item[5] 仍是 Message 对象
             for message in dup_messages:
                 await mark_processed(message, duplicate=True)
-
-    except Exception as e:
-        # 整组上传失败：记录待重试（挂在组内第一条待上传消息上），本轮不推进 checkpoint
-        logger.warning("媒体组上传失败，记录待重试", exc_info=True)
-        if to_upload:
-            await _record_failure(to_upload[0][5], "upload", str(e))
-        return False
 
     finally:
         for p in temp_files:
