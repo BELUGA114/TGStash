@@ -72,6 +72,7 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 
 - **路径一（转发）**：向接收频道转发媒体消息，扫描间隔后自动归档，原消息下方回复 `✅ 已归档`
 - **路径二（链接）**：复制消息链接发到接收频道。支持 `t.me/username/123`（公开）和 `t.me/c/数字/123`（私有，账号需已加入），原链接原地编辑添加 `✅ 已归档`
+- **失败处理**：归档失败会在接收频道回复原消息告警（首次失败提示将重试，重试满 `RETRY_MAX_ATTEMPTS` 次后标记跳过并保留原消息），单条失败不阻塞后续归档。
 
 ## 配置
 
@@ -91,6 +92,7 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 | `TDL_DELAY_SECONDS` | `1` | tdl 每个下载任务之间的间隔（秒） |
 | `TDL_TIMEOUT_SECONDS` | `0` | tdl 进程超时，0 表示不超时 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
+| `RETRY_MAX_ATTEMPTS` | `3` | 同一条消息归档失败 N 次后跳过/剔除（记录 + 接收频道回复告警，原消息保留） |
 
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
 
