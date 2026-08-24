@@ -23,6 +23,6 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY --from=tdl /usr/bin/tdl /usr/local/bin/tdl
 COPY --from=ffmpeg-fetcher /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
-COPY stash-listener/db.py stash-listener/listener.py stash-listener/tdl_downloader.py stash-listener/login.py stash-listener/search.py ./
+COPY stash-listener/compress_video.py stash-listener/db.py stash-listener/listener.py stash-listener/tdl_downloader.py stash-listener/login.py stash-listener/search.py ./
 COPY scripts/ ./scripts/
 CMD ["python", "-u", "listener.py"]
