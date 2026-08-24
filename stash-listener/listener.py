@@ -588,7 +588,8 @@ async def archive_group(
     for message, kind, msg_dir, dl_name, media in downloads:
         local_path = paths.get(message.id)
         if local_path is None:
-            logger.warning("下载 %s 失败，跳过", message.id)
+            logger.warning("下载 %s 失败，记录待重试", message.id)
+            await _record_failure(message, "download", "tdl 返回空路径")
             continue
 
         # tdl 成功时文件在 batch_dir，msg_dir 已无用途，避免残留空目录
@@ -604,8 +605,9 @@ async def archive_group(
         # 文件完整性校验（失败跳过本条，不阻塞整组）
         try:
             verify_download_size(local_path, getattr(media, "file_size", None))
-        except RuntimeError:
-            logger.warning("文件校验失败 %s，跳过", message.id)
+        except RuntimeError as e:
+            logger.warning("文件校验失败 %s，记录待重试", message.id)
+            await _record_failure(message, "verify", str(e))
             continue
         logger.debug("校验通过 %s", message.id)
 
@@ -778,6 +780,13 @@ async def archive_group(
             for message in dup_messages:
                 await mark_processed(message, duplicate=True)
 
+    except Exception as e:
+        # 整组上传失败：记录待重试（挂在组内第一条待上传消息上），本轮不推进 checkpoint
+        logger.warning("媒体组上传失败，记录待重试", exc_info=True)
+        if to_upload:
+            await _record_failure(to_upload[0][5], "upload", str(e))
+        return False
+
     finally:
         for p in temp_files:
             if os.path.exists(p):
@@ -786,6 +795,19 @@ async def archive_group(
                     os.rmdir(os.path.dirname(p))
                 except OSError:
                     pass
+
+
+async def _advance_group_checkpoint(group: list[Message]) -> bool:
+    """组内所有消息都不再处于重试状态才推进 checkpoint。
+    返回 True 表示已推进，False 表示仍有未满 N 轮的失败待下轮重试。"""
+    ids = {str(m.id) for m in group}
+    chat_id = str(group[0].chat.id) if group[0].chat and group[0].chat.id else str(RECEIVE_CHAT)
+    pending = {p.split(":", 1)[1] for p in db.pending_failures() if p.split(":", 1)[0] == chat_id}
+    if pending & ids:
+        logger.warning("媒体组仍有 %s 条待重试，本轮不推进 checkpoint", len(pending & ids))
+        return False
+    db.set_checkpoint(chat_id, max(m.id for m in group))
+    return True
 
 
 async def process_link_message(message: Message):
@@ -885,7 +907,7 @@ async def scan_once():
             group = sorted(group, key=lambda m: m.id)
             await archive_group(group)
             handled_groups.add(msg.media_group_id)
-            db.set_checkpoint(RECEIVE_CHAT, max(m.id for m in group))
+            await _advance_group_checkpoint(group)
             processed += len(group)
             continue
 
