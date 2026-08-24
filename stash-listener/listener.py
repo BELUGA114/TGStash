@@ -550,6 +550,7 @@ async def archive_group(
             continue
         if db.find_by_unique_id(media.file_unique_id):
             dup_messages.append(message)
+            _clear_failure(message)
             continue
 
         msg_dir = os.path.join(DOWNLOAD_DIR, str(message.id))
@@ -630,6 +631,7 @@ async def archive_group(
                 source_channel=RECEIVE_CHAT,
             )
             dup_messages.append(message)
+            _clear_failure(message)
             continue
 
         if kind not in INPUT_MEDIA_CLASS:
@@ -721,6 +723,7 @@ async def archive_group(
                         archived_chat_id=ARCHIVE_CHAT,
                         archived_message_id=sent.id,
                     )
+                    _clear_failure(message)
                     await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
                 logger.info("归档媒体组（拆组）%s 条", len(to_upload))
             else:
@@ -782,6 +785,7 @@ async def archive_group(
                         archived_chat_id=ARCHIVE_CHAT,
                         archived_message_id=sent.id,
                     )
+                    _clear_failure(message)
                 await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
                 logger.info("归档媒体组 %s 张", len(to_upload))
         for message in new_messages:

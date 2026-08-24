@@ -239,3 +239,36 @@ class TestArchiveGroupCheckpoint:
 
         assert result is False
         assert set_calls == []
+
+    def test_scan_once_advance_when_no_pending_failure(self, monkeypatch):
+        """组内无未满 N 轮的失败：推进 checkpoint"""
+        set_calls = []
+        monkeypatch.setattr(listener, "db", SimpleNamespace(
+            get_checkpoint=lambda c: 0,
+            pending_failures=lambda: [],
+            set_checkpoint=lambda c, m: set_calls.append(m),
+            ensure_channel=lambda *a: None,
+        ))
+
+        msgs = [_stub_message(41), _stub_message(42)]
+        result = asyncio.run(listener._advance_group_checkpoint(msgs))
+
+        assert result is True
+        assert set_calls == [42]  # 推进到组内最大消息 id
+
+    def test_scan_once_advance_after_self_heal(self, monkeypatch):
+        """失败成员后来成功（自愈清除失败记录）：不再阻塞推进"""
+        set_calls = []
+        # 模拟：失败已通过 _clear_failure 清除，pending_failures 为空
+        monkeypatch.setattr(listener, "db", SimpleNamespace(
+            get_checkpoint=lambda c: 0,
+            pending_failures=lambda: [],
+            set_checkpoint=lambda c, m: set_calls.append(m),
+            ensure_channel=lambda *a: None,
+        ))
+
+        msgs = [_stub_message(41), _stub_message(42)]
+        result = asyncio.run(listener._advance_group_checkpoint(msgs))
+
+        assert result is True
+        assert set_calls == [42]
