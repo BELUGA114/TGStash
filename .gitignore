@@ -18,6 +18,9 @@ build/
 # 测试
 .pytest_cache/
 
+# git worktree 隔离工作区
+.worktrees/
+
 # Claude
 CLAUDE.md
 .claude/
