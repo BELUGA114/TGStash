@@ -1,9 +1,11 @@
 """视频压缩模块测试：注入假 ffmpeg，不真正转码。"""
-import os
+import asyncio
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import compress_video as cv
+import listener
 
 
 def test_build_command_has_key_params():
@@ -61,7 +63,6 @@ def _stub_message(msg_id: int) -> object:
     get_media 按 MEDIA_ATTRS 顺序取第一个非空属性（listener.MEDIA_ATTRS[1] == "video"），
     只有 video 属性才会让 kind == "video" 走压缩段。
     """
-    from types import SimpleNamespace
     return SimpleNamespace(
         id=msg_id,
         chat=SimpleNamespace(id=-100123, title="stub"),
@@ -75,16 +76,11 @@ def _stub_message(msg_id: int) -> object:
 
 
 def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_path):
-    import asyncio
-
-    import listener
-
     # 开启压缩 + 阈值 0（任何视频都触发）
     monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
     monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
 
     msg = _stub_message(9001)
-    from types import SimpleNamespace
     sent = SimpleNamespace(id=7777)  # archive_single 需要 sent.id 落库
     calls = {"compress": 0}
 
