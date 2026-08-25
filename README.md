@@ -95,6 +95,7 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 | `VIDEO_COMPRESS_ENABLED` | `false` | 是否启用视频压缩（H.264 CRF 恒定质量转码） |
 | `VIDEO_COMPRESS_MIN_SIZE_MB` | `100` | 超过此体积(MB)的视频才触发压缩 |
 | `VIDEO_COMPRESS_CRF` | `28` | H.264 CRF 恒定质量值，越小质量越高体积越大 |
+| `VIDEO_COMPRESS_THREADS` | `4` | x264 编码线程数上限，设为 `0` 则不限制 |
 | `HTTP_PROXY` | — | 代理地址，如 `http://host:port` |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
