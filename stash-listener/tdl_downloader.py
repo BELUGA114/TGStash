@@ -112,14 +112,16 @@ class TDLDownloader:
         else:
             by_chat: dict[int, list[Message]] = {}
             for message in messages:
-                by_chat.setdefault(message.chat.id, []).append(message)
+                chat = message.chat
+                assert chat is not None and chat.id is not None
+                by_chat.setdefault(chat.id, []).append(message)
             groups = [
                 (
                     msgs,
-                    [make_tme_link(msgs[0].chat.id, m.id) for m in msgs],
+                    [make_tme_link(chat_id, m.id) for m in msgs],
                     False,
                 )
-                for msgs in by_chat.values()
+                for chat_id, msgs in by_chat.items()
             ]
 
         for group, urls, use_group in groups:
@@ -190,13 +192,17 @@ class TDLDownloader:
             "--template",
             DOWNLOAD_TEMPLATE,
             "--restart",
+            # 同名同大小的完整文件直接跳过：进程中断后重跑时复用本地副本，不重新下载
+            "--skip-same",
         ]
         if use_group:
             cmd += ["--group"]
         return cmd
 
     def _find_download(self, message: Message, dest_dir: str) -> str | None:
-        bare = _bare_chat_id(message.chat.id)
+        chat = message.chat
+        assert chat is not None and chat.id is not None
+        bare = _bare_chat_id(chat.id)
         prefixes = (f"{bare}_{message.id}_", f"-100{bare}_{message.id}_")
         for name in sorted(os.listdir(dest_dir)):
             path = os.path.join(dest_dir, name)

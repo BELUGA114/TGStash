@@ -317,9 +317,11 @@ async def mark_processed(message: Message, duplicate: bool):
         pass
 
 
-async def alert_failure(message: Message, text: str):
+async def alert_failure(message: Message | None, text: str):
     """在接收频道回复原消息提醒归档失败。尽力而为，失败仅记日志。"""
-    chat = message.chat if message is not None else None
+    if message is None:
+        return
+    chat = message.chat
     if chat is None or chat.id is None:
         return
     try:
