@@ -24,7 +24,8 @@ DownloadRunner = Callable[[list[str]], Awaitable[None]]
 
 
 def make_tme_link(chat_id: int, message_id: int) -> str:
-    """把 Pyrogram chat.id 转成 tdl 可解析的 t.me/c 链接。
+    """
+    把 Pyrogram chat.id 转成 tdl 可解析的 t.me/c 链接。
 
     Telegram 频道 ID 形如 -1001234567890，t.me/c 链接使用去掉 -100
     的裸频道 ID。
@@ -98,7 +99,8 @@ class TDLDownloader:
         links: dict[int, str] | None = None,
         fallback_paths: dict[int, str] | None = None,
     ) -> dict[int, str]:
-        """下载一批消息，返回 {message_id: 本地路径}。
+        """
+        下载一批消息，返回 {message_id: 本地路径}。
 
         links 供路径二使用：默认按 message.chat.id 构造 t.me/c 链接；
         传入 links 时优先使用原始 t.me 链接。媒体组只传一个链接时自动加
