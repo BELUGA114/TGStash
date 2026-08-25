@@ -15,6 +15,7 @@ def test_build_command_has_key_params():
     assert "ffmpeg" in cmd[0]
     assert "-crf" in s and "28" in s
     assert "libx264" in s
+    assert "-threads" in s
     assert "-c:a" in s and "copy" in s
     assert "-movflags" in s and "+faststart" in s
     # 只降采样不升采样：1920 上限 + force_original_aspect_ratio=decrease
@@ -24,6 +25,12 @@ def test_build_command_has_key_params():
 def test_build_command_respects_crf_override():
     cmd = cv.build_compress_command("s.mp4", "d.mp4", crf=30)
     assert "-crf" in cmd and cmd[cmd.index("-crf") + 1] == "30"
+
+
+def test_build_command_threads_zero_omits_flag(monkeypatch):
+    monkeypatch.setattr(cv, "DEFAULT_THREADS", 0)
+    cmd = cv.build_compress_command("s.mp4", "d.mp4")
+    assert "-threads" not in cmd
 
 
 def test_compress_video_success(tmp_path):

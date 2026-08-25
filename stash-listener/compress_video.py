@@ -8,6 +8,8 @@ import subprocess
 
 DEFAULT_CRF = 28
 MAX_HEIGHT = 1920  # 超过此分辨率才降采样，1080p 及以下不动
+# 编码线程数上限：x264 默认按核心数×1.5 开线程，高核数机器上初始化时内存暴增可能被 OOM 杀死
+DEFAULT_THREADS = int(os.environ.get("VIDEO_COMPRESS_THREADS", "4"))
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +21,14 @@ def _remove_if_exists(path: str) -> None:
 
 def build_compress_command(src_path: str, dst_path: str, crf: int = DEFAULT_CRF) -> list[str]:
     """构造 ffmpeg 命令。只降采样不升采样；音频流拷贝不重编码。"""
-    return [
+    cmd = [
         "ffmpeg", "-y", "-i", src_path,
         "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+    ]
+    # 0 表示不限制线程数
+    if DEFAULT_THREADS > 0:
+        cmd += ["-threads", str(DEFAULT_THREADS)]
+    cmd += [
         "-vf", (
             f"scale='min({MAX_HEIGHT},iw)':'min({MAX_HEIGHT},ih)':"
             "force_original_aspect_ratio=decrease"
@@ -29,6 +36,7 @@ def build_compress_command(src_path: str, dst_path: str, crf: int = DEFAULT_CRF)
         "-c:a", "copy", "-movflags", "+faststart",
         dst_path,
     ]
+    return cmd
 
 
 def compress_video(src_path: str, dst_path: str, crf: int = DEFAULT_CRF) -> bool:
