@@ -57,6 +57,7 @@ def test_download_success_maps_file(tmp_path):
     assert "--threads" in cmd and "4" in cmd
     assert "--limit" in cmd and "2" in cmd
     assert "--restart" in cmd
+    assert "--skip-same" in cmd
 
 
 def test_missing_file_falls_back(tmp_path):
