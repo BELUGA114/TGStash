@@ -149,8 +149,10 @@ def sha256_of_file(path: str) -> str:
 
 
 def verify_download_size(local_path: str, expected_size) -> None:
-    """基线校验：抓最离谱的截断情况，不追求精确匹配。
-    expected_size 拿不到就只做最小体积检查，不当作可疑信号。"""
+    """
+    基线校验：抓最离谱的截断情况，不追求精确匹配。
+    expected_size 拿不到就只做最小体积检查，不当作可疑信号。
+    """
     actual_size = os.path.getsize(local_path)
 
     if actual_size < MIN_PLAUSIBLE_SIZE:
@@ -164,10 +166,12 @@ def verify_download_size(local_path: str, expected_size) -> None:
 
 
 def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
-    """下载后的文件格式可能与 Telegram 声称的类型不匹配。
+    """
+    下载后的文件格式可能与 Telegram 声称的类型不匹配。
 
     - WebP/PNG/GIF → 转 JPEG，保证 Telegram 内联展示
-    - 无后缀视频/图片 → 补后缀，否则 Telegram 解析不出缩略图和时长"""
+    - 无后缀视频/图片 → 补后缀，否则 Telegram 解析不出缩略图和时长
+    """
     if kind == "video":
         if not os.path.splitext(path)[1]:
             suffix = ".mp4" if "mp4" in (mime_type or "") else ".mp4"
@@ -213,9 +217,11 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
 
 
 def probe_video(path: str) -> dict | None:
-    """用 ffprobe 量出真实的 duration/width/height。
+    """
+    用 ffprobe 量出真实的 duration/width/height。
     Telegram 对大文件可能解析不出元数据（duration=0），不能信任源消息自带的值。
-    任何失败都返回 None，调用方看到 None 回退到源消息元数据 → 0，不阻塞归档。"""
+    任何失败都返回 None，调用方看到 None 回退到源消息元数据 → 0，不阻塞归档。
+    """
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -250,10 +256,12 @@ def probe_video(path: str) -> dict | None:
 
 def make_thumbnail(video_path: str, thumb_path: str,
                    timestamp: str = "00:00:01") -> str | None:
-    """用 ffmpeg 抽一帧当缩略图。
+    """
+    用 ffmpeg 抽一帧当缩略图。
     Telegram 对大文件不保证生成缩略图，Pyrogram send_video 的 thumb 参数
     是唯一可靠途径——客户端主动提供缩略图，不指望服务端。
-    画质从 5 递减到 31 重试；任何失败返回 None，不阻塞归档。"""
+    画质从 5 递减到 31 重试；任何失败返回 None，不阻塞归档。
+    """
     for q in (5, 10, 20, 31):
         try:
             result = subprocess.run(
@@ -289,7 +297,8 @@ def sender_name(message: Message) -> str:
 
 
 def parse_message_link(link: str) -> tuple[str, int]:
-    """解析 t.me 链接，返回 (chat_identifier, message_id)
+    """
+    解析 t.me 链接，返回 (chat_identifier, message_id)
 
     https://t.me/username/123    → ("@username", 123)
     https://t.me/c/123456/123    → ("-100123456", 123)
@@ -838,8 +847,10 @@ async def archive_group(
 
 
 async def _advance_group_checkpoint(group: list[Message]) -> bool:
-    """组内所有消息都不再处于重试状态才推进 checkpoint。
-    返回 True 表示已推进，False 表示仍有未满 N 轮的失败待下轮重试。"""
+    """
+    组内所有消息都不再处于重试状态才推进 checkpoint。
+    返回 True 表示已推进，False 表示仍有未满 N 轮的失败待下轮重试。
+    """
     ids = {str(m.id) for m in group}
     chat_id = str(group[0].chat.id) if group[0].chat and group[0].chat.id else str(RECEIVE_CHAT)
     pending = {p.split(":", 1)[1] for p in db.pending_failures() if p.split(":", 1)[0] == chat_id}
@@ -851,11 +862,13 @@ async def _advance_group_checkpoint(group: list[Message]) -> bool:
 
 
 async def process_link_message(message: Message):
-    """处理包含 t.me 链接的文本消息：Pyrogram 直接获取消息 → 复用路径一的去重+上传管道
+    """
+    处理包含 t.me 链接的文本消息：Pyrogram 直接获取消息 → 复用路径一的去重+上传管道
 
     你是频道成员，Pyrogram 可以直接下载（不能"转发"但能"读取+下载"）。
     支持媒体组——检测到 media_group_id 后拉取整组，每张照片的 caption 一并保留。
-    返回实际归档的文件数。"""
+    返回实际归档的文件数。
+    """
     text = message.text or ""
     raw_links = re.findall(r"https?://t\.me/\S+", text)
     seen = set()
