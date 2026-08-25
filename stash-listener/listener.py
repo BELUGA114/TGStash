@@ -359,6 +359,127 @@ def _clear_failure(message: Message):
     db.delete_failure(chat_id, message.id)
 
 
+async def _prepare_video(
+    local_path: str,
+    media: object,
+    temp_files: list[str],
+    thumb_dir: str,
+    message_id: int,
+) -> tuple[str, str | None, dict]:
+    """压缩视频、探测元数据并生成缩略图，返回实际路径和上传参数。"""
+    if VIDEO_COMPRESS_ENABLED:
+        local_path = await asyncio.to_thread(
+            maybe_compress_video,
+            local_path,
+            temp_files,
+            VIDEO_COMPRESS_ENABLED,
+            VIDEO_COMPRESS_MIN_SIZE_MB,
+            VIDEO_COMPRESS_CRF,
+        )
+
+    logger.debug("ffprobe 探测 %s ...", message_id)
+    meta = await asyncio.to_thread(probe_video, local_path)
+    if meta is None:
+        logger.debug("ffprobe %s 失败，回退源消息元数据", message_id)
+        meta = {
+            "duration": getattr(media, "duration", 0) or 0,
+            "width": getattr(media, "width", 0) or 0,
+            "height": getattr(media, "height", 0) or 0,
+        }
+    elif meta["duration"] == 0:
+        # ffprobe 有时拿不到 duration，优先保留源消息中的有效值。
+        source_dur = getattr(media, "duration", 0) or 0
+        if source_dur:
+            meta["duration"] = source_dur
+            logger.debug("ffprobe %s duration=0，回退源数据 duration=%s", message_id, source_dur)
+    logger.debug("ffprobe %s: duration=%s, %sx%s",
+                 message_id, meta["duration"], meta["width"], meta["height"])
+
+    logger.debug("生成缩略图 %s ...", message_id)
+    thumb_path = os.path.join(thumb_dir, "thumb.jpg")
+    thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
+    if thumb_path:
+        logger.debug("缩略图 %s: %s (%s bytes)", message_id, thumb_path, os.path.getsize(thumb_path))
+        temp_files.append(thumb_path)
+
+    return local_path, thumb_path, meta
+
+
+async def _send_media(
+    local_path: str,
+    kind: str,
+    caption: str,
+    *,
+    thumb_path: str | None = None,
+    meta: dict | None = None,
+) -> Message | None:
+    """上传单个媒体；照片格式不被 Telegram 接受时回退为 document。"""
+    if kind == "video":
+        video_meta = meta or {}
+        sent = await app.send_video(
+            ARCHIVE_CHAT,
+            local_path,
+            duration=video_meta["duration"],
+            width=video_meta["width"],
+            height=video_meta["height"],
+            thumb=thumb_path,  # type: ignore[arg-type]
+            caption=caption,
+        )
+    else:
+        send = getattr(app, SEND_METHOD[kind])
+        try:
+            sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
+        except PhotoExtInvalid:
+            logger.debug("PhotoExtInvalid，回退 send_document")
+            sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+
+    return sent
+
+
+def _record_archived_media(
+    message: Message,
+    file_unique_id: str,
+    sha256: str,
+    size: int,
+    sent: Message,
+    caption: str,
+) -> None:
+    """记录已上传文件及其来源消息。"""
+    assert sent.id is not None
+    db.record_file(
+        file_unique_id=file_unique_id,
+        sha256=sha256,
+        size=size,
+        archived_chat_id=ARCHIVE_CHAT,
+        archived_message_id=sent.id,
+        source="manual_forward",
+        source_channel=RECEIVE_CHAT,
+    )
+    db.record_message(
+        source_chat_id=RECEIVE_CHAT,
+        source_message_id=message.id,
+        source_channel_title=message.chat.title if message.chat else None,
+        sender=sender_name(message),
+        sent_at=message.date.isoformat() if message.date else None,
+        caption=caption,
+        file_unique_id=file_unique_id,
+        media_group_id=message.media_group_id,
+        archived_chat_id=ARCHIVE_CHAT,
+        archived_message_id=sent.id,
+    )
+
+
+def _cleanup_temp_files(temp_files: list[str]) -> None:
+    """删除临时文件，并尽力清理其所在的空目录。"""
+    for path in temp_files:
+        if os.path.exists(path):
+            os.remove(path)
+            try:
+                os.rmdir(os.path.dirname(path))
+            except OSError:
+                pass
+
+
 async def archive_single(
     message: Message,
     *,
@@ -443,48 +564,16 @@ async def archive_single(
 
         # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
         thumb_path = None
+        meta = None
         if kind == "video":
-            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过；失败/未变小回退原始）
-            if VIDEO_COMPRESS_ENABLED:
-                local_path = await asyncio.to_thread(
-                    maybe_compress_video,
-                    local_path, temp_files,
-                    VIDEO_COMPRESS_ENABLED, VIDEO_COMPRESS_MIN_SIZE_MB, VIDEO_COMPRESS_CRF,
-                )
-            logger.debug("ffprobe 探测 %s ...", message.id)
-            meta = await asyncio.to_thread(probe_video, local_path)
-            if meta is None:
-                logger.debug("ffprobe %s 失败，回退源消息元数据", message.id)
-                meta = {
-                    "duration": getattr(media, "duration", 0) or 0,
-                    "width": getattr(media, "width", 0) or 0,
-                    "height": getattr(media, "height", 0) or 0,
-                }
-            elif meta["duration"] == 0:
-                # ffprobe 有时拿不到 duration（moov atom 在末尾、截断文件等），
-                # 但源消息元数据可能有正确的值——宁可回退也比传 0 强
-                source_dur = getattr(media, "duration", 0) or 0
-                if source_dur:
-                    meta["duration"] = source_dur
-                    logger.debug("ffprobe %s duration=0，回退源数据 duration=%s", message.id, source_dur)
-            logger.debug("ffprobe %s: duration=%s, %sx%s", message.id, meta["duration"], meta["width"], meta["height"])
-
-            logger.debug("生成缩略图 %s ...", message.id)
-            thumb_path = os.path.join(msg_dir, "thumb.jpg")
-            thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
-            if thumb_path:
-                logger.debug("缩略图 %s: %s (%s bytes)", message.id, thumb_path, os.path.getsize(thumb_path))
-                temp_files.append(thumb_path)
+            local_path, thumb_path, meta = await _prepare_video(
+                local_path, media, temp_files, msg_dir, message.id,
+            )
 
             logger.debug("上传视频 %s ...", message.id)
             try:
-                sent = await app.send_video(
-                    ARCHIVE_CHAT, local_path,
-                    duration=meta["duration"],
-                    width=meta["width"],
-                    height=meta["height"],
-                    thumb=thumb_path,  # type: ignore[arg-type]
-                    caption=caption,
+                sent = await _send_media(
+                    local_path, kind, caption, thumb_path=thumb_path, meta=meta,
                 )
             except Exception as e:
                 logger.warning("上传视频 %s 失败，记录待重试", message.id, exc_info=True)
@@ -493,41 +582,15 @@ async def archive_single(
         else:
             assert kind is not None
             logger.debug("上传 %s %s ...", kind, message.id)
-            send = getattr(app, SEND_METHOD[kind])
             try:
-                try:
-                    sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
-                except PhotoExtInvalid:
-                    # WebP 等格式 Pyrogram 归为 photo，但 Telegram 拒绝以 photo 重传
-                    logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
-                    sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+                sent = await _send_media(local_path, kind, caption)
             except Exception as e:
                 logger.warning("上传 %s %s 失败，记录待重试", kind, message.id, exc_info=True)
                 outcome = await _record_failure(message, "upload", str(e))
                 return False if outcome == "retry" else True
-        assert sent is not None and sent.id is not None
 
-        db.record_file(
-            file_unique_id=file_unique_id,
-            sha256=sha256,
-            size=size,
-            archived_chat_id=ARCHIVE_CHAT,
-            archived_message_id=sent.id,
-            source="manual_forward",
-            source_channel=RECEIVE_CHAT,
-        )
-        db.record_message(
-            source_chat_id=RECEIVE_CHAT,
-            source_message_id=message.id,
-            source_channel_title=message.chat.title if message.chat else None,
-            sender=sender_name(message),
-            sent_at=message.date.isoformat() if message.date else None,
-            caption=caption,
-            file_unique_id=file_unique_id,
-            media_group_id=message.media_group_id,
-            archived_chat_id=ARCHIVE_CHAT,
-            archived_message_id=sent.id,
-        )
+        assert sent is not None and sent.id is not None
+        _record_archived_media(message, file_unique_id, sha256, size, sent, caption)
         if mark:
             await mark_processed(message, duplicate=False)
         _clear_failure(message)
@@ -540,14 +603,7 @@ async def archive_single(
         outcome = await _record_failure(message, "verify", str(e))
         return False if outcome == "retry" else True
     finally:
-        for p in temp_files:
-            if os.path.exists(p):
-                os.remove(p)
-                # 清理空子目录
-                try:
-                    os.rmdir(os.path.dirname(p))
-                except OSError:
-                    pass
+        _cleanup_temp_files(temp_files)
 
     return True
 
@@ -676,37 +732,9 @@ async def archive_group(
         thumb_path = None
         meta = {}
         if kind == "video":
-            # 体积≥阈值且启用时先压缩（SHA-256 去重之后，命中已跳过；失败/未变小回退原始）
-            if VIDEO_COMPRESS_ENABLED:
-                local_path = await asyncio.to_thread(
-                    maybe_compress_video,
-                    local_path, temp_files,
-                    VIDEO_COMPRESS_ENABLED, VIDEO_COMPRESS_MIN_SIZE_MB, VIDEO_COMPRESS_CRF,
-                )
-            logger.debug("ffprobe 探测 %s ...", message.id)
-            meta = await asyncio.to_thread(probe_video, local_path)
-            if meta is None:
-                logger.debug("ffprobe %s 失败，回退源消息元数据", message.id)
-                meta = {
-                    "duration": getattr(media, "duration", 0) or 0,
-                    "width": getattr(media, "width", 0) or 0,
-                    "height": getattr(media, "height", 0) or 0,
-                }
-            elif meta["duration"] == 0:
-                # ffprobe 有时拿不到 duration（moov atom 在末尾、截断文件等），
-                # 但源消息元数据可能有正确的值——宁可回退也比传 0 强
-                source_dur = getattr(media, "duration", 0) or 0
-                if source_dur:
-                    meta["duration"] = source_dur
-                    logger.debug("ffprobe %s duration=0，回退源数据 duration=%s", message.id, source_dur)
-            logger.debug("ffprobe %s: duration=%s, %sx%s", message.id, meta["duration"], meta["width"], meta["height"])
-
-            logger.debug("生成缩略图 %s ...", message.id)
-            thumb_path = os.path.join(msg_dir, "thumb.jpg")
-            thumb_path = await asyncio.to_thread(make_thumbnail, local_path, thumb_path)
-            if thumb_path:
-                logger.debug("缩略图 %s: %s (%s bytes)", message.id, thumb_path, os.path.getsize(thumb_path))
-                temp_files.append(thumb_path)
+            local_path, thumb_path, meta = await _prepare_video(
+                local_path, media, temp_files, msg_dir, message.id,
+            )
 
         # to_upload: 从 6 元素扩到 8 元素（+thumb_path +meta）
         to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message, thumb_path, meta))
@@ -720,48 +748,21 @@ async def archive_group(
                 for kind, file_unique_id, sha256, size, local_path, message, thumb_path, meta in to_upload:
                     caption = message.caption or message.text or ""
                     try:
-                        if kind == "video":
-                            sent = await app.send_video(
-                                ARCHIVE_CHAT, local_path,
-                                duration=meta["duration"],
-                                width=meta["width"],
-                                height=meta["height"],
-                                thumb=thumb_path,
-                                caption=caption,
-                            )
-                        else:
-                            send = getattr(app, SEND_METHOD[kind])
-                            try:
-                                sent = await send(ARCHIVE_CHAT, local_path, caption=caption)
-                            except PhotoExtInvalid:
-                                logger.debug("PhotoExtInvalid %s，回退 send_document", message.id)
-                                sent = await app.send_document(ARCHIVE_CHAT, local_path, caption=caption)
+                        sent = await _send_media(
+                            local_path,
+                            kind,
+                            caption,
+                            thumb_path=thumb_path,
+                            meta=meta,
+                        )
                     except Exception as e:
                         logger.warning("拆组上传 %s 失败，记录待重试", message.id, exc_info=True)
                         await _record_failure(message, "upload", str(e))
                         return False
-                    assert sent is not None and sent.id is not None
 
-                    db.record_file(
-                        file_unique_id=file_unique_id,
-                        sha256=sha256,
-                        size=size,
-                        archived_chat_id=ARCHIVE_CHAT,
-                        archived_message_id=sent.id,
-                        source="manual_forward",
-                        source_channel=RECEIVE_CHAT,
-                    )
-                    db.record_message(
-                        source_chat_id=RECEIVE_CHAT,
-                        source_message_id=message.id,
-                        source_channel_title=message.chat.title if message.chat else None,
-                        sender=sender_name(message),
-                        sent_at=message.date.isoformat() if message.date else None,
-                        caption=caption,
-                        file_unique_id=file_unique_id,
-                        media_group_id=message.media_group_id,
-                        archived_chat_id=ARCHIVE_CHAT,
-                        archived_message_id=sent.id,
+                    assert sent is not None and sent.id is not None
+                    _record_archived_media(
+                        message, file_unique_id, sha256, size, sent, caption,
                     )
                     _clear_failure(message)
                     await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
@@ -804,26 +805,8 @@ async def archive_group(
                     return False
 
                 for (kind, file_unique_id, sha256, size, _, message, thumb, meta), sent in zip(to_upload, sent_list):
-                    db.record_file(
-                        file_unique_id=file_unique_id,
-                        sha256=sha256,
-                        size=size,
-                        archived_chat_id=ARCHIVE_CHAT,
-                        archived_message_id=sent.id,
-                        source="manual_forward",
-                        source_channel=RECEIVE_CHAT,
-                    )
-                    db.record_message(
-                        source_chat_id=RECEIVE_CHAT,
-                        source_message_id=message.id,
-                        source_channel_title=message.chat.title if message.chat else None,
-                        sender=sender_name(message),
-                        sent_at=message.date.isoformat() if message.date else None,
-                        caption=group_caption,
-                        file_unique_id=file_unique_id,
-                        media_group_id=message.media_group_id,
-                        archived_chat_id=ARCHIVE_CHAT,
-                        archived_message_id=sent.id,
+                    _record_archived_media(
+                        message, file_unique_id, sha256, size, sent, group_caption,
                     )
                     _clear_failure(message)
                 await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
@@ -837,13 +820,7 @@ async def archive_group(
                 await mark_processed(message, duplicate=True)
 
     finally:
-        for p in temp_files:
-            if os.path.exists(p):
-                os.remove(p)
-                try:
-                    os.rmdir(os.path.dirname(p))
-                except OSError:
-                    pass
+        _cleanup_temp_files(temp_files)
 
 
 async def _advance_group_checkpoint(group: list[Message]) -> bool:
