@@ -8,11 +8,11 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # 使用静态编译的 ffmpeg
 FROM alpine:3.21 AS ffmpeg-fetcher
-RUN wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz" \
+RUN wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
     -O /tmp/ffmpeg.tar.xz && \
     tar -xf /tmp/ffmpeg.tar.xz -C /tmp && \
-    mv /tmp/ffmpeg-master-latest-linux64-lgpl/bin/ffmpeg \
-       /tmp/ffmpeg-master-latest-linux64-lgpl/bin/ffprobe \
+    mv /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg \
+       /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe \
        /usr/local/bin/
 
 # 运行阶段：仅保留编译产物 + 静态 ffmpeg
