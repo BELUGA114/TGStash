@@ -214,7 +214,7 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
                 logger.debug("补后缀 %s", fmt or "未知")
                 return new_path
     except Exception:
-        pass
+        logger.warning("图片格式修正失败，按原文件继续：%s", path, exc_info=True)
     return path
 
 
@@ -325,7 +325,7 @@ async def mark_processed(message: Message, duplicate: bool):
     try:
         await app.send_message(chat.id, text, reply_parameters=ReplyParameters(message_id=message.id))
     except Exception:
-        pass
+        logger.warning("回复归档标记失败（已归档结果不受影响）：%s", message.id, exc_info=True)
 
 
 async def alert_failure(message: Message | None, text: str):
@@ -900,7 +900,8 @@ async def process_link_message(message: Message):
                 await app.edit_message_text(chat.id, message.id,
                     f"✅ 已归档\n{text}"[:4096])
         except Exception:
-            pass
+            logger.warning("编辑链接消息标记失败（已归档结果不受影响）：%s",
+                           message.id, exc_info=True)
 
     return archived
 
