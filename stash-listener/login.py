@@ -15,7 +15,7 @@ from pyrogram.client import Client
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
-SESSION_DIR = "/data/session"
+SESSION_DIR = os.path.join(os.environ.get("DATA_DIR", "/data"), "session")
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(

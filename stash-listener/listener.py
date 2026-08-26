@@ -67,9 +67,11 @@ VIDEO_COMPRESS_ENABLED = os.environ.get("VIDEO_COMPRESS_ENABLED", "false").lower
 VIDEO_COMPRESS_MIN_SIZE_MB = int(os.environ.get("VIDEO_COMPRESS_MIN_SIZE_MB", "100"))
 VIDEO_COMPRESS_CRF = int(os.environ.get("VIDEO_COMPRESS_CRF", "28"))
 
-SESSION_DIR = "/data/session"
-DB_PATH = "/data/db/archive.db"
-DOWNLOAD_DIR = "/data/tmp/listener"
+# 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖，避免模块导入期就往根目录建目录
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+SESSION_DIR = os.path.join(DATA_DIR, "session")
+DB_PATH = os.path.join(DATA_DIR, "db", "archive.db")
+DOWNLOAD_DIR = os.path.join(DATA_DIR, "tmp", "listener")
 
 os.makedirs(SESSION_DIR, exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
