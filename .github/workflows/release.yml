@@ -116,6 +116,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # actions/checkout 会把 annotated tag 覆盖成轻量 tag：它拿 github.sha（commit）
+      # 去比 `git rev-parse refs/tags/<tag>`（annotated tag 返回的是 tag 对象 sha），
+      # 两者永远不等，于是补一次 `+<commit-sha>:refs/tags/<tag>` 定向 fetch，
+      # refs/tags/<tag> 就直接指向 commit 了 —— 此时 %(contents) 拿到的是 commit
+      # message 而不是 tag 注释。--force 必需：本地已有同名 tag，不加会被
+      # "would clobber existing tag" 拒绝，静默留下错的那个
+      - name: 取回被 checkout 覆盖掉的 annotated tag
+        run: git fetch --tags --force origin
+
       - name: 生成 release 说明（tag 注释 + 自动变更列表）
         env:
           # 走 env 而不是把 ${{ }} 直接插进 run：git 允许 tag 名里带 ; $ | & 反引号
@@ -123,6 +132,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # 轻量 tag 没有注释对象，%(contents) 自然回落到 commit message，就用它，不卡发布
           # 落成文件而不进 $GITHUB_ENV：没有定界符冲突问题，中文原样保留。
           # 现有 tag 都是 annotated 但未签名，所以 %(contents) 里没有 PGP 块
           git tag -l --format='%(contents)' "$TAG" > release-body.md
