@@ -1,0 +1,3 @@
+# 开发/CI 依赖。运行时依赖见 stash-listener/requirements.txt
+-r stash-listener/requirements.txt
+pytest==9.1.1
