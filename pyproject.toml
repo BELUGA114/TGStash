@@ -2,3 +2,15 @@
 testpaths = ["scripts"]
 pythonpath = ["stash-listener"]
 filterwarnings = ["ignore:There is no current event loop:DeprecationWarning"]
+
+[tool.ruff]
+# 与生产运行时对齐（镜像是 python:3.12-slim），不是本机 .venv 的 3.13
+target-version = "py312"
+
+[tool.ruff.lint]
+ignore = [
+    # except Exception 在这里是有意设计：长驻服务单条消息失败不能中断整轮扫描，
+    # 每一处都记了日志并走 archive_failures 重试账；测试里用它收集线程异常再断言。
+    # 收窄成具体异常类型反而会让漏网的异常终止扫描循环
+    "BLE001",
+]
