@@ -55,10 +55,10 @@ async def _run_tdl_process(cmd: list[str], timeout: float | None) -> None:
     )
     try:
         if timeout is None:
-            stdout, stderr = await proc.communicate()
+            _stdout, stderr = await proc.communicate()
         else:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         raise RuntimeError(f"tdl 下载超时（{timeout} 秒）")

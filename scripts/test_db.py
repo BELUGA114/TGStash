@@ -8,8 +8,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-
-from db import ArchiveDB, SCHEMA
+from db import SCHEMA, ArchiveDB
 
 
 @pytest.fixture
