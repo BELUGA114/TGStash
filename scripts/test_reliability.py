@@ -7,10 +7,9 @@ import os
 import tempfile
 from types import SimpleNamespace
 
-import pytest
-
-from db import ArchiveDB, SCHEMA
 import listener
+import pytest
+from db import SCHEMA, ArchiveDB
 
 
 @pytest.fixture
@@ -233,7 +232,7 @@ class TestArchiveGroupCheckpoint:
         set_calls = []
         monkeypatch.setattr(listener, "db", SimpleNamespace(
             get_checkpoint=lambda c: 0,
-            pending_failures=lambda: [],
+            pending_failures=list,
             set_checkpoint=lambda c, m: set_calls.append(m),
             ensure_channel=lambda *a: None,
         ))

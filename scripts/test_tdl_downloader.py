@@ -61,7 +61,7 @@ def test_download_success_maps_file(tmp_path):
 
 
 def test_missing_file_falls_back(tmp_path):
-    calls, runner = _capture_runner(tmp_path, [])
+    _calls, runner = _capture_runner(tmp_path, [])
     fallback_calls = []
 
     async def fallback(message, path):

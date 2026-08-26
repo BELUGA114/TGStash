@@ -31,8 +31,8 @@ for name in expected:
     importlib.import_module(module)
 
 # 3) 运行时第三方依赖真的装进了 /usr/local（COPY --from=builder /install）
-import pyrogram  # noqa: E402,F401
-from PIL import Image  # noqa: E402,F401
+import pyrogram  # noqa: F401
+from PIL import Image  # noqa: F401
 
 assert importlib.util.find_spec("tgcrypto") is not None, "TgCrypto 未装进镜像"
 

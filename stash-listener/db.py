@@ -12,7 +12,7 @@ stash-listener 和 tdl-sync 两个服务各自拷贝一份这个文件，
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
@@ -94,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_archive_failures_status
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class ArchiveDB:

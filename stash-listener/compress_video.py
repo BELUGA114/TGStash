@@ -49,6 +49,7 @@ def compress_video(src_path: str, dst_path: str, crf: int = DEFAULT_CRF) -> bool
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            check=False,
         )
     except Exception as e:
         logger.warning("ffmpeg 压缩启动失败 %s → %s: %s", src_path, dst_path, e)

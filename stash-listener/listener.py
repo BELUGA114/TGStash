@@ -20,29 +20,29 @@
 
 import asyncio
 import hashlib
+import json
+import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from urllib.parse import urlparse
 
-import json, logging, shutil, subprocess
-
+from compress_video import maybe_compress_video
+from db import ArchiveDB
 from PIL import Image
-
 from pyrogram.client import Client
 from pyrogram.errors import PhotoExtInvalid
 from pyrogram.types import (
-    Message,
+    InputMediaAudio,
+    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
-    InputMediaDocument,
-    InputMediaAudio,
+    Message,
     ReplyParameters,
 )
-
-from compress_video import maybe_compress_video
-from db import ArchiveDB
 from tdl_downloader import TDLDownloader
 
 API_ID = int(os.environ["TG_API_ID"])
@@ -83,7 +83,7 @@ if HTTP_PROXY:
     u = urlparse(HTTP_PROXY)
     app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
                  max_concurrent_transmissions=2,
-                 proxy=dict(scheme=u.scheme, hostname=u.hostname, port=u.port))
+                 proxy={"scheme": u.scheme, "hostname": u.hostname, "port": u.port})
 else:
     app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
                  max_concurrent_transmissions=2)
@@ -160,14 +160,13 @@ def verify_download_size(local_path: str, expected_size) -> None:
     if actual_size < MIN_PLAUSIBLE_SIZE:
         raise RuntimeError(f"文件小到不合理（{actual_size} 字节），大概率下载中断")
 
-    if expected_size:
-        if actual_size != expected_size:
-            raise RuntimeError(
-                f"文件大小对不上（期望 {expected_size}，实际 {actual_size}），疑似下载不完整"
-            )
+    if expected_size and actual_size != expected_size:
+        raise RuntimeError(
+            f"文件大小对不上（期望 {expected_size}，实际 {actual_size}），疑似下载不完整"
+        )
 
 
-def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
+def _fix_media_format(path: str, kind: str | None) -> str:
     """
     下载后的文件格式可能与 Telegram 声称的类型不匹配。
 
@@ -176,10 +175,10 @@ def _fix_media_format(path: str, kind: str | None, mime_type: str = "") -> str:
     """
     if kind == "video":
         if not os.path.splitext(path)[1]:
-            suffix = ".mp4" if "mp4" in (mime_type or "") else ".mp4"
-            new_path = path + suffix
+            # Telegram 的视频实际都是 mp4 容器，补后缀它才解析得出时长和缩略图
+            new_path = path + ".mp4"
             os.rename(path, new_path)
-            logger.debug("补后缀 video → %s", suffix)
+            logger.debug("补后缀 video → .mp4")
             return new_path
         return path
 
@@ -271,7 +270,7 @@ def make_thumbnail(video_path: str, thumb_path: str,
                  "-vframes", "1",
                  "-vf", "scale=320:320:force_original_aspect_ratio=decrease:force_divisible_by=2",
                  "-q:v", str(q), thumb_path],
-                capture_output=True, timeout=20,
+                capture_output=True, timeout=20, check=False,
             )
         except FileNotFoundError:
             logger.error("ffmpeg 可执行文件不存在，检查镜像是否装了 ffmpeg")
@@ -280,9 +279,9 @@ def make_thumbnail(video_path: str, thumb_path: str,
             logger.warning("ffmpeg 截图超时（20s），放弃：%s", video_path)
             return None  # 超时卡在解码上，换 -q:v 不会变快，直接跳出循环
 
-        if result.returncode == 0 and os.path.exists(thumb_path):
-            if os.path.getsize(thumb_path) <= 200 * 1024:
-                return thumb_path
+        if (result.returncode == 0 and os.path.exists(thumb_path)
+                and os.path.getsize(thumb_path) <= 200 * 1024):
+            return thumb_path
 
     # 所有画质档位都试过了仍超标（320px 下极少发生），放弃
     if os.path.exists(thumb_path):
@@ -522,12 +521,12 @@ async def archive_single(
     except Exception as e:
         logger.warning("下载 %s 失败，下轮重试", message.id)
         outcome = await _record_failure(message, "download", str(e))
-        return False if outcome == "retry" else True
+        return outcome != "retry"
     local_path = paths.get(message.id)
     if local_path is None:
         logger.warning("下载 %s 失败，下轮重试", message.id)
         outcome = await _record_failure(message, "download", "tdl 返回空路径")
-        return False if outcome == "retry" else True
+        return outcome != "retry"
     logger.debug("下载完成 %s → %s (%s bytes)", message.id, local_path, os.path.getsize(local_path))
 
     # 显式追踪所有临时文件，finally 统一清理
@@ -543,7 +542,7 @@ async def archive_single(
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
-        local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
+        local_path = _fix_media_format(local_path, kind)
         temp_files[0] = local_path  # _fix_media_format 可能改了路径（WebP→JPEG），跟踪新文件
 
         dup = db.find_by_sha256(sha256)
@@ -580,7 +579,7 @@ async def archive_single(
             except Exception as e:
                 logger.warning("上传视频 %s 失败，记录待重试", message.id, exc_info=True)
                 outcome = await _record_failure(message, "upload", str(e))
-                return False if outcome == "retry" else True
+                return outcome != "retry"
         else:
             assert kind is not None
             logger.debug("上传 %s %s ...", kind, message.id)
@@ -589,7 +588,7 @@ async def archive_single(
             except Exception as e:
                 logger.warning("上传 %s %s 失败，记录待重试", kind, message.id, exc_info=True)
                 outcome = await _record_failure(message, "upload", str(e))
-                return False if outcome == "retry" else True
+                return outcome != "retry"
 
         assert sent is not None and sent.id is not None
         _record_archived_media(message, file_unique_id, sha256, size, sent, caption)
@@ -603,7 +602,7 @@ async def archive_single(
         # verify_download_size 抛出的校验失败，不推进 checkpoint，下轮重试
         logger.warning("文件校验失败 %s，下轮重试", message.id)
         outcome = await _record_failure(message, "verify", str(e))
-        return False if outcome == "retry" else True
+        return outcome != "retry"
     finally:
         _cleanup_temp_files(temp_files)
 
@@ -707,7 +706,7 @@ async def archive_group(
         size = os.path.getsize(local_path)
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
-        local_path = _fix_media_format(local_path, kind, getattr(media, "mime_type", ""))
+        local_path = _fix_media_format(local_path, kind)
         temp_files[-1] = local_path  # _fix_media_format 可能改了路径，更新追踪
 
         dup = db.find_by_sha256(sha256)
@@ -992,7 +991,7 @@ async def main():
                     logger.debug("无新消息，%ss 后再查", SCAN_INTERVAL_SECONDS)
                     await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             except Exception:
-                logger.error("本轮扫描出错", exc_info=True)
+                logger.exception("本轮扫描出错")
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
