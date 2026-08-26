@@ -8,10 +8,11 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # 使用静态编译的 ffmpeg。必须是 GPL 版：LGPL 构建不含 libx264 编码器
 FROM alpine:3.21 AS ffmpeg-fetcher
-# 钉死具体构建。原先用 releases/download/latest/ 浮动链接，同一个 git tag
-# 隔几个月重新构建可能拿到完全不同的 ffmpeg
+# 走 9.0 发布线而不是 master 快照：master 会带进新特性和行为变更，
+# 归档服务只需要稳定的解码/编码。同时钉死具体构建，原先的
+# releases/download/latest/ 浮动链接会让同一个 git tag 拿到不同的 ffmpeg
 ARG FFMPEG_RELEASE=autobuild-2026-08-25-13-06
-ARG FFMPEG_BUILD=ffmpeg-N-126264-g007cd1fd43-linux64-gpl
+ARG FFMPEG_BUILD=ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0
 RUN wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz" \
     -O /tmp/ffmpeg.tar.xz && \
     tar -xf /tmp/ffmpeg.tar.xz -C /tmp && \
