@@ -3,8 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 # 默认收到最小；每个 job 自己声明需要什么
@@ -40,12 +38,11 @@ jobs:
           tags: tgstash:smoke
           platforms: linux/amd64
           cache-from: type=gha
-          # PR 只读缓存不写：省 10GB 配额，也不让 PR 的层污染 main 的缓存
-          cache-to: ${{ github.event_name == 'pull_request' && '' || 'type=gha,mode=max' }}
+          cache-to: type=gha,mode=max
 
       - name: 外部二进制 + libx264 编码器
-        # ef22adc 的回归防线：ffmpeg 下载地址是 releases/download/latest/ 浮动链接，
-        # 不改一行代码也可能哪天变成不含 libx264 的构建。这是唯一的探测手段。
+        # ffmpeg 与 tdl 已在 Dockerfile 里钉死版本，这里兜住升级版本号时的回归：
+        # 换成 LGPL 构建或换错资产名都会在这一步红，而不是等到线上压视频时静默回退。
         # grep 的 libx264 前后带空格，避免被 libx264rgb 假阳性
         run: |
           set -euo pipefail
