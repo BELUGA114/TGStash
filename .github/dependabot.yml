@@ -1,0 +1,52 @@
+version: 2
+updates:
+  # 唯一真正好用的一档
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]          # 一周最多一个 PR，不是七个
+    commit-message:
+      prefix: "chore(ci)"
+
+  # 开发依赖：requirements-dev.txt 里的 pytest
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "chore(deps-dev)"
+
+  # 运行时依赖：三个里只有 Kurigram==2.2.23 是精确钉的，会收到 PR；
+  # Pillow>=10.0.0 / TgCrypto>=1.2.5 是开放下界，新版本本来就满足约束，无事可做
+  - package-ecosystem: pip
+    directory: /stash-listener
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "chore(deps)"
+
+  # 基础镜像：实际只有 alpine:3.21 会动。iyear/tdl:latest 没有可比较的版本号，
+  # Dependabot 对它完全无解；ffmpeg 那个裸 URL 也没有任何 ecosystem 覆盖
+  - package-ecosystem: docker
+    directory: /stash-listener
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    ignore:
+      # 生产刻意钉在 3.12（Kurigram/TgCrypto 兼容性），不接受自动跃迁到 3.13
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+    commit-message:
+      prefix: "chore(docker)"
