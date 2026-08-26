@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 默认收到最小；每个 job 自己声明需要什么
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+
+  image:
+    name: 构建镜像并冒烟（不推送）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建并 load 到本地 docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: stash-listener/Dockerfile
+          push: false
+          load: true
+          tags: tgstash:smoke
+          platforms: linux/amd64
+          cache-from: type=gha
+          # PR 只读缓存不写：省 10GB 配额，也不让 PR 的层污染 main 的缓存
+          cache-to: ${{ github.event_name == 'pull_request' && '' || 'type=gha,mode=max' }}
+
+      - name: 外部二进制 + libx264 编码器
+        # ef22adc 的回归防线：ffmpeg 下载地址是 releases/download/latest/ 浮动链接，
+        # 不改一行代码也可能哪天变成不含 libx264 的构建。这是唯一的探测手段。
+        # grep 的 libx264 前后带空格，避免被 libx264rgb 假阳性
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh tgstash:smoke -euc '
+            ffmpeg  -hide_banner -version >/dev/null
+            ffprobe -hide_banner -version >/dev/null
+            tdl version >/dev/null
+            ffmpeg -hide_banner -encoders | grep -q " libx264 "
+            ffmpeg -hide_banner -loglevel error -f lavfi \
+                   -i testsrc=size=64x64:rate=1 -frames:v 1 \
+                   -c:v libx264 -f null -
+          '
+
+      - name: Python 模块导入冒烟
+        run: |
+          set -euo pipefail
+          EXPECTED=$(cd stash-listener && modules=(*.py) && IFS=, && echo "${modules[*]}")
+          echo "期望模块：$EXPECTED"
+          docker run --rm \
+            -e EXPECTED_MODULES="$EXPECTED" \
+            -e TG_API_ID=12345 \
+            -e TG_API_HASH=testhash \
+            -e RECEIVE_CHAT_ID=-1001234567890 \
+            -e ARCHIVE_CHAT_ID=-1009876543210 \
+            -v "$PWD/.github/smoke.py:/smoke.py:ro" \
+            tgstash:smoke python /smoke.py
+
+      - name: 辅助脚本在容器里可用
+        # 依赖 ENV PYTHONPATH=/app：镜像里模块拍平到 /app，而
+        # delete_message.py 插入的 ../stash-listener 在容器里不存在
+        run: docker run --rm tgstash:smoke python scripts/delete_message.py --help

@@ -1,0 +1,46 @@
+name: 测试
+
+# 可复用：ci.yml（push/PR）和 release.yml（tag）都调它，
+# 保证「PR 跑的测试」和「发布前的门禁」永远是同一套步骤
+on:
+  workflow_call:
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 = 生产镜像（python:3.12-slim），3.13 = 本机 .venv。
+        # 两者本来就不一致，只测一个等于放着另一个不管
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            stash-listener/requirements.txt
+
+      - name: 安装依赖
+        # TgCrypto 无预编译 wheel，首次要编译（ubuntu-latest 自带 gcc），
+        # 编好的 wheel 进 ~/.cache/pip，之后走缓存
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: 安装 ffmpeg
+        # compress_video.compress_video() 第一步是 shutil.which("ffmpeg") 预检，
+        # 缺 ffmpeg 会挂 test_compress_video_success 和
+        # test_compress_video_failure_removes_half_product（两个用例只 patch 了
+        # subprocess.run，没 patch shutil.which）。不依赖 runner 是否自带
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: pytest
+        run: python -m pytest -ra
