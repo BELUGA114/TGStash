@@ -13,7 +13,7 @@ import sys
 
 from db import ArchiveDB
 
-DB_PATH = "/data/db/archive.db"
+DB_PATH = os.path.join(os.environ.get("DATA_DIR", "/data"), "db", "archive.db")
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
