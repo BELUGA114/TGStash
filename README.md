@@ -125,7 +125,7 @@ docker compose run --rm stash-listener python scripts/delete_message.py 12345   
 测试使用 pytest，覆盖 `db.py`（schema/checkpoint/去重/FTS5/并发场景）与 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
 
 ```bash
-python -m pip install pytest
+python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
