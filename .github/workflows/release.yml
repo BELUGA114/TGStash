@@ -7,7 +7,8 @@ on:
 permissions: {}
 
 concurrency:
-  # 不 cancel-in-progress：发布跑到一半被取消可能留下推了一半的镜像
+  # 同一 tag 重复推送时串行处理，不 cancel-in-progress：
+  # 发布跑到一半被取消可能留下推了一半的镜像
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
@@ -33,11 +34,13 @@ jobs:
           # metadata-action 自动转小写：BELUGA114/TGStash → beluga114/tgstash，
           # 这就是现在 ghcr.io/beluga114/tgstash 能对上的原因，别手搓 tag 字符串
           images: ghcr.io/${{ github.repository }}
-          # latest=auto：带连字符的 v2.2.0-rc1 这类预发布不会顶掉 latest
-          flavor: latest=auto
+          # 保留带 v 前缀的完整标签（v2.1.1），并补 v2.1 / v2 便于按精度 pin；
+          # 预发布 tag（含连字符，如 v2.2.0-rc1）不会移动 latest 与 v2.1 / v2
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -113,16 +116,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 从 annotated tag 注释生成 release 说明
+      - name: 生成 release 说明（tag 注释 + 自动变更列表）
         env:
           # 走 env 而不是把 ${{ }} 直接插进 run：git 允许 tag 名里带 ; $ | & 反引号
           TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # 落成文件而不进 $GITHUB_ENV：没有 EOF 定界符冲突问题，中文原样保留。
+          # 落成文件而不进 $GITHUB_ENV：没有定界符冲突问题，中文原样保留。
           # 现有 tag 都是 annotated 但未签名，所以 %(contents) 里没有 PGP 块
           git tag -l --format='%(contents)' "$TAG" > release-body.md
           test -s release-body.md
+          # 手写 tag 说明之后追加自动生成的变更列表
+          echo >> release-body.md
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body >> release-body.md
           cat release-body.md
 
       - name: gh release create
@@ -132,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           extra=()
-          # 带连字符的按预发布处理，与 metadata-action 的 latest=auto 保持一致
+          # 带连字符的按预发布处理，与镜像 tag 里 latest 的 enable 条件保持一致
           if [[ "$TAG" == *-* ]]; then
             extra+=(--prerelease)
           fi
