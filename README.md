@@ -69,6 +69,8 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 
 生成 `data/session/`，将其上传到服务器同路径
 
+镜像默认拉 `:latest`。想钉版本或回滚，在服务器 `.env` 里设 `TGSTASH_VERSION`（如 `TGSTASH_VERSION=2.1.1`）后 `docker compose up -d` 即可，可用版本见 [Releases](https://github.com/BELUGA114/TGStash/releases)。
+
 ## 使用
 
 - **路径一（转发）**：向接收频道转发媒体消息，扫描间隔后自动归档，原消息下方回复 `✅ 已归档`

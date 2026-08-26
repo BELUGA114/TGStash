@@ -1,7 +1,9 @@
 # 生产部署
 services:
   stash-listener:
-    image: ghcr.io/beluga114/tgstash:latest
+    # 不写 TGSTASH_VERSION 时等同于以前的 :latest；
+    # 在服务器 .env 里设成具体版本（如 2.1.1）即可钉版本 / 回滚
+    image: ghcr.io/beluga114/tgstash:${TGSTASH_VERSION:-latest}
     container_name: stash-listener
     network_mode: "host"
     restart: unless-stopped
