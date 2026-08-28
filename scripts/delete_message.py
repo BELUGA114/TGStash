@@ -2,6 +2,9 @@
 按 source_message_id 删除数据库中与该消息相关的所有记录，并回退 checkpoint
 使项目下次扫描时重新备份该消息。
 
+source_message_id 是**入口** id，即接收频道里那条消息（两条路径一致）。
+checkpoint 回退依赖这一点——真实来源在 origin_* 列，不要拿它来回退。
+
 用法：
     # 单个 ID
     python scripts/delete_message.py 12345 --db data/db/archive.db

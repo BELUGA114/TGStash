@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 from compress_video import maybe_compress_video
 from db import ArchiveDB
+from origin import normalize_origin, origin_from_link
 from PIL import Image
 from pyrogram.client import Client
 from pyrogram.errors import PhotoExtInvalid
@@ -439,27 +440,48 @@ async def _send_media(
 
 def _record_archived_media(
     message: Message,
+    entry: Message,
     file_unique_id: str,
     sha256: str,
     size: int,
     sent: Message,
     caption: str,
+    kind: str,
+    media: object,
 ) -> None:
-    """记录已上传文件及其来源消息。"""
+    """
+    记录已上传文件及其来源消息。
+
+    message 是被归档的那条媒体消息：路径一等于 entry，路径二来自源频道。
+    entry 是接收频道里的入口消息（路径一是媒体消息本身，路径二是那条链接消息）。
+
+    两者必须分开：source_* 列存入口，delete_message.py 靠它回退 checkpoint；
+    origin_* 列存真实来源。混用会让路径二的记录落在错误的 id 空间——源频道的
+    消息 id 被当成接收频道的 id 去回退 checkpoint。
+    """
     assert sent.id is not None
+    entry_chat = entry.chat.id if entry.chat and entry.chat.id else RECEIVE_CHAT
+    is_forward_path = entry is message
+    file_name = getattr(media, "file_name", None)
+    mime_type = getattr(media, "mime_type", None)
+    origin = normalize_origin(message) if is_forward_path else origin_from_link(message)
+
     db.record_file(
         file_unique_id=file_unique_id,
         sha256=sha256,
         size=size,
         archived_chat_id=ARCHIVE_CHAT,
         archived_message_id=sent.id,
-        source="manual_forward",
-        source_channel=RECEIVE_CHAT,
+        source="manual_forward" if is_forward_path else "link",
+        source_channel=entry_chat,
+        file_name=file_name,
+        mime_type=mime_type,
+        media_kind=kind,
     )
     db.record_message(
-        source_chat_id=RECEIVE_CHAT,
-        source_message_id=message.id,
-        source_channel_title=message.chat.title if message.chat else None,
+        source_chat_id=entry_chat,
+        source_message_id=entry.id,
+        source_channel_title=entry.chat.title if entry.chat else None,
         sender=sender_name(message),
         sent_at=message.date.isoformat() if message.date else None,
         caption=caption,
@@ -467,6 +489,9 @@ def _record_archived_media(
         media_group_id=message.media_group_id,
         archived_chat_id=ARCHIVE_CHAT,
         archived_message_id=sent.id,
+        file_name=file_name,
+        media_kind=kind,
+        **origin,
     )
 
 
@@ -486,8 +511,15 @@ async def archive_single(
     *,
     mark: bool = True,
     tme_link: str | None = None,
+    entry: Message | None = None,
 ) -> bool:
-    """处理单条媒体消息。返回 True 表示成功（含跳过重复），False 表示需下轮重试。"""
+    """
+    处理单条媒体消息。返回 True 表示成功（含跳过重复），False 表示需下轮重试。
+
+    entry 是接收频道里的入口消息：路径一不传，入口就是 message 本身；
+    路径二传那条链接消息，DB 的 source_* 列才指向真实存在的接收频道消息。
+    """
+    entry = entry or message
     kind, media = get_media(message)
     if not media:
         return True
@@ -591,7 +623,9 @@ async def archive_single(
                 return outcome != "retry"
 
         assert sent is not None and sent.id is not None
-        _record_archived_media(message, file_unique_id, sha256, size, sent, caption)
+        _record_archived_media(
+            message, entry, file_unique_id, sha256, size, sent, caption, kind, media,
+        )
         if mark:
             await mark_processed(message, duplicate=False)
         _clear_failure(message)
@@ -614,6 +648,7 @@ async def archive_group(
     *,
     mark: bool = True,
     tme_links: dict[int, str] | None = None,
+    entry: Message | None = None,
 ):
     """媒体组：并行下载（最多 2 个）→ 顺序处理 → 打包成 send_media_group 上传"""
     to_upload: list[tuple] = []
@@ -737,8 +772,9 @@ async def archive_group(
                 local_path, media, temp_files, msg_dir, message.id,
             )
 
-        # to_upload: 从 6 元素扩到 8 元素（+thumb_path +meta）
-        to_upload.append((kind, media.file_unique_id, sha256, size, local_path, message, thumb_path, meta))
+        # to_upload 9 元素：末尾的 media 供 _record_archived_media 取 file_name / mime_type
+        to_upload.append((kind, media.file_unique_id, sha256, size, local_path,
+                          message, thumb_path, meta, media))
 
     # 阶段四：上传 + 清理
     try:
@@ -746,7 +782,7 @@ async def archive_group(
             # 多条消息各有独立文字（转发文档被 Telegram 编组）→ 拆组单独上传，
             # 每条带自己的 caption，还原 "文件A+文字A、文件B+文字B" 的原始布局
             if len(caps) > 1:
-                for kind, file_unique_id, sha256, size, local_path, message, thumb_path, meta in to_upload:
+                for kind, file_unique_id, sha256, size, local_path, message, thumb_path, meta, media in to_upload:
                     caption = message.caption or message.text or ""
                     try:
                         sent = await _send_media(
@@ -763,7 +799,8 @@ async def archive_group(
 
                     assert sent is not None and sent.id is not None
                     _record_archived_media(
-                        message, file_unique_id, sha256, size, sent, caption,
+                        message, entry or message, file_unique_id, sha256, size,
+                        sent, caption, kind, media,
                     )
                     _clear_failure(message)
                     await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
@@ -771,7 +808,7 @@ async def archive_group(
             else:
                 # 普通媒体组：共用一条 caption，send_media_group 打包上传
                 input_media = []
-                for i, (kind, _, _, _, path, m, thumb, meta) in enumerate(to_upload):
+                for i, (kind, _, _, _, path, m, thumb, meta, _media) in enumerate(to_upload):
                     caption = group_caption if i == 0 else ""
                     if kind == "video":
                         input_media.append(InputMediaVideo(
@@ -795,7 +832,7 @@ async def archive_group(
                         logger.debug("PhotoExtInvalid，回退整组 send_document")
                         input_media = [
                             InputMediaDocument(path, caption=group_caption if i == 0 else "")
-                            for i, (_, _, _, _, path, m, thumb, meta) in enumerate(to_upload)
+                            for i, (_, _, _, _, path, m, thumb, meta, _media) in enumerate(to_upload)
                         ]
                         sent_list = await app.send_media_group(ARCHIVE_CHAT, input_media)  # type: ignore[arg-type]
                 except Exception as e:
@@ -805,15 +842,16 @@ async def archive_group(
                         await _record_failure(to_upload[0][5], "upload", str(e))
                     return False
 
-                for (kind, file_unique_id, sha256, size, _, message, thumb, meta), sent in zip(to_upload, sent_list):
+                for (kind, file_unique_id, sha256, size, _, message, thumb, meta, media), sent in zip(to_upload, sent_list):
                     _record_archived_media(
-                        message, file_unique_id, sha256, size, sent, group_caption,
+                        message, entry or message, file_unique_id, sha256, size,
+                        sent, group_caption, kind, media,
                     )
                     _clear_failure(message)
                 await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
                 logger.info("归档媒体组 %s 张", len(to_upload))
         for message in new_messages:
-            await archive_single(message, mark=mark)
+            await archive_single(message, mark=mark, entry=entry)
         if mark:
             for item in to_upload:
                 await mark_processed(item[5], duplicate=False)  # item[5] 仍是 Message 对象
@@ -875,13 +913,15 @@ async def process_link_message(message: Message):
                 group = await app.get_media_group(chat, msg_id)
                 group = sorted(group, key=lambda m: m.id)
                 # mark=False：不编辑源频道消息，最终只标记接收频道里的链接消息
-                await archive_group(group, mark=False, tme_links={msg.id: link})
+                # entry=message：DB 入口列指向接收频道的链接消息，不是源频道那条
+                await archive_group(group, mark=False, tme_links={msg.id: link},
+                                    entry=message)
                 archived += len(group)
                 logger.info("链接 %s → 媒体组 %s 张", link, len(group))
             else:
                 kind, _ = get_media(msg)
                 if kind:
-                    if await archive_single(msg, mark=False, tme_link=link):
+                    if await archive_single(msg, mark=False, tme_link=link, entry=message):
                         archived += 1
                         logger.info("链接 %s → %s", link, kind)
                     else:
