@@ -3,8 +3,9 @@
 
     docker compose exec stash-listener python search.py 关键词
 
-注意：搜索用的是 FTS5 trigram 分词器，关键词至少要 3 个字符，
-2 字词（比如"猫咪"里搜"猫咪"是 2 字没问题，但搜单字"猫"搜不到）会搜不到结果。
+注意：搜索用 FTS5 trigram 分词器，每个关键词至少要 3 个字符。2 字及更短的词
+不产生 token，等于没有约束——搜「猫咪」会把所有结果都带回来，搜「橘猫咪」才是
+精确匹配。多个关键词之间是 AND。
 """
 
 import logging
@@ -24,6 +25,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def archive_link(chat_id, message_id) -> str:
+    """把备份频道的 chat_id + message_id 拼成 t.me/c 链接。私有频道去掉 -100 前缀。"""
+    text = str(chat_id)
+    bare = text[4:] if text.startswith("-100") else text.lstrip("-")
+    return f"https://t.me/c/{bare}/{message_id}"
+
+
 def main():
     if len(sys.argv) < 2:
         logger.info("用法：python search.py 关键词")
@@ -34,17 +42,21 @@ def main():
     rows = db.search(query, limit=30)
 
     if not rows:
-        logger.info("没搜到跟「%s」相关的内容（提示：关键词至少要 3 个字符）", query)
+        logger.info("没搜到跟「%s」相关的内容（提示：每个关键词至少要 3 个字符）", query)
         return
 
     for r in rows:
-        chat = r["source_channel_title"] or r["source_chat_id"] or "?"
+        # 展示真实来源而不是入口频道——入口对所有行恒定，没有信息量
+        origin = r["origin_title"] or r["origin_chat_id"] or "?"
         sender = r["sender"] or ""
+        kind = r["media_kind"] or "?"
         caption = (r["caption"] or "").replace("\n", " ")[:80]
+        name = f" [{r['file_name']}]" if r["file_name"] else ""
         archived = ""
         if r["archived_chat_id"] and r["archived_message_id"]:
-            archived = f"  -> 备份频道消息 {r['archived_message_id']}"
-        logger.info("[%s] %s %s: %s%s", r["sent_at"] or "?", chat, sender, caption, archived)
+            archived = f"  -> {archive_link(r['archived_chat_id'], r['archived_message_id'])}"
+        logger.info("[%s] (%s) %s %s: %s%s%s",
+                    r["sent_at"] or "?", kind, origin, sender, caption, name, archived)
 
 
 if __name__ == "__main__":
