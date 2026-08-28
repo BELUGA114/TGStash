@@ -36,8 +36,11 @@ from PIL import Image  # noqa: F401
 
 assert importlib.util.find_spec("tgcrypto") is not None, "TgCrypto 未装进镜像"
 
-# 4) scripts/ 下的辅助脚本（COPY scripts/ ./scripts/）
+# 4) scripts/ 下的辅助脚本（COPY scripts/ ./scripts/）。
+#    这些脚本自己 sys.path.insert 到 ../stash-listener——容器里模块被拍平到 /app，
+#    那个目录并不存在，靠 PYTHONPATH=/app 才 import 得到 db/origin。真跑一遍才算数
 sys.path.insert(0, str(APP / "scripts"))
-importlib.import_module("get_chat_ids")
+for helper in ("get_chat_ids", "delete_message", "backfill_metadata"):
+    importlib.import_module(helper)
 
 print("smoke OK:", ", ".join(expected))
