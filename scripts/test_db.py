@@ -662,3 +662,75 @@ class TestQueryEscaping:
                 t.join()
 
             assert not errors, f"第 {round_no} 轮冷启动竞争出错：{errors}"
+
+
+# ═══════════════════════════════════════════
+# 回填支持
+# ═══════════════════════════════════════════
+
+
+class TestBackfillQueries:
+    def test_rows_missing_origin_selects_only_null(self, db: ArchiveDB):
+        db.record_message(source_message_id=1, file_unique_id="F1", caption="待回填")
+        db.record_message(source_message_id=2, file_unique_id="F2", caption="已原创",
+                          origin_type="original")
+        db.record_message(source_message_id=3, file_unique_id="F3", caption="已放弃",
+                          origin_type="unknown")
+        rows = db.rows_missing_origin()
+        assert [r["source_message_id"] for r in rows] == [1]
+
+    def test_rows_missing_origin_respects_limit(self, db: ArchiveDB):
+        for i in range(5):
+            db.record_message(source_message_id=i, file_unique_id=f"F{i}")
+        assert len(db.rows_missing_origin(limit=2)) == 2
+
+    def test_update_message_metadata_writes_origin(self, db: ArchiveDB):
+        db.record_message(source_message_id=10, file_unique_id="F10", caption="内容正文")
+        row_id = db.rows_missing_origin()[0]["id"]
+        db.update_message_metadata(
+            row_id,
+            origin_chat_id="-1001111111111", origin_message_id=42,
+            origin_title="某个公开频道", origin_type="channel",
+            file_name="cat.mp4", media_kind="video",
+        )
+        assert db.rows_missing_origin() == []
+        row = db.search("某个公开频道")[0]
+        assert row["origin_message_id"] == 42
+        assert row["file_name"] == "cat.mp4"
+
+    def test_update_file_metadata_writes_identity(self, db: ArchiveDB):
+        db.record_file(file_unique_id="F20", sha256="d" * 64, size=8,
+                       archived_chat_id=None, archived_message_id=None,
+                       source="manual_forward", source_channel=None)
+        db.update_file_metadata("F20", file_name="dog.jpg",
+                                mime_type="image/jpeg", media_kind="photo")
+        row = db.find_by_unique_id("F20")
+        assert row["file_name"] == "dog.jpg"
+        assert row["media_kind"] == "photo"
+
+    def test_update_file_metadata_does_not_clobber_existing(self, db: ArchiveDB):
+        """回填不能把已有的好数据覆盖成 None"""
+        db.record_file(file_unique_id="F21", sha256="e" * 64, size=8,
+                       archived_chat_id=None, archived_message_id=None,
+                       source="manual_forward", source_channel=None,
+                       file_name="原始名.mp4", mime_type="video/mp4", media_kind="video")
+        db.update_file_metadata("F21", file_name=None, mime_type=None, media_kind=None)
+        row = db.find_by_unique_id("F21")
+        assert row["file_name"] == "原始名.mp4"
+        assert row["media_kind"] == "video"
+
+    def test_mark_origin_unknown_stops_reselection(self, db: ArchiveDB):
+        """查不到原消息的行标 unknown，下次不再被选中"""
+        db.record_message(source_message_id=30, file_unique_id="F30")
+        row_id = db.rows_missing_origin()[0]["id"]
+        db.mark_origin_unknown(row_id)
+        assert db.rows_missing_origin() == []
+
+    def test_rebuild_fts_reindexes(self, db: ArchiveDB):
+        """回填走 UPDATE，au 触发器已经会同步索引；rebuild 是兜底的一致性保证"""
+        db.record_message(source_message_id=40, file_unique_id="F40", caption="内容正文")
+        row_id = db.rows_missing_origin()[0]["id"]
+        db.update_message_metadata(row_id, origin_title="某个公开频道",
+                                   origin_type="channel")
+        db.rebuild_fts()
+        assert len(db.search("某个公开频道")) == 1
