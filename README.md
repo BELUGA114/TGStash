@@ -108,7 +108,10 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 docker compose exec stash-listener python search.py 关键词
 ```
 
-FTS5 + trigram 分词器。关键词需要至少 3 个字符
+FTS5 + trigram 分词器，每个关键词至少 3 个字符（2 字及更短的词不产生 token，
+等于无约束，会把全部结果带回来）。多个关键词之间是 AND。
+输出包含时间、媒体类型、真实来源、发送者、caption、原始文件名，
+以及可点击的备份频道链接。
 
 ## 调试工具
 
@@ -117,14 +120,16 @@ FTS5 + trigram 分词器。关键词需要至少 3 个字符
 ```bash
 docker compose run --rm stash-listener python scripts/get_chat_ids.py           # 列出频道 ID
 docker compose run --rm stash-listener python scripts/delete_message.py 12345   # 删除消息记录并回退 checkpoint
+docker compose run --rm stash-listener python scripts/backfill_metadata.py --dry-run   # 预览元数据回填
 ```
 
 - **get_chat_ids.py** — 列出当前账号加入的所有频道 ID 和标题，用于填写 `.env`
-- **delete_message.py** — 按 `source_message_id` 删除数据库记录并回退 checkpoint，支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
+- **delete_message.py** — 按 `source_message_id`（入口 id，即接收频道那条消息）删除数据库记录并回退 checkpoint，支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
+- **backfill_metadata.py** — 回填历史消息的来源（`origin_*`）与文件身份（文件名/mime/类型）。只处理 `origin_type IS NULL` 的行，从接收频道重新读原消息，靠 `file_unique_id` 自证匹配防止写错；查不到或不匹配的行标记 `unknown` 不再重试。支持 `--dry-run` 预览、`--limit N` 限量、`--db` 指定路径
 
 ## 本地开发
 
-测试使用 pytest，覆盖 `db.py`（schema/checkpoint/去重/FTS5/并发场景）与 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
+测试使用 pytest，覆盖 `db.py`（schema/迁移/checkpoint/去重/FTS5/并发场景）、`origin.py`（forward_origin 五变体归一化）、入口/来源写入路径、回填决策逻辑，以及 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -134,8 +139,8 @@ python -m pytest
 ## 目录结构
 
 ```
-├── stash-listener/    # 主服务（listener/tdl_downloader/login/search/db）
-├── scripts/           # 辅助脚本（get_chat_ids/delete_message/test_db/test_tdl_downloader）
+├── stash-listener/    # 主服务（listener/tdl_downloader/compress_video/origin/login/search/db）
+├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata）与测试
 ├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
 ├── .env.example       # 配置模板
 └── docker-compose.yml
