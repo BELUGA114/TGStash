@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from db import SCHEMA, ArchiveDB
+from db import SCHEMA, SCHEMA_VERSION, ArchiveDB, build_match_query
 
 
 @pytest.fixture
@@ -291,6 +291,7 @@ class TestFTS:
             source_chat_id="-1001",
             source_message_id=1,
             source_channel_title="归档频道",
+            origin_title="某个来源频道",
             sender="张三丰",
             caption="今天天气不错，适合出去玩",
         )
@@ -298,6 +299,7 @@ class TestFTS:
             source_chat_id="-1001",
             source_message_id=2,
             source_channel_title="归档频道",
+            origin_title="某个来源频道",
             sender="李四方",
             caption="明天可能有雨，记得带伞",
         )
@@ -305,6 +307,7 @@ class TestFTS:
             source_chat_id="-1001",
             source_message_id=3,
             source_channel_title="归档频道",
+            origin_title="某个来源频道",
             sender="王五六",
             caption="Python 异步编程最佳实践",
         )
@@ -331,11 +334,16 @@ class TestFTS:
         assert len(results) >= 1
         assert any(r["sender"] == "李四方" for r in results)
 
-    def test_search_by_channel_title(self, db: ArchiveDB):
-        """source_channel_title 在 FTS 索引中"""
+    def test_search_by_origin_title(self, db: ArchiveDB):
+        """origin_title（真实来源）在 FTS 索引中"""
         self._seed_messages(db)
-        results = db.search("归档频道", limit=10)
-        assert len(results) >= 1
+        results = db.search("某个来源频道", limit=10)
+        assert len(results) == 3
+
+    def test_entry_channel_title_not_indexed(self, db: ArchiveDB):
+        """source_channel_title 是入口频道标题，对所有行恒定，进索引纯属噪音"""
+        self._seed_messages(db)
+        assert db.search("归档频道", limit=10) == []
 
     def test_search_no_match(self, db: ArchiveDB):
         self._seed_messages(db)
@@ -470,3 +478,187 @@ class TestConcurrency:
         for i in range(20):
             assert db.find_by_unique_id(f"service_a_{i}") is not None
             assert db.find_by_unique_id(f"service_b_{i}") is not None
+
+
+# ═══════════════════════════════════════════
+# Schema 迁移
+# ═══════════════════════════════════════════
+
+OLD_SCHEMA = """
+CREATE TABLE files (
+    file_unique_id TEXT PRIMARY KEY, sha256 TEXT, size INTEGER,
+    archived_chat_id TEXT, archived_message_id INTEGER,
+    source TEXT, source_channel TEXT, first_seen_at TEXT
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_chat_id TEXT, source_message_id INTEGER, source_channel_title TEXT,
+    sender TEXT, sent_at TEXT, caption TEXT, file_unique_id TEXT,
+    media_group_id TEXT, archived_chat_id TEXT, archived_message_id INTEGER,
+    created_at TEXT
+);
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    caption, source_channel_title, sender,
+    content='messages', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, caption, source_channel_title, sender)
+    VALUES (new.id, new.caption, new.source_channel_title, new.sender);
+END;
+"""
+
+
+def _make_old_db(path):
+    """造一个迁移前的库并塞一条数据，模拟线上已有的 archive.db。"""
+    con = sqlite3.connect(path)
+    con.executescript(OLD_SCHEMA)
+    con.execute(
+        "INSERT INTO messages(source_chat_id, source_message_id, source_channel_title,"
+        " sender, caption, file_unique_id) VALUES(?,?,?,?,?,?)",
+        ("-1001234567890", 100, "接收频道", "阿猫", "一只很胖的橘猫", "FUID_OLD"),
+    )
+    con.execute(
+        "INSERT INTO files(file_unique_id, sha256, size, source) VALUES(?,?,?,?)",
+        ("FUID_OLD", "a" * 64, 2048, "manual_forward"),
+    )
+    con.commit()
+    con.close()
+
+
+class TestMigration:
+    def test_old_db_gains_new_columns(self, tmp_path):
+        path = str(tmp_path / "old.db")
+        _make_old_db(path)
+        ArchiveDB(path)
+        with sqlite3.connect(path) as con:
+            files_cols = {r[1] for r in con.execute("PRAGMA table_info(files)")}
+            msg_cols = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
+        assert {"file_name", "mime_type", "media_kind"} <= files_cols
+        assert {"origin_chat_id", "origin_message_id", "origin_title",
+                "origin_type", "file_name", "media_kind"} <= msg_cols
+
+    def test_migration_preserves_existing_rows(self, tmp_path):
+        """迁移不能动到已有数据——archive.db 是唯一真相"""
+        path = str(tmp_path / "old.db")
+        _make_old_db(path)
+        ArchiveDB(path)
+        with sqlite3.connect(path) as con:
+            row = con.execute(
+                "SELECT caption, file_unique_id, source_message_id FROM messages"
+            ).fetchone()
+            size = con.execute("SELECT size FROM files").fetchone()[0]
+        assert row == ("一只很胖的橘猫", "FUID_OLD", 100)
+        assert size == 2048
+
+    def test_migration_sets_user_version(self, tmp_path):
+        path = str(tmp_path / "old.db")
+        _make_old_db(path)
+        ArchiveDB(path)
+        with sqlite3.connect(path) as con:
+            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """服务每次启动都跑 __init__，重复执行必须无副作用"""
+        path = str(tmp_path / "old.db")
+        _make_old_db(path)
+        ArchiveDB(path)
+        ArchiveDB(path)
+        ArchiveDB(path)
+        with sqlite3.connect(path) as con:
+            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+            assert con.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+
+    def test_fresh_db_also_at_current_version(self, tmp_path):
+        """全新库由 SCHEMA 一次建全，迁移在其上是 no-op，版本号同样要落定"""
+        path = str(tmp_path / "fresh.db")
+        ArchiveDB(path)
+        with sqlite3.connect(path) as con:
+            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+    def test_migrated_db_searches_new_columns(self, tmp_path):
+        """重建后 origin_title / file_name 可搜，旧的入口标题不再进索引"""
+        path = str(tmp_path / "old.db")
+        _make_old_db(path)
+        db = ArchiveDB(path)
+        with sqlite3.connect(path) as con:
+            con.execute(
+                "UPDATE messages SET origin_title=?, file_name=? WHERE source_message_id=100",
+                ("某个公开频道", "fat_cat.mp4"),
+            )
+            con.commit()
+            con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            con.commit()
+        assert len(db.search("某个公开频道")) == 1
+        assert len(db.search("fat_cat.mp4")) == 1
+        assert len(db.search("接收频道")) == 0
+
+
+# ═══════════════════════════════════════════
+# FTS 查询转义
+# ═══════════════════════════════════════════
+
+
+class TestQueryEscaping:
+    @pytest.fixture
+    def seeded(self, db: ArchiveDB):
+        db.record_message(caption="一只很胖的橘猫在睡觉", origin_title="猫咪频道",
+                          sender="阿猫", file_name="fat_cat.mp4")
+        db.record_message(caption="很胖的狗在跑步", origin_title="宠物频道",
+                          sender="小李", file_name="repair-guide (1).mkv")
+        return db
+
+    def test_build_match_query_quotes_each_term(self):
+        assert build_match_query("很胖的 在睡觉") == '"很胖的" "在睡觉"'
+
+    def test_build_match_query_escapes_inner_quote(self):
+        assert build_match_query('a"b') == '"a""b"'
+
+    def test_build_match_query_blank_is_none(self):
+        assert build_match_query("   ") is None
+
+    def test_dotted_filename_does_not_raise(self, seeded: ArchiveDB):
+        """未转义时这个查询会抛 OperationalError: syntax error near '.'"""
+        assert len(seeded.search("fat_cat.mp4")) == 1
+
+    def test_hyphen_query_does_not_raise(self, seeded: ArchiveDB):
+        """未转义时 repair-guide 会被解析成列名，抛 no such column: guide"""
+        assert len(seeded.search("repair-guide")) == 1
+
+    def test_paren_query_does_not_raise(self, seeded: ArchiveDB):
+        assert seeded.search("(汽车") == []
+
+    def test_multi_term_keeps_and_semantics(self, seeded: ArchiveDB):
+        """两个 3 字以上的词之间是 AND，不能退化成 OR"""
+        assert len(seeded.search("很胖的 在睡觉")) == 1
+        assert len(seeded.search("很胖的")) == 2
+
+    def test_blank_query_returns_empty(self, seeded: ArchiveDB):
+        assert seeded.search("   ") == []
+
+    def test_concurrent_cold_start_does_not_crash(self, tmp_path: Path):
+        """
+        两个服务同时对着一个还不存在的库启动。
+
+        回归测试：迁移放进 BEGIN IMMEDIATE 事务后，另一个连接的
+        PRAGMA journal_mode=WAL 会撞上独占锁——而切换 journal_mode 不吃
+        busy_timeout，会直接抛 database is locked。_ensure_wal 先读后判断，
+        已是 WAL 就不再发写操作。重复多轮以覆盖时序抖动。
+        """
+        import threading
+
+        for round_no in range(5):
+            db_path = str(tmp_path / f"cold_{round_no}.db")
+            errors = []
+
+            def starter():
+                try:
+                    ArchiveDB(db_path)  # noqa: B023
+                except Exception as e:
+                    errors.append(str(e))  # noqa: B023
+
+            threads = [threading.Thread(target=starter) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert not errors, f"第 {round_no} 轮冷启动竞争出错：{errors}"

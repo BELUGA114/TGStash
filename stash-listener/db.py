@@ -1,23 +1,34 @@
 """
 共享数据层：SQLite + FTS5
 
-三张表：
-  channels — 每个来源（接收频道 / 各个 tdl 批量频道）各自的 checkpoint
-  files    — 去重表，file_unique_id 或 sha256 命中即视为重复
-  messages — 原始消息元数据（来源频道/发送者/时间/caption），供全文搜索
+四张表：
+  channels          — 每个来源（接收频道 / 各个 tdl 批量频道）各自的 checkpoint
+  files             — 去重表，file_unique_id 或 sha256 命中即视为重复
+  messages          — 原始消息元数据（入口/来源/发送者/时间/caption），供全文搜索
+  archive_failures  — 归档失败账，控制重试与跳过
+
+schema 变更走 PRAGMA user_version + MIGRATIONS 有序迁移，
+SCHEMA 常量始终保持目标形态。
 
 stash-listener 和 tdl-sync 两个服务各自拷贝一份这个文件，
 但通过挂载同一个 /data/db 卷，实际操作的是同一个 SQLite 文件。
 """
 
+import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
-SCHEMA = """
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 1
+
+# 建表部分。FTS 单独拆出去，因为迁移时要 DROP 重建，定义只能有一份
+TABLES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
     chat_id TEXT PRIMARY KEY,
-    source_type TEXT NOT NULL,          -- 'manual_forward' 或 'tdl_bulk'
+    source_type TEXT NOT NULL,          -- 'manual_forward' | 'link' | 'tdl_bulk'
     last_message_id INTEGER NOT NULL DEFAULT 0,
     last_run_at TEXT
 );
@@ -28,17 +39,22 @@ CREATE TABLE IF NOT EXISTS files (
     size INTEGER,
     archived_chat_id TEXT,
     archived_message_id INTEGER,
-    source TEXT,                        -- 'manual_forward' 或 'tdl_bulk'
+    source TEXT,                        -- 'manual_forward' | 'link' | 'tdl_bulk'
     source_channel TEXT,
-    first_seen_at TEXT
+    first_seen_at TEXT,
+    file_name TEXT,                     -- 原始文件名；Photo 类型没有这个字段，为 NULL
+    mime_type TEXT,
+    media_kind TEXT                     -- document/video/photo/audio/animation/voice/video_note
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- source_* 三列是「入口」：两条路径一致地指向接收频道里那条消息。
+    -- 真实来源在 origin_* 四列，两者不要混用
     source_chat_id TEXT,
     source_message_id INTEGER,
-    source_channel_title TEXT,
+    source_channel_title TEXT,          -- 入口频道标题；值对所有行恒定，故不进 FTS
     sender TEXT,
     sent_at TEXT,
     caption TEXT,
@@ -46,33 +62,18 @@ CREATE TABLE IF NOT EXISTS messages (
     media_group_id TEXT,
     archived_chat_id TEXT,
     archived_message_id INTEGER,
-    created_at TEXT
+    created_at TEXT,
+    origin_chat_id TEXT,
+    origin_message_id INTEGER,
+    origin_title TEXT,
+    -- 'channel'|'chat'|'user'|'hidden_user'|'import' 来自 forward_origin 五变体，
+    -- 'link' 路径二直读，'original' 原创直发无转发来源，'unknown' 回填不到，
+    -- NULL 表示这行还没回填过。'original' 与 NULL 必须区分，否则回填脚本的
+    -- origin_type IS NULL 选择器会永久反复选中原创消息
+    origin_type TEXT,
+    file_name TEXT,                     -- 冗余自 files：FTS 是 messages 的外部内容，跨表索引不了
+    media_kind TEXT                     -- 冗余自 files：便于按类型过滤而不必 JOIN
 );
-
--- tokenize='trigram'：SQLite 默认的 unicode61 分词器几乎无法处理中文（没有空格分隔，
--- 整段中文常被当成一个 token，导致搜不到子串）。trigram 按每 3 个字符切一次，
--- 对中文更实用，但代价是搜索词必须 >= 3 个字符，2 字词搜不到。
--- 如果以后觉得不够用，可以按升级路径接入 Meilisearch。
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    caption, source_channel_title, sender,
-    content='messages', content_rowid='id',
-    tokenize='trigram'
-);
-
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, caption, source_channel_title, sender)
-    VALUES (new.id, new.caption, new.source_channel_title, new.sender);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, caption, source_channel_title, sender)
-    VALUES('delete', old.id, old.caption, old.source_channel_title, old.sender);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, caption, source_channel_title, sender)
-    VALUES('delete', old.id, old.caption, old.source_channel_title, old.sender);
-    INSERT INTO messages_fts(rowid, caption, source_channel_title, sender)
-    VALUES (new.id, new.caption, new.source_channel_title, new.sender);
-END;
 
 CREATE TABLE IF NOT EXISTS archive_failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,9 +93,129 @@ CREATE INDEX IF NOT EXISTS idx_archive_failures_status
     ON archive_failures(status);
 """
 
+# tokenize='trigram'：SQLite 默认的 unicode61 分词器几乎无法处理中文（没有空格分隔，
+# 整段中文常被当成一个 token，导致搜不到子串）。trigram 按每 3 个字符切一次，
+# 对中文更实用，但代价是搜索词必须 >= 3 个字符，2 字词搜不到。
+# 索引 origin_title 而不是 source_channel_title：后者是接收频道标题，
+# 所有行同一个值，在索引里纯属噪音。
+#
+# 拆成单条语句的列表而不是一整段脚本：迁移要在显式事务里重建 FTS，
+# 而 executescript 会先隐式 COMMIT，把事务拆散。con.execute 逐条执行才能留在事务内。
+FTS_CREATE_STATEMENTS = [
+    """CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    caption, origin_title, sender, file_name,
+    content='messages', content_rowid='id',
+    tokenize='trigram'
+)""",
+    """CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, caption, origin_title, sender, file_name)
+    VALUES (new.id, new.caption, new.origin_title, new.sender, new.file_name);
+END""",
+    """CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, caption, origin_title, sender, file_name)
+    VALUES('delete', old.id, old.caption, old.origin_title, old.sender, old.file_name);
+END""",
+    """CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, caption, origin_title, sender, file_name)
+    VALUES('delete', old.id, old.caption, old.origin_title, old.sender, old.file_name);
+    INSERT INTO messages_fts(rowid, caption, origin_title, sender, file_name)
+    VALUES (new.id, new.caption, new.origin_title, new.sender, new.file_name);
+END""",
+]
+
+# 迁移时先把旧定义整套拆掉，再按 FTS_CREATE_STATEMENTS 重建。
+# 触发器体里写死了列名，必须跟着 DROP，否则触发器会往不存在的列写
+FTS_DROP_STATEMENTS = [
+    "DROP TRIGGER IF EXISTS messages_ai",
+    "DROP TRIGGER IF EXISTS messages_ad",
+    "DROP TRIGGER IF EXISTS messages_au",
+    "DROP TABLE IF EXISTS messages_fts",
+]
+
+# 供 __init__ 的 executescript 使用；定义的唯一来源仍是上面那个列表
+FTS_SCHEMA = ";\n".join(FTS_CREATE_STATEMENTS) + ";\n"
+
+SCHEMA = TABLES_SCHEMA + FTS_SCHEMA
+
+# 迁移要补的列。SCHEMA 里已经写全，这份表只服务于「已有数据的旧库」
+MIGRATION_COLUMNS = {
+    "files": [("file_name", "TEXT"), ("mime_type", "TEXT"), ("media_kind", "TEXT")],
+    "messages": [
+        ("origin_chat_id", "TEXT"), ("origin_message_id", "INTEGER"),
+        ("origin_title", "TEXT"), ("origin_type", "TEXT"),
+        ("file_name", "TEXT"), ("media_kind", "TEXT"),
+    ],
+}
+
+
+# journal_mode 是数据库的持久属性，建库时设一次就够。每次连接都无条件重设会踩坑：
+# 切换 journal_mode 需要独占锁，而且不吃 busy_timeout——另一个连接正持有写事务时
+# 会直接抛 database is locked。所以先读后判断，已经是 WAL 就不去动它
+WAL_SWITCH_ATTEMPTS = 5
+WAL_SWITCH_DELAY_SECONDS = 0.2
+
+
+def _ensure_wal(con) -> None:
+    """确保库处于 WAL 模式。已是 WAL 则不发写操作，避免和别的连接抢独占锁。"""
+    if str(con.execute("PRAGMA journal_mode").fetchone()[0]).upper() == "WAL":
+        return
+    for attempt in range(WAL_SWITCH_ATTEMPTS):
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            # 建库瞬间两个进程可能同时切换。只要对端切成功了，这边读到 WAL 就收工
+            if str(con.execute("PRAGMA journal_mode").fetchone()[0]).upper() == "WAL":
+                return
+            if attempt == WAL_SWITCH_ATTEMPTS - 1:
+                raise
+            time.sleep(WAL_SWITCH_DELAY_SECONDS)
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def build_match_query(raw: str) -> str | None:
+    """
+    把用户输入转成安全的 FTS5 MATCH 表达式。
+
+    直接把原始输入喂给 MATCH 会炸：文件名里的 `.` 触发语法错误，
+    `-` 会让后半段被当成列名（no such column）。逐词包成字符串字面量，
+    内部双引号翻倍转义。词与词之间留空格——FTS5 里这仍是 AND，
+    不会退化成 OR，也不会变成要求相邻的短语。
+
+    全空白输入返回 None，调用方直接返回空结果（MATCH '' 会报错）。
+    """
+    terms = [t for t in raw.split() if t]
+    if not terms:
+        return None
+    return " ".join('"' + t.replace('"', '""') + '"' for t in terms)
+
+
+def _add_missing_columns(con) -> None:
+    """按 PRAGMA table_info 检测缺列再 ALTER。新库上是 no-op，因此天然幂等。"""
+    for table, columns in MIGRATION_COLUMNS.items():
+        existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                logger.info("迁移：%s 新增列 %s", table, name)
+
+
+def _migrate_v1(con) -> None:
+    """补齐元数据列，并把 FTS 索引列从 source_channel_title 换成 origin_title + file_name。"""
+    _add_missing_columns(con)
+    for statement in FTS_DROP_STATEMENTS + FTS_CREATE_STATEMENTS:
+        con.execute(statement)
+    # external content FTS：DROP 不动 messages 表，rebuild 从 content table 重填
+    con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+    logger.info("迁移：messages_fts 索引列已切换并重建")
+
+
+# (版本号, 迁移函数)，按版本号升序。加列本身幂等，
+# user_version 存在的唯一理由是让 FTS 重建这类非幂等步骤只跑一次
+MIGRATIONS = [(1, _migrate_v1)]
 
 
 class ArchiveDB:
@@ -102,14 +223,35 @@ class ArchiveDB:
         self._path = path
         with self._connect() as con:
             con.executescript(SCHEMA)
+            self._migrate(con)
+
+    def _migrate(self, con) -> None:
+        if con.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+            return
+        # 先拿写锁再读版本号。WAL 下「先读后写」的连接无法升级成写事务，
+        # 两个服务同时启动会有一个直接吃到 SQLITE_BUSY——busy_timeout 对
+        # 锁升级无效。BEGIN IMMEDIATE 一开始就取写锁，慢的那个改为等待。
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            current = con.execute("PRAGMA user_version").fetchone()[0]
+            for version, migrate in MIGRATIONS:
+                if current < version:
+                    logger.info("archive.db 迁移 v%s → v%s", current, version)
+                    migrate(con)
+                    # PRAGMA 不支持参数绑定；version 来自本模块常量，不是外部输入
+                    con.execute(f"PRAGMA user_version={version}")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
 
     @contextmanager
     def _connect(self):
         con = sqlite3.connect(self._path, timeout=30)
-        # WAL 模式：读不阻塞写，写不阻塞读——两个服务共享同一个 db 文件的基础
-        con.execute("PRAGMA journal_mode=WAL")
         # 遇到锁时等待 30 秒而非立即报 SQLITE_BUSY，容忍两个服务同时写入的瞬间冲突
         con.execute("PRAGMA busy_timeout=30000")
+        # WAL 模式：读不阻塞写，写不阻塞读——两个服务共享同一个 db 文件的基础
+        _ensure_wal(con)
         try:
             yield con
             con.commit()
@@ -173,13 +315,16 @@ class ArchiveDB:
         archived_message_id,
         source: str,
         source_channel,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        media_kind: str | None = None,
     ):
         with self._connect() as con:
             con.execute(
                 """INSERT OR IGNORE INTO files
                    (file_unique_id, sha256, size, archived_chat_id, archived_message_id,
-                    source, source_channel, first_seen_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                    source, source_channel, first_seen_at, file_name, mime_type, media_kind)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     file_unique_id,
                     sha256,
@@ -189,6 +334,9 @@ class ArchiveDB:
                     source,
                     str(source_channel) if source_channel is not None else None,
                     _now(),
+                    file_name,
+                    mime_type,
+                    media_kind,
                 ),
             )
 
@@ -204,14 +352,21 @@ class ArchiveDB:
         media_group_id=None,
         archived_chat_id=None,
         archived_message_id=None,
+        origin_chat_id=None,
+        origin_message_id=None,
+        origin_title=None,
+        origin_type=None,
+        file_name=None,
+        media_kind=None,
     ):
         with self._connect() as con:
             con.execute(
                 """INSERT INTO messages
                    (source_chat_id, source_message_id, source_channel_title, sender, sent_at,
                     caption, file_unique_id, media_group_id, archived_chat_id, archived_message_id,
-                    created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    created_at, origin_chat_id, origin_message_id, origin_title, origin_type,
+                    file_name, media_kind)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(source_chat_id) if source_chat_id is not None else None,
                     source_message_id,
@@ -224,10 +379,19 @@ class ArchiveDB:
                     str(archived_chat_id) if archived_chat_id is not None else None,
                     archived_message_id,
                     _now(),
+                    str(origin_chat_id) if origin_chat_id is not None else None,
+                    origin_message_id,
+                    origin_title,
+                    origin_type,
+                    file_name,
+                    media_kind,
                 ),
             )
 
     def search(self, query: str, limit: int = 20):
+        match = build_match_query(query)
+        if match is None:
+            return []
         with self._connect() as con:
             con.row_factory = sqlite3.Row
             return con.execute(
@@ -235,7 +399,7 @@ class ArchiveDB:
                    JOIN messages m ON m.id = f.rowid
                    WHERE messages_fts MATCH ?
                    ORDER BY rank LIMIT ?""",
-                (query, limit),
+                (match, limit),
             ).fetchall()
 
     def get_failure(self, source_chat_id, source_message_id: int):
