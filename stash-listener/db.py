@@ -388,6 +388,84 @@ class ArchiveDB:
                 ),
             )
 
+    def rows_missing_origin(self, limit: int | None = None):
+        """
+        待回填的行：origin_type IS NULL 才算「还没回填过」。
+
+        'original'（原创直发）和 'unknown'（查不到原消息）都已经是终态，
+        必须排除，否则每轮回填都会把它们重新拉一遍。
+        """
+        sql = ("SELECT id, source_chat_id, source_message_id, file_unique_id "
+               "FROM messages WHERE origin_type IS NULL ORDER BY id")
+        params: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            return con.execute(sql, params).fetchall()
+
+    def update_message_metadata(
+        self,
+        row_id: int,
+        *,
+        origin_chat_id=None,
+        origin_message_id=None,
+        origin_title=None,
+        origin_type=None,
+        file_name=None,
+        media_kind=None,
+    ):
+        """回填单行 messages 的来源与文件身份。"""
+        with self._connect() as con:
+            con.execute(
+                """UPDATE messages SET
+                       origin_chat_id=?, origin_message_id=?, origin_title=?,
+                       origin_type=?, file_name=?, media_kind=?
+                   WHERE id=?""",
+                (
+                    str(origin_chat_id) if origin_chat_id is not None else None,
+                    origin_message_id,
+                    origin_title,
+                    origin_type,
+                    file_name,
+                    media_kind,
+                    row_id,
+                ),
+            )
+
+    def update_file_metadata(
+        self,
+        file_unique_id: str,
+        *,
+        file_name=None,
+        mime_type=None,
+        media_kind=None,
+    ):
+        """回填 files 的文件身份。COALESCE 保住已有非空值，回填不覆盖好数据。"""
+        with self._connect() as con:
+            con.execute(
+                """UPDATE files SET
+                       file_name=COALESCE(file_name, ?),
+                       mime_type=COALESCE(mime_type, ?),
+                       media_kind=COALESCE(media_kind, ?)
+                   WHERE file_unique_id=?""",
+                (file_name, mime_type, media_kind, file_unique_id),
+            )
+
+    def mark_origin_unknown(self, row_id: int):
+        """原消息查不到或校验不通过：标为终态，下轮不再选中。"""
+        with self._connect() as con:
+            con.execute(
+                "UPDATE messages SET origin_type='unknown' WHERE id=? AND origin_type IS NULL",
+                (row_id,),
+            )
+
+    def rebuild_fts(self):
+        """整体重建 FTS 索引。回填走 UPDATE 时 au 触发器已同步，这是兜底。"""
+        with self._connect() as con:
+            con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+
     def search(self, query: str, limit: int = 20):
         match = build_match_query(query)
         if match is None:
