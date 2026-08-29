@@ -4,8 +4,8 @@
     docker compose exec stash-listener python search.py 关键词
 
 注意：搜索用 FTS5 trigram 分词器，每个关键词至少要 3 个字符。2 字及更短的词
-不产生 token，等于没有约束——搜「猫咪」会把所有结果都带回来，搜「橘猫咪」才是
-精确匹配。多个关键词之间是 AND。
+不产生 token：单独搜返回空（搜「猫咪」得不到结果），和 ≥3 字的词一起用时它不起
+任何约束作用（「猫咪 橘猫在」等同于只搜「橘猫在」）。多个关键词之间是 AND。
 """
 
 import logging

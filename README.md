@@ -108,8 +108,10 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 docker compose exec stash-listener python search.py 关键词
 ```
 
-FTS5 + trigram 分词器，每个关键词至少 3 个字符（2 字及更短的词不产生 token，
-等于无约束，会把全部结果带回来）。多个关键词之间是 AND。
+FTS5 + trigram 分词器，每个关键词至少 3 个字符。2 字及更短的词不产生 token：
+单独搜返回空（搜「猫咪」得不到结果），和 ≥3 字的词一起用时它不起任何约束作用
+（搜「猫咪 橘猫在」等同于只搜「橘猫在」）。多个关键词之间是 AND。
+trigram 本身就是子串匹配，不要在词尾加 `*`——那个星号会被当成字面字符，反而搜不到。
 输出包含时间、媒体类型、真实来源、发送者、caption、原始文件名，
 以及可点击的备份频道链接。
 
@@ -122,6 +124,9 @@ docker compose run --rm stash-listener python scripts/get_chat_ids.py           
 docker compose run --rm stash-listener python scripts/delete_message.py 12345   # 删除消息记录并回退 checkpoint
 docker compose run --rm stash-listener python scripts/backfill_metadata.py --dry-run   # 预览元数据回填
 ```
+
+> 回填脚本和主服务共用 `/data/session` 里那份 Pyrogram session，跑之前先
+> `docker compose stop stash-listener`，跑完再 `docker compose up -d`。
 
 - **get_chat_ids.py** — 列出当前账号加入的所有频道 ID 和标题，用于填写 `.env`
 - **delete_message.py** — 按 `source_message_id`（入口 id，即接收频道那条消息）删除数据库记录并回退 checkpoint，支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
