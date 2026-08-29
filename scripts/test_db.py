@@ -634,6 +634,20 @@ class TestQueryEscaping:
     def test_blank_query_returns_empty(self, seeded: ArchiveDB):
         assert seeded.search("   ") == []
 
+    def test_two_char_term_alone_returns_nothing(self, seeded: ArchiveDB):
+        """trigram 下 2 字词不产生 token：单独搜是空结果，不是「全部结果」"""
+        assert seeded.search("橘猫") == []
+
+    def test_two_char_term_adds_no_constraint_when_combined(self, seeded: ArchiveDB):
+        """与 ≥3 字的词一起用时，短词不起约束作用"""
+        assert len(seeded.search("橘猫 很胖的")) == len(seeded.search("很胖的")) == 2
+
+    def test_trailing_star_is_literal_not_prefix_wildcard(self, seeded: ArchiveDB):
+        """加引号的代价：`*` 变字面字符。trigram 直接搜子串即可"""
+        assert seeded.search("fat_cat*") == []
+        assert len(seeded.search("fat_cat")) == 1
+
+
     def test_concurrent_cold_start_does_not_crash(self, tmp_path: Path):
         """
         两个服务同时对着一个还不存在的库启动。
@@ -733,16 +747,3 @@ class TestBackfillQueries:
         db.update_message_metadata(row_id, origin_title="某个公开频道",
                                    origin_type="channel")
         assert len(db.search("某个公开频道")) == 1
-
-    def test_two_char_term_alone_returns_nothing(self, seeded: ArchiveDB):
-        """trigram 下 2 字词不产生 token：单独搜是空结果，不是「全部结果」"""
-        assert seeded.search("橘猫") == []
-
-    def test_two_char_term_adds_no_constraint_when_combined(self, seeded: ArchiveDB):
-        """与 ≥3 字的词一起用时，短词不起约束作用"""
-        assert len(seeded.search("橘猫 很胖的")) == len(seeded.search("很胖的")) == 2
-
-    def test_trailing_star_is_literal_not_prefix_wildcard(self, seeded: ArchiveDB):
-        """加引号的代价：`*` 变字面字符。trigram 直接搜子串即可"""
-        assert seeded.search("fat_cat*") == []
-        assert len(seeded.search("fat_cat")) == 1
