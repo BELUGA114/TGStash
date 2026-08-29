@@ -186,6 +186,10 @@ def build_match_query(raw: str) -> str | None:
     不会退化成 OR，也不会变成要求相邻的短语。
 
     全空白输入返回 None，调用方直接返回空结果（MATCH '' 会报错）。
+
+    代价：FTS5 的前缀通配 `*` 会被当成字面字符，`report_2026*` 搜不到东西。
+    trigram 本身就是子串匹配（搜 `report_2026` 即可命中），所以不算损失，
+    但用户习惯性加星号时得不到提示，这里记一笔。
     """
     terms = [t for t in raw.split() if t]
     if not terms:
