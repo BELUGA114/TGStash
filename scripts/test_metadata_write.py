@@ -99,3 +99,90 @@ def test_link_path_entry_is_the_link_message_not_the_source(db: ArchiveDB):
     assert row["origin_title"] == "私有频道"
     assert row["origin_type"] == ORIGIN_LINK
     assert db.find_by_unique_id("FUID_L")["source"] == "link"
+
+
+# ═══════════════════════════════════════════
+# SHA-256 去重命中分支
+# ═══════════════════════════════════════════
+
+
+def _doc_message(message_id, chat, file_unique_id, file_name="report.pdf"):
+    """带 document 的消息桩。document 不走 ffprobe/缩略图，最适合测去重分支。"""
+    return SimpleNamespace(
+        id=message_id, chat=chat, forward_origin=None,
+        date=None, media_group_id=None, caption="", text="",
+        from_user=SimpleNamespace(first_name="tester", id=1),
+        document=SimpleNamespace(file_unique_id=file_unique_id, file_name=file_name,
+                                 mime_type="application/pdf"),
+    )
+
+
+def _run_archive_single(monkeypatch, msg, local_file, *, entry=None):
+    """跑一遍 archive_single，下载替换成本地已有文件。上传不该发生（去重命中会提前返回）。"""
+    import asyncio
+
+    async def fake_download(messages, *a, **k):
+        return {messages[0].id: str(local_file)}
+
+    async def boom(*a, **k):
+        raise AssertionError("去重命中不应该上传")
+
+    monkeypatch.setattr(listener.tdl_downloader, "download", fake_download)
+    monkeypatch.setattr(listener.app, "send_document", boom)
+    monkeypatch.setattr(listener, "mark_processed", _noop)
+    kwargs = {"mark": False}
+    if entry is not None:
+        kwargs["entry"] = entry
+    return asyncio.run(listener.archive_single(msg, **kwargs))
+
+
+async def _noop(*a, **k):
+    return None
+
+
+def _seed_dup(db, local_file):
+    """把 local_file 的 sha256 先落库，模拟这个内容已经归档过。"""
+    import hashlib
+
+    sha = hashlib.sha256(local_file.read_bytes()).hexdigest()
+    db.record_file(
+        file_unique_id="FUID_ALREADY", sha256=sha, size=local_file.stat().st_size,
+        archived_chat_id="-1009876543210", archived_message_id=888,
+        source="manual_forward", source_channel="-1001234567890",
+        file_name="旧文件.pdf", mime_type="application/pdf", media_kind="document",
+    )
+    return sha
+
+
+def test_sha256_dup_records_file_identity(db: ArchiveDB, tmp_path, monkeypatch):
+    """去重命中也要写文件身份——media 就在手边，漏了这三列就永久缺失"""
+    local = tmp_path / "same.pdf"
+    local.write_bytes(b"\x00" * 2048)
+    _seed_dup(db, local)
+
+    msg = _doc_message(700, _chat(-1001234567890, "接收频道"), "FUID_NEW", "新名字.pdf")
+    assert _run_archive_single(monkeypatch, msg, local) is True
+
+    row = db.find_by_unique_id("FUID_NEW")
+    assert row is not None, "去重命中必须留下指向已归档消息的 files 行"
+    assert row["archived_message_id"] == 888
+    assert row["file_name"] == "新名字.pdf"
+    assert row["mime_type"] == "application/pdf"
+    assert row["media_kind"] == "document"
+    assert row["source"] == "manual_forward"
+
+
+def test_sha256_dup_on_link_path_records_link_source(db: ArchiveDB, tmp_path, monkeypatch):
+    """路径二命中去重时 source 必须是 link，不能硬编码成 manual_forward"""
+    local = tmp_path / "same.pdf"
+    local.write_bytes(b"\x01" * 2048)
+    _seed_dup(db, local)
+
+    entry = _msg(800, _chat(-1001234567890, "接收频道"))
+    source_msg = _doc_message(55, _chat(-1009999999999, "私有频道"), "FUID_LINK")
+    assert _run_archive_single(monkeypatch, source_msg, local, entry=entry) is True
+
+    row = db.find_by_unique_id("FUID_LINK")
+    assert row is not None
+    assert row["source"] == "link"
+    assert row["media_kind"] == "document"
