@@ -438,6 +438,56 @@ async def _send_media(
     return sent
 
 
+def _file_identity(kind: str, media: object) -> dict:
+    """files 表的文件身份三件套。Photo 类型没有 file_name / mime_type，取不到就是 None。"""
+    return {
+        "file_name": getattr(media, "file_name", None),
+        "mime_type": getattr(media, "mime_type", None),
+        "media_kind": kind,
+    }
+
+
+def _entry_source(message: Message, entry: Message) -> tuple[str, int]:
+    """
+    返回 (files.source, 入口 chat id)。
+
+    entry is message 表示路径一（转发进接收频道的那条消息本身）；
+    否则是路径二，message 来自源频道、entry 是接收频道里那条链接消息。
+    """
+    chat_id = entry.chat.id if entry.chat and entry.chat.id else RECEIVE_CHAT
+    return ("manual_forward" if entry is message else "link", chat_id)
+
+
+def _record_dedup_file(
+    message: Message,
+    entry: Message,
+    file_unique_id: str,
+    sha256: str,
+    size: int,
+    dup,
+    kind: str,
+    media: object,
+) -> None:
+    """
+    SHA-256 去重命中：文件已在备份频道，只补一条指向它的 files 记录。
+
+    这里不写 messages —— 没有新的归档消息可记。但文件身份和 source 必须照写，
+    否则去重命中的行会永久缺 file_name/mime_type/media_kind，而且回填脚本救不了：
+    它按 messages.origin_type IS NULL 选行，这些行没有对应的 messages 记录。
+    """
+    source, entry_chat = _entry_source(message, entry)
+    db.record_file(
+        file_unique_id=file_unique_id,
+        sha256=sha256,
+        size=size,
+        archived_chat_id=dup["archived_chat_id"],
+        archived_message_id=dup["archived_message_id"],
+        source=source,
+        source_channel=entry_chat,
+        **_file_identity(kind, media),
+    )
+
+
 def _record_archived_media(
     message: Message,
     entry: Message,
@@ -460,11 +510,9 @@ def _record_archived_media(
     消息 id 被当成接收频道的 id 去回退 checkpoint。
     """
     assert sent.id is not None
-    entry_chat = entry.chat.id if entry.chat and entry.chat.id else RECEIVE_CHAT
-    is_forward_path = entry is message
-    file_name = getattr(media, "file_name", None)
-    mime_type = getattr(media, "mime_type", None)
-    origin = normalize_origin(message) if is_forward_path else origin_from_link(message)
+    source, entry_chat = _entry_source(message, entry)
+    identity = _file_identity(kind, media)
+    origin = normalize_origin(message) if entry is message else origin_from_link(message)
 
     db.record_file(
         file_unique_id=file_unique_id,
@@ -472,11 +520,9 @@ def _record_archived_media(
         size=size,
         archived_chat_id=ARCHIVE_CHAT,
         archived_message_id=sent.id,
-        source="manual_forward" if is_forward_path else "link",
+        source=source,
         source_channel=entry_chat,
-        file_name=file_name,
-        mime_type=mime_type,
-        media_kind=kind,
+        **identity,
     )
     db.record_message(
         source_chat_id=entry_chat,
@@ -489,7 +535,7 @@ def _record_archived_media(
         media_group_id=message.media_group_id,
         archived_chat_id=ARCHIVE_CHAT,
         archived_message_id=sent.id,
-        file_name=file_name,
+        file_name=identity["file_name"],
         media_kind=kind,
         **origin,
     )
@@ -579,14 +625,8 @@ async def archive_single(
 
         dup = db.find_by_sha256(sha256)
         if dup:
-            db.record_file(
-                file_unique_id=file_unique_id,
-                sha256=sha256,
-                size=size,
-                archived_chat_id=dup["archived_chat_id"],
-                archived_message_id=dup["archived_message_id"],
-                source="manual_forward",
-                source_channel=RECEIVE_CHAT,
+            _record_dedup_file(
+                message, entry, file_unique_id, sha256, size, dup, kind, media,
             )
             if mark:
                 await mark_processed(message, duplicate=True)
@@ -746,14 +786,9 @@ async def archive_group(
 
         dup = db.find_by_sha256(sha256)
         if dup:
-            db.record_file(
-                file_unique_id=media.file_unique_id,
-                sha256=sha256,
-                size=size,
-                archived_chat_id=dup["archived_chat_id"],
-                archived_message_id=dup["archived_message_id"],
-                source="manual_forward",
-                source_channel=RECEIVE_CHAT,
+            _record_dedup_file(
+                message, entry or message, media.file_unique_id, sha256, size,
+                dup, kind, media,
             )
             dup_messages.append(message)
             _clear_failure(message)
