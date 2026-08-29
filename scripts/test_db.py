@@ -726,11 +726,10 @@ class TestBackfillQueries:
         db.mark_origin_unknown(row_id)
         assert db.rows_missing_origin() == []
 
-    def test_rebuild_fts_reindexes(self, db: ArchiveDB):
-        """回填走 UPDATE，au 触发器已经会同步索引；rebuild 是兜底的一致性保证"""
+    def test_update_reindexes_via_trigger(self, db: ArchiveDB):
+        """回填走 UPDATE，messages_au 触发器逐行同步 FTS，不需要整表 rebuild"""
         db.record_message(source_message_id=40, file_unique_id="F40", caption="内容正文")
         row_id = db.rows_missing_origin()[0]["id"]
         db.update_message_metadata(row_id, origin_title="某个公开频道",
                                    origin_type="channel")
-        db.rebuild_fts()
         assert len(db.search("某个公开频道")) == 1

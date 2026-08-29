@@ -125,3 +125,66 @@ def test_apply_updates_dry_run_writes_nothing(db: ArchiveDB):
     updates, unknown = plan_updates([row], {600: _msg(600, "FUID_G")})
     apply_updates(db, updates, unknown, dry_run=True)
     assert len(db.rows_missing_origin()) == 1
+
+
+# ═══════════════════════════════════════════
+# 批次拉取失败不能污染回填结果
+# ═══════════════════════════════════════════
+
+
+class _FlakyApp:
+    """第 N 批抛异常，其余正常返回。模拟 FloodWait / 连接中断。"""
+
+    def __init__(self, fail_on_batch, messages_by_id):
+        self.fail_on_batch = fail_on_batch
+        self.messages_by_id = messages_by_id
+        self.calls = 0
+
+    async def get_messages(self, chat_id, ids):
+        self.calls += 1
+        if self.calls == self.fail_on_batch:
+            raise ConnectionError("连接被重置")
+        return [self.messages_by_id[i] for i in ids if i in self.messages_by_id]
+
+
+def test_failed_batch_ids_are_reported_not_silently_dropped(monkeypatch):
+    """
+    传输失败不等于「原消息查不到」。
+
+    失败批次的 id 若只是从 fetched 里缺席，plan_updates 会把它们判成
+    unknown——那是终态，rows_missing_origin 永远不再选中，一次 FloodWait
+    就永久烧掉最多一批可回填的行。
+    """
+    import asyncio
+
+    import backfill_metadata as bf
+
+    monkeypatch.setattr(bf, "BATCH_SIZE", 2)
+    monkeypatch.setattr(bf, "BATCH_DELAY_SECONDS", 0)
+
+    msgs = {i: _msg(i, f"FUID_{i}") for i in (1, 2, 3, 4, 5, 6)}
+    app = _FlakyApp(fail_on_batch=2, messages_by_id=msgs)  # 第二批 = id 3,4
+
+    fetched, failed = asyncio.run(bf.fetch_messages(app, -100123, [1, 2, 3, 4, 5, 6]))
+
+    assert sorted(fetched) == [1, 2, 5, 6]
+    assert sorted(failed) == [3, 4], "失败批次的 id 必须单独报出来"
+
+
+def test_failed_ids_rows_stay_null_for_next_run(db: ArchiveDB):
+    """失败批次对应的行要留在 NULL，下次还能重试；不能标 unknown"""
+    import backfill_metadata as bf
+
+    for mid in (1, 2):
+        db.record_message(source_message_id=mid, file_unique_id=f"FUID_{mid}")
+    rows = db.rows_missing_origin()
+
+    # 只有 id=1 拉回来了，id=2 属于失败批次
+    fetched = {1: _msg(1, "FUID_1")}
+    failed = {2}
+    plannable = [r for r in rows if r["source_message_id"] not in failed]
+    updates, unknown = bf.plan_updates(plannable, fetched)
+    bf.apply_updates(db, updates, unknown, dry_run=False)
+
+    remaining = [r["source_message_id"] for r in db.rows_missing_origin()]
+    assert remaining == [2], "失败批次的行必须保持 NULL 等下轮"
