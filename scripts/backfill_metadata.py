@@ -100,6 +100,11 @@ def apply_updates(db, updates, unknown_ids, dry_run):
         logger.info("[dry-run] %s 行将标为 unknown", len(unknown_ids))
         return
 
+    # 不做整表 rebuild：这里全是 UPDATE messages，messages_au 触发器已经逐行
+    # 同步了 FTS。而 'rebuild' 会对整表上独占写锁，主服务此时正在跑，锁等待
+    # 一旦超过它的 busy_timeout=30000，record_file/record_message 抛的
+    # sqlite3.OperationalError 不是 RuntimeError，archive_single 捕不住——
+    # 文件已经传上去却没落库，下轮扫描会重新下载重传，正是要避免的重复归档
     for row_id, file_unique_id, origin, identity in updates:
         db.update_message_metadata(row_id, file_name=identity["file_name"],
                                    media_kind=identity["media_kind"], **origin)
@@ -107,8 +112,6 @@ def apply_updates(db, updates, unknown_ids, dry_run):
         db.update_file_metadata(file_unique_id, **identity)
     for row_id in unknown_ids:
         db.mark_origin_unknown(row_id)
-    if updates:
-        db.rebuild_fts()
 
 
 def load_dotenv() -> None:
@@ -155,15 +158,27 @@ def build_client():
 
 
 async def fetch_messages(app, chat_id, message_ids):
-    """分批拉取接收频道消息，返回 {message_id: Message}。批间等待，别把账号跑挂。"""
+    """
+    分批拉取接收频道消息。批间等待，别把账号跑挂。
+
+    返回 (fetched, failed_ids)：
+      fetched     — {message_id: Message}
+      failed_ids  — 整批拉取失败（FloodWait / 连接中断）的 id 集合
+
+    失败的 id 必须单独报出来，不能只是从 fetched 里缺席。传输失败不等于
+    「原消息查不到」：前者下次还能成功，后者才该落终态。混在一起会让一次
+    FloodWait 把最多一整批可回填的行永久标成 unknown。
+    """
     fetched = {}
+    failed_ids: set[int] = set()
     for start in range(0, len(message_ids), BATCH_SIZE):
         batch = message_ids[start:start + BATCH_SIZE]
         logger.info("拉取 %s-%s / %s 条", start + 1, start + len(batch), len(message_ids))
         try:
             messages = await app.get_messages(chat_id, batch)
         except Exception:
-            logger.warning("批次拉取失败，跳过这一批", exc_info=True)
+            logger.warning("批次拉取失败，这 %s 条留到下次重试", len(batch), exc_info=True)
+            failed_ids.update(batch)
             continue
         if not isinstance(messages, list):
             messages = [messages]
@@ -172,7 +187,7 @@ async def fetch_messages(app, chat_id, message_ids):
                 fetched[message.id] = message
         if start + BATCH_SIZE < len(message_ids):
             await asyncio.sleep(BATCH_DELAY_SECONDS)
-    return fetched
+    return fetched, failed_ids
 
 
 async def main():
@@ -206,9 +221,15 @@ async def main():
 
     app = build_client()
     async with app:
-        fetched = await fetch_messages(app, receive_chat, message_ids)
+        fetched, failed_ids = await fetch_messages(app, receive_chat, message_ids)
 
-    updates, unknown_ids = plan_updates(rows, fetched)
+    # 失败批次的行完全不参与规划，保持 origin_type IS NULL 等下轮
+    plannable = [r for r in rows if r["source_message_id"] not in failed_ids]
+    skipped = len(rows) - len(plannable)
+    if skipped:
+        logger.warning("%s 行因批次拉取失败本轮跳过，仍为待回填状态", skipped)
+
+    updates, unknown_ids = plan_updates(plannable, fetched)
     logger.info("可回填 %s 行，标为 unknown %s 行", len(updates), len(unknown_ids))
     apply_updates(db, updates, unknown_ids, args.dry_run)
     if not args.dry_run:

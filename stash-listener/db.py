@@ -461,11 +461,6 @@ class ArchiveDB:
                 (row_id,),
             )
 
-    def rebuild_fts(self):
-        """整体重建 FTS 索引。回填走 UPDATE 时 au 触发器已同步，这是兜底。"""
-        with self._connect() as con:
-            con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
-
     def search(self, query: str, limit: int = 20):
         match = build_match_query(query)
         if match is None:
