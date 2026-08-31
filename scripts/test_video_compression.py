@@ -85,6 +85,8 @@ def _stub_message(msg_id: int) -> object:
 
 def _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert=None):
     """跑一遍 archive_single 视频路径，fake 下载返回 src_video，mock 压缩与上传。"""
+    from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
+
     sent = SimpleNamespace(id=7777)  # archive_single 需要 sent.id 落库
 
     async def fake_download(messages, *a, **k):
@@ -95,15 +97,20 @@ def _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert=
             send_assert(path)
         return sent
 
+    async def noop_mark(*a, **k):
+        return None
+
     monkeypatch.setattr(listener.tdl_downloader, "download", fake_download)
     monkeypatch.setattr(cv, "compress_video", fake_compress)
     monkeypatch.setattr(listener.app, "send_video", fake_send_video)
+    monkeypatch.setattr(listener, "mark_processed", noop_mark)
     monkeypatch.setattr(listener.db, "find_by_sha256", lambda *a, **k: None)
     monkeypatch.setattr(listener.db, "find_by_unique_id", lambda *a, **k: None)
     monkeypatch.setattr(listener.db, "record_file", lambda *a, **k: None)
     monkeypatch.setattr(listener.db, "record_message", lambda *a, **k: None)
 
-    assert asyncio.run(listener.archive_single(msg, mark=False)) is True
+    item = ArchiveItem(media=msg, entry=Entry(message=msg, route=ROUTE_FORWARD))
+    assert asyncio.run(listener.archive_single(item)).ok is True
 
 
 def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_path):

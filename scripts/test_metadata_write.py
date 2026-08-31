@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import listener
 import pytest
+from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry
 from db import ArchiveDB
 from origin import ORIGIN_LINK
 
@@ -28,20 +29,28 @@ def _media(file_unique_id="FUID_W", file_name="cat.mp4", mime_type="video/mp4"):
                            mime_type=mime_type)
 
 
-def _msg(message_id, chat, forward_origin=None):
-    return SimpleNamespace(
+def _msg(message_id, chat, forward_origin=None, kind=None, media=None):
+    """消息桩。kind/media 把媒体对象挂到对应属性上——kind 由 get_media 推导。"""
+    msg = SimpleNamespace(
         id=message_id, chat=chat, forward_origin=forward_origin,
         date=None, media_group_id=None, from_user=None, sender_chat=None,
+        caption=None, text=None,
+    )
+    if kind:
+        setattr(msg, kind, media)
+    return msg
+
+
+def _item(media_msg, entry_msg, route=ROUTE_FORWARD, link=None):
+    return ArchiveItem(
+        media=media_msg, entry=Entry(message=entry_msg, route=route), link=link,
     )
 
 
 def test_forward_path_entry_is_the_message_itself(db: ArchiveDB):
     """路径一：入口就是接收频道那条消息，未转发则来源为 original"""
-    entry = _msg(100, _chat(-1001234567890, "接收频道"))
-    listener._record_archived_media(
-        entry, entry, "FUID_W", "a" * 64, 2048, _sent(), "正文内容",
-        "video", _media(),
-    )
+    entry = _msg(100, _chat(-1001234567890, "接收频道"), kind="video", media=_media())
+    listener._record_archived_media(_item(entry, entry), "a" * 64, 2048, _sent(), "正文内容")
     row = db.search("正文内容")[0]
     assert row["source_message_id"] == 100
     assert row["source_chat_id"] == "-1001234567890"
@@ -62,11 +71,9 @@ def test_forwarded_message_records_channel_origin(db: ArchiveDB):
         chat=_chat(-1001111111111, "某个公开频道"),
         message_id=42,
     )
-    entry = _msg(101, _chat(-1001234567890, "接收频道"), forward_origin=origin)
-    listener._record_archived_media(
-        entry, entry, "FUID_F", "c" * 64, 512, _sent(), "转发的内容",
-        "photo", _media("FUID_F", file_name=None, mime_type="image/jpeg"),
-    )
+    entry = _msg(101, _chat(-1001234567890, "接收频道"), forward_origin=origin,
+                 kind="photo", media=_media("FUID_F", file_name=None, mime_type="image/jpeg"))
+    listener._record_archived_media(_item(entry, entry), "c" * 64, 512, _sent(), "转发的内容")
     row = db.search("某个公开频道")[0]
     assert row["source_message_id"] == 101
     assert row["origin_chat_id"] == "-1001111111111"
@@ -83,10 +90,10 @@ def test_link_path_entry_is_the_link_message_not_the_source(db: ArchiveDB):
     delete_message.py 会拿 42 去回退接收频道的 checkpoint。
     """
     entry = _msg(300, _chat(-1001234567890, "接收频道"))
-    source = _msg(42, _chat(-1009999999999, "私有频道"))
+    source = _msg(42, _chat(-1009999999999, "私有频道"),
+                  kind="video", media=_media("FUID_L"))
     listener._record_archived_media(
-        source, entry, "FUID_L", "b" * 64, 1024, _sent(), "链接来的内容",
-        "video", _media("FUID_L"),
+        _item(source, entry, ROUTE_LINK), "b" * 64, 1024, _sent(), "链接来的内容",
     )
     row = db.search("链接来的内容")[0]
     # 入口 = 接收频道的链接消息
@@ -117,7 +124,7 @@ def _doc_message(message_id, chat, file_unique_id, file_name="report.pdf"):
     )
 
 
-def _run_archive_single(monkeypatch, msg, local_file, *, entry=None):
+def _run_archive_single(monkeypatch, msg, local_file, *, entry=None, route=ROUTE_FORWARD):
     """跑一遍 archive_single，下载替换成本地已有文件。上传不该发生（去重命中会提前返回）。"""
     import asyncio
 
@@ -130,10 +137,8 @@ def _run_archive_single(monkeypatch, msg, local_file, *, entry=None):
     monkeypatch.setattr(listener.tdl_downloader, "download", fake_download)
     monkeypatch.setattr(listener.app, "send_document", boom)
     monkeypatch.setattr(listener, "mark_processed", _noop)
-    kwargs = {"mark": False}
-    if entry is not None:
-        kwargs["entry"] = entry
-    return asyncio.run(listener.archive_single(msg, **kwargs))
+    item = ArchiveItem(media=msg, entry=Entry(message=entry or msg, route=route))
+    return asyncio.run(listener.archive_single(item))
 
 
 async def _noop(*a, **k):
@@ -161,7 +166,7 @@ def test_sha256_dup_records_file_identity(db: ArchiveDB, tmp_path, monkeypatch):
     _seed_dup(db, local)
 
     msg = _doc_message(700, _chat(-1001234567890, "接收频道"), "FUID_NEW", "新名字.pdf")
-    assert _run_archive_single(monkeypatch, msg, local) is True
+    assert _run_archive_single(monkeypatch, msg, local).ok is True
 
     row = db.find_by_unique_id("FUID_NEW")
     assert row is not None, "去重命中必须留下指向已归档消息的 files 行"
@@ -180,7 +185,9 @@ def test_sha256_dup_on_link_path_records_link_source(db: ArchiveDB, tmp_path, mo
 
     entry = _msg(800, _chat(-1001234567890, "接收频道"))
     source_msg = _doc_message(55, _chat(-1009999999999, "私有频道"), "FUID_LINK")
-    assert _run_archive_single(monkeypatch, source_msg, local, entry=entry) is True
+    outcome = _run_archive_single(monkeypatch, source_msg, local,
+                                 entry=entry, route=ROUTE_LINK)
+    assert outcome.ok is True
 
     row = db.find_by_unique_id("FUID_LINK")
     assert row is not None

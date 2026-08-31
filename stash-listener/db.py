@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE TABLE IF NOT EXISTS archive_failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- 这两列是「入口」：接收频道里那条消息，两条路径一致。
+    -- 路径二若写成源频道的 id，pending_failures 与 delete_message.py 都读不到，
+    -- 那条失败既不重试也不阻塞 checkpoint
     source_chat_id TEXT NOT NULL,
     source_message_id INTEGER NOT NULL,
     failure_stage TEXT NOT NULL,   -- 'download' | 'verify' | 'convert' | 'upload' | 'unknown'
