@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import compress_video as cv
 import listener
+import media_ops
 
 
 def test_build_command_has_key_params():
@@ -292,8 +293,8 @@ def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path):
 
     monkeypatch.setattr(listener, "tdl_downloader", SimpleNamespace(download=fake_download))
     monkeypatch.setattr(cv, "compress_video", recording_compress)
-    monkeypatch.setattr(listener, "probe_video", lambda p: {"duration": 5, "width": 640, "height": 360})
-    monkeypatch.setattr(listener, "make_thumbnail", lambda *a, **k: None)
+    monkeypatch.setattr(media_ops, "probe_video", lambda p: {"duration": 5, "width": 640, "height": 360})
+    monkeypatch.setattr(media_ops, "make_thumbnail", lambda *a, **k: None)
     monkeypatch.setattr(listener, "mark_processed", noop)
     monkeypatch.setattr(listener, "app", SimpleNamespace(send_media_group=fake_send_media_group))
     monkeypatch.setattr(listener, "db", SimpleNamespace(
