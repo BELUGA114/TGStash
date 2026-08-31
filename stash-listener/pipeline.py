@@ -268,7 +268,6 @@ class ArchivePipeline:
         local_path: str,
         media: object,
         temp_files: list[str],
-        thumb_dir: str,
         message_id: int,
     ) -> tuple[str, str | None, dict]:
         """压缩视频、探测元数据并生成缩略图，返回实际路径和上传参数。"""
@@ -303,7 +302,11 @@ class ArchivePipeline:
                      message_id, meta["duration"], meta["width"], meta["height"])
 
         logger.debug("生成缩略图 %s ...", message_id)
-        thumb_path = os.path.join(thumb_dir, "thumb.jpg")
+        # 产物写源文件所在目录并带上消息 id：媒体组 tdl 命中时文件在 batch_dir，
+        # msg_dir 已被 rmdir，写进去必然失败（还要白跑四档画质重试）；整组文件同在
+        # batch_dir，固定名会被 ffmpeg -y 互相覆盖。与 compressed_{tag}.mp4 同一套约定。
+        # dirname 必须在压缩之后取：压缩成功时 local_path 已经换成产物路径
+        thumb_path = os.path.join(os.path.dirname(local_path), f"thumb_{message_id}.jpg")
         thumb_path = await asyncio.to_thread(media_ops.make_thumbnail, local_path, thumb_path)
         if thumb_path:
             logger.debug("缩略图 %s: %s (%s bytes)",
@@ -429,7 +432,7 @@ class ArchivePipeline:
             meta = None
             if kind == "video":
                 local_path, thumb_path, meta = await self._prepare_video(
-                    local_path, media, temp_files, msg_dir, message.id,
+                    local_path, media, temp_files, message.id,
                 )
 
             logger.debug("上传 %s %s ...", kind, message.id)
@@ -604,7 +607,7 @@ class ArchivePipeline:
             meta: dict = {}
             if kind == "video":
                 local_path, thumb_path, meta = await self._prepare_video(
-                    local_path, media, temp_files, task.msg_dir, message.id,
+                    local_path, media, temp_files, message.id,
                 )
 
             pending.append(_PendingUpload(

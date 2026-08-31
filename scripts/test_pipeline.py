@@ -4,6 +4,7 @@ ArchivePipeline 测试：假 client / 假 db / 假 downloader，
 """
 
 import asyncio
+import os
 from types import SimpleNamespace
 
 from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
@@ -129,3 +130,51 @@ def test_archive_one_uploads_and_records(tmp_path, make_pipeline):
     assert [w[0] for w in db.writes] == ["file", "message"]
     assert db.writes[0][1]["source"] == "manual_forward"
     assert db.writes[1][1]["source_message_id"] == 41
+
+
+class TestThumbnailPath:
+    def test_media_group_thumbs_land_beside_each_source(self, tmp_path, monkeypatch,
+                                                       make_pipeline):
+        """
+        回归：缩略图必须写在源文件所在目录，且按消息 id 区分。
+
+        修复前 thumb_dir 传的是 msg_dir，而 tdl 命中时 msg_dir 已被 rmdir，
+        ffmpeg 写不进去 —— 四档画质白跑一轮，媒体组视频永远没有缩略图。
+        """
+        import media_ops
+
+        thumb_calls = []
+
+        def fake_make_thumbnail(video_path, thumb_path, timestamp="00:00:01"):
+            # 目录是否存在只能在调用当时判断：archive_batch 收尾时 _cleanup_temp_files
+            # 会把临时文件连所在空目录一起清掉，事后再看什么都不剩
+            dir_ok = os.path.isdir(os.path.dirname(thumb_path))
+            thumb_calls.append((video_path, thumb_path, dir_ok))
+            if not dir_ok:
+                return None  # 真 ffmpeg 在这种情况下是四档画质全跑一遍再返回 None
+            # 真写一个文件：_prepare_video 成功后会 os.path.getsize 记日志，
+            # 日志参数是即时求值的，返回不存在的路径会抛 FileNotFoundError
+            with open(thumb_path, "wb") as f:
+                f.write(b"jpg")
+            return thumb_path
+
+        monkeypatch.setattr(media_ops, "make_thumbnail", fake_make_thumbnail)
+        monkeypatch.setattr(media_ops, "probe_video",
+                            lambda p: {"duration": 5, "width": 640, "height": 360})
+
+        # tdl 成功时整组文件都落在同一个 batch_dir，msg_dir 会被 rmdir
+        sources = {mid: local_file(tmp_path, f"batch/{mid}.mp4") for mid in (41, 42)}
+        items = [item_of(msg_stub(mid, "video", group="g1")) for mid in (41, 42)]
+        pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                                downloader=fake_downloader(sources))
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        assert all(o.ok for o in outcomes)
+        assert len(thumb_calls) == 2
+        for src, thumb, dir_ok in thumb_calls:
+            assert dir_ok, f"缩略图目录不存在，ffmpeg 必然写不进去：{thumb}"
+            assert os.path.dirname(thumb) == os.path.dirname(src)
+        thumbs = [t for _, t, _ in thumb_calls]
+        assert len(set(thumbs)) == 2, f"两条缩略图指向同一个文件：{thumbs}"
+        assert sorted(os.path.basename(t) for t in thumbs) == ["thumb_41.jpg", "thumb_42.jpg"]
