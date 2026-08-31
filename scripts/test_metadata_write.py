@@ -16,6 +16,12 @@ def db(tmp_path, monkeypatch):
     return real
 
 
+@pytest.fixture
+def pipeline(db, make_pipeline):
+    """写库路径只需要真 db，client / downloader 不会被调用。"""
+    return make_pipeline(db=db)
+
+
 def _chat(chat_id, title):
     return SimpleNamespace(id=chat_id, title=title)
 
@@ -47,10 +53,10 @@ def _item(media_msg, entry_msg, route=ROUTE_FORWARD, link=None):
     )
 
 
-def test_forward_path_entry_is_the_message_itself(db: ArchiveDB):
+def test_forward_path_entry_is_the_message_itself(db: ArchiveDB, pipeline):
     """路径一：入口就是接收频道那条消息，未转发则来源为 original"""
     entry = _msg(100, _chat(-1001234567890, "接收频道"), kind="video", media=_media())
-    listener._record_archived_media(_item(entry, entry), "a" * 64, 2048, _sent(), "正文内容")
+    pipeline._record_archived_media(_item(entry, entry), "a" * 64, 2048, _sent(), "正文内容")
     row = db.search("正文内容")[0]
     assert row["source_message_id"] == 100
     assert row["source_chat_id"] == "-1001234567890"
@@ -64,7 +70,7 @@ def test_forward_path_entry_is_the_message_itself(db: ArchiveDB):
     assert file_row["media_kind"] == "video"
 
 
-def test_forwarded_message_records_channel_origin(db: ArchiveDB):
+def test_forwarded_message_records_channel_origin(db: ArchiveDB, pipeline):
     """路径一的转发消息：来源从 forward_origin 取"""
     origin = SimpleNamespace(
         type=SimpleNamespace(value="channel"),
@@ -73,7 +79,7 @@ def test_forwarded_message_records_channel_origin(db: ArchiveDB):
     )
     entry = _msg(101, _chat(-1001234567890, "接收频道"), forward_origin=origin,
                  kind="photo", media=_media("FUID_F", file_name=None, mime_type="image/jpeg"))
-    listener._record_archived_media(_item(entry, entry), "c" * 64, 512, _sent(), "转发的内容")
+    pipeline._record_archived_media(_item(entry, entry), "c" * 64, 512, _sent(), "转发的内容")
     row = db.search("某个公开频道")[0]
     assert row["source_message_id"] == 101
     assert row["origin_chat_id"] == "-1001111111111"
@@ -82,7 +88,7 @@ def test_forwarded_message_records_channel_origin(db: ArchiveDB):
     assert row["file_name"] is None
 
 
-def test_link_path_entry_is_the_link_message_not_the_source(db: ArchiveDB):
+def test_link_path_entry_is_the_link_message_not_the_source(db: ArchiveDB, pipeline):
     """
     路径二回归测试：入口必须是接收频道里那条链接消息，来源才是源频道那条。
 
@@ -92,7 +98,7 @@ def test_link_path_entry_is_the_link_message_not_the_source(db: ArchiveDB):
     entry = _msg(300, _chat(-1001234567890, "接收频道"))
     source = _msg(42, _chat(-1009999999999, "私有频道"),
                   kind="video", media=_media("FUID_L"))
-    listener._record_archived_media(
+    pipeline._record_archived_media(
         _item(source, entry, ROUTE_LINK), "b" * 64, 1024, _sent(), "链接来的内容",
     )
     row = db.search("链接来的内容")[0]
