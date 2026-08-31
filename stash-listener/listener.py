@@ -19,12 +19,14 @@
 """
 
 import asyncio
+import functools
 import logging
 import os
 import re
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from typing import NamedTuple
 from urllib.parse import urlparse
 
@@ -99,19 +101,29 @@ logger = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
-def _pipeline() -> ArchivePipeline:
+@dataclass(frozen=True)
+class ListenerContext:
     """
-    按当前模块级依赖与配置组装 pipeline。
+    一轮扫描要用到的运行时依赖。
 
-    每次调用重新组装，不缓存：现有测试用 monkeypatch.setattr(listener, "db"/"app"/
-    "VIDEO_COMPRESS_ENABLED", ...) 打桩，在导入期固化依赖会让这些桩全部静默失效。
-    后续会由 _build_context() 组装一次，本函数连同两个薄封装一起删掉。
+    只装「可替换的协作者」与「必填配置」。带默认值的环境变量常量
+    （RETRY_MAX_ATTEMPTS、BATCH_SIZE、SCAN_INTERVAL_SECONDS ...）留在模块级：
+    它们是纯读取，没有导入期副作用，进 ctx 只会让所有调用点变长。
     """
-    return ArchivePipeline(
+
+    client: Client
+    db: ArchiveDB
+    pipeline: ArchivePipeline
+    receive_chat: int
+
+
+def _build_context() -> ListenerContext:
+    """组装运行时依赖。"""
+    pipeline = ArchivePipeline(
         client=app,
         db=db,
         downloader=tdl_downloader,
-        mark_processed=mark_processed,
+        mark_processed=functools.partial(mark_processed, app),
         config=PipelineConfig(
             upload_cooldown_seconds=UPLOAD_COOLDOWN_SECONDS,
             video_compress_enabled=VIDEO_COMPRESS_ENABLED,
@@ -122,16 +134,7 @@ def _pipeline() -> ArchivePipeline:
         receive_chat=RECEIVE_CHAT,
         download_dir=DOWNLOAD_DIR,
     )
-
-
-async def archive_single(item: ArchiveItem) -> Outcome:
-    """薄封装，过渡用：让现有测试的模块级打桩继续有效。"""
-    return await _pipeline().archive_one(item)
-
-
-async def archive_group(items: list[ArchiveItem]) -> list[Outcome]:
-    """薄封装，过渡用。"""
-    return await _pipeline().archive_batch(items)
+    return ListenerContext(client=app, db=db, pipeline=pipeline, receive_chat=RECEIVE_CHAT)
 
 
 def parse_message_link(link: str) -> tuple[str, int]:
@@ -151,7 +154,7 @@ def parse_message_link(link: str) -> tuple[str, int]:
     raise ValueError(f"无法解析链接：{link}")
 
 
-async def mark_processed(message: Message, duplicate: bool):
+async def mark_processed(client: Client, message: Message, duplicate: bool):
     """回复原消息标记处理状态（转发的消息无法编辑，用回复形式）"""
     chat = message.chat
     if chat is None:
@@ -159,17 +162,18 @@ async def mark_processed(message: Message, duplicate: bool):
     assert chat.id is not None
     text = "✅ 已归档（重复）" if duplicate else "✅ 已归档"
     try:
-        await app.send_message(chat.id, text, reply_parameters=ReplyParameters(message_id=message.id))
+        await client.send_message(
+            chat.id, text, reply_parameters=ReplyParameters(message_id=message.id))
     except Exception:
         logger.warning("回复归档标记失败（已归档结果不受影响）：%s", message.id, exc_info=True)
 
 
-async def alert_failure(entry: Entry, text: str):
+async def alert_failure(client: Client, entry: Entry, text: str):
     """在接收频道回复入口消息提醒归档失败。尽力而为，失败仅记日志。"""
     if entry.chat_id is None:
         return
     try:
-        await app.send_message(
+        await client.send_message(
             int(entry.chat_id), text,
             reply_parameters=ReplyParameters(message_id=entry.message_id),
         )
@@ -177,12 +181,12 @@ async def alert_failure(entry: Entry, text: str):
         logger.debug("失败告警发送失败", exc_info=True)
 
 
-def _entry_chat(entry: Entry) -> str:
-    """入口所在频道。入口恒来自接收频道，chat 缺失时兜底到 RECEIVE_CHAT。"""
-    return entry.chat_id or str(RECEIVE_CHAT)
+def _entry_chat(ctx: ListenerContext, entry: Entry) -> str:
+    """入口所在频道。入口恒来自接收频道，chat 缺失时兜底到接收频道 id。"""
+    return entry.chat_id or str(ctx.receive_chat)
 
 
-async def _record_failure(entry: Entry, stage: str, error: str) -> str:
+async def _record_failure(ctx: ListenerContext, entry: Entry, stage: str, error: str) -> str:
     """
     记录一次失败并决定后续动作。返回 'retry'（未满 N 轮，不推进 checkpoint）
     或 'skip'（已满 N 轮，跳过/剔除）。
@@ -191,24 +195,28 @@ async def _record_failure(entry: Entry, stage: str, error: str) -> str:
     那条消息记账，行会落在另一个 id 空间，pending_failures() 永远读不到，
     等于既不重试也不阻塞 checkpoint。
     """
-    chat_id = _entry_chat(entry)
+    chat_id = _entry_chat(ctx, entry)
     msg_id = entry.message_id
-    count = db.increment_failure(chat_id, msg_id, stage, error)
+    count = ctx.db.increment_failure(chat_id, msg_id, stage, error)
     if count == 1:
-        await alert_failure(entry, f"⚠️ 归档失败，将自动重试（共 {RETRY_MAX_ATTEMPTS} 次）。阶段: {stage}")
+        await alert_failure(
+            ctx.client, entry,
+            f"⚠️ 归档失败，将自动重试（共 {RETRY_MAX_ATTEMPTS} 次）。阶段: {stage}")
     if count >= RETRY_MAX_ATTEMPTS:
-        db.mark_failure_skipped(chat_id, msg_id, f"重试 {count} 次仍失败: {stage}")
-        await alert_failure(entry, f"⚠️ 归档失败 {count} 次，已跳过。原消息保留。阶段: {stage}，最近错误: {error}")
+        ctx.db.mark_failure_skipped(chat_id, msg_id, f"重试 {count} 次仍失败: {stage}")
+        await alert_failure(
+            ctx.client, entry,
+            f"⚠️ 归档失败 {count} 次，已跳过。原消息保留。阶段: {stage}，最近错误: {error}")
         return "skip"
     return "retry"
 
 
-def _clear_failure(entry: Entry):
+def _clear_failure(ctx: ListenerContext, entry: Entry):
     """归档成功后自愈：清除该入口的失败记录（如有）。"""
-    db.delete_failure(_entry_chat(entry), entry.message_id)
+    ctx.db.delete_failure(_entry_chat(ctx, entry), entry.message_id)
 
 
-async def _settle(entry: Entry, outcomes: list[Outcome]) -> bool:
+async def _settle(ctx: ListenerContext, entry: Entry, outcomes: list[Outcome]) -> bool:
     """
     结算一个入口：返回它是否已结清（可以推进 checkpoint）。
 
@@ -218,15 +226,15 @@ async def _settle(entry: Entry, outcomes: list[Outcome]) -> bool:
     """
     failed = [o for o in outcomes if not o.ok]
     if not failed:
-        _clear_failure(entry)
+        _clear_failure(ctx, entry)
         return True
     first = failed[0]
-    outcome = await _record_failure(entry, first.stage or "unknown", first.error or "")
+    outcome = await _record_failure(ctx, entry, first.stage or "unknown", first.error or "")
     # 满 N 轮已标记 skipped，视为结清，否则这条入口会永久卡住 checkpoint
     return outcome == "skip"
 
 
-async def _settle_all(outcomes: list[Outcome]) -> bool:
+async def _settle_all(ctx: ListenerContext, outcomes: list[Outcome]) -> bool:
     """
     按入口分组结算全部结果。返回是否所有入口都已结清。
 
@@ -236,17 +244,17 @@ async def _settle_all(outcomes: list[Outcome]) -> bool:
     grouped: dict[tuple[str, int], tuple[Entry, list[Outcome]]] = {}
     for outcome in outcomes:
         entry = outcome.item.entry
-        key = (_entry_chat(entry), entry.message_id)
+        key = (_entry_chat(ctx, entry), entry.message_id)
         grouped.setdefault(key, (entry, []))[1].append(outcome)
 
     settled = True
     for entry, entry_outcomes in grouped.values():
-        if not await _settle(entry, entry_outcomes):
+        if not await _settle(ctx, entry, entry_outcomes):
             settled = False
     return settled
 
 
-def _group_settled(group: list[Message]) -> bool:
+def _group_settled(ctx: ListenerContext, group: list[Message]) -> bool:
     """
     组内所有消息都不再处于重试状态。checkpoint 的推进交给 scan_once 统一负责。
 
@@ -254,15 +262,17 @@ def _group_settled(group: list[Message]) -> bool:
     必须挡住推进，否则那条消息永远不会被重试。
     """
     ids = {str(m.id) for m in group}
-    chat_id = str(group[0].chat.id) if group[0].chat and group[0].chat.id else str(RECEIVE_CHAT)
-    pending = {p.split(":", 1)[1] for p in db.pending_failures() if p.split(":", 1)[0] == chat_id}
+    chat_id = (str(group[0].chat.id) if group[0].chat and group[0].chat.id
+               else str(ctx.receive_chat))
+    pending = {p.split(":", 1)[1] for p in ctx.db.pending_failures()
+               if p.split(":", 1)[0] == chat_id}
     if pending & ids:
         logger.warning("媒体组仍有 %s 条待重试，本轮不推进 checkpoint", len(pending & ids))
         return False
     return True
 
 
-async def process_link_message(entry: Entry) -> list[Outcome]:
+async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outcome]:
     """
     处理包含 t.me 链接的入口消息：Pyrogram 直接获取消息 → 复用路径一的去重+上传管道
 
@@ -292,7 +302,7 @@ async def process_link_message(entry: Entry) -> list[Outcome]:
             continue
 
         try:
-            msg = await app.get_messages(chat, msg_id)
+            msg = await ctx.client.get_messages(chat, msg_id)
         except Exception as e:
             logger.warning("获取链接消息 %s 失败，下轮重试", link, exc_info=True)
             outcomes.append(Outcome.failure(
@@ -303,10 +313,11 @@ async def process_link_message(entry: Entry) -> list[Outcome]:
             logger.warning("消息 %s 不可访问或已删除", link)
             continue
 
-        # 媒体组：拉整组，复用 archive_group()
+        # 媒体组：拉整组，复用 pipeline.archive_batch()
         if msg.media_group_id:
             try:
-                group = sorted(await app.get_media_group(chat, msg_id), key=lambda m: m.id)
+                group = sorted(await ctx.client.get_media_group(chat, msg_id),
+                               key=lambda m: m.id)
             except Exception as e:
                 logger.warning("获取媒体组 %s 失败，下轮重试", link, exc_info=True)
                 outcomes.append(Outcome.failure(
@@ -318,20 +329,21 @@ async def process_link_message(entry: Entry) -> list[Outcome]:
                 ArchiveItem(media=m, entry=entry, link=link if m.id == msg.id else None)
                 for m in group
             ]
-            outcomes.extend(await archive_group(items))
+            outcomes.extend(await ctx.pipeline.archive_batch(items))
             logger.info("链接 %s → 媒体组 %s 张", link, len(group))
         else:
             kind, _ = get_media(msg)
             if kind is None:
                 logger.info("链接 %s → 无媒体", link)
                 continue
-            outcomes.append(await archive_single(ArchiveItem(media=msg, entry=entry, link=link)))
+            outcomes.append(await ctx.pipeline.archive_one(
+                ArchiveItem(media=msg, entry=entry, link=link)))
             logger.info("链接 %s → %s", link, kind)
 
     # 只有确实归档了文件才打标记（去重跳过也算——文件已在备份频道）
     if any(o.ok for o in outcomes) and entry.chat_id is not None:
         try:
-            await app.edit_message_text(
+            await ctx.client.edit_message_text(
                 int(entry.chat_id), entry.message_id, f"✅ 已归档\n{text}"[:4096])
         except Exception:
             logger.warning("编辑链接消息标记失败（已归档结果不受影响）：%s",
@@ -352,48 +364,50 @@ class EntryResult(NamedTuple):
     handled: int      # 本条入口实际处理的文件数，只用于冷却计时
 
 
-async def _handle_entry(msg: Message, handled_groups: set) -> EntryResult:
+async def _handle_entry(ctx: ListenerContext, msg: Message, handled_groups: set) -> EntryResult:
     """
     处理接收频道的一条消息。三条路径统一成同一个返回形状，
     checkpoint 的推进由 scan_once 一处负责。
     """
     if msg.media_group_id:
-        group = sorted(await app.get_media_group(msg.chat.id, msg.id), key=lambda m: m.id)
+        group = sorted(await ctx.client.get_media_group(msg.chat.id, msg.id),
+                       key=lambda m: m.id)
         handled_groups.add(msg.media_group_id)
         items = [
             ArchiveItem(media=m, entry=Entry(message=m, route=ROUTE_FORWARD))
             for m in group
         ]
-        outcomes = await archive_group(items)
+        outcomes = await ctx.pipeline.archive_batch(items)
         # _settle_all 负责写失败账；组是否结清以库里的 pending 为准，
         # 这样往轮残留的 'retrying' 行也能挡住推进
-        await _settle_all(outcomes)
-        return EntryResult(_group_settled(group), max(m.id for m in group), len(group))
+        await _settle_all(ctx, outcomes)
+        return EntryResult(_group_settled(ctx, group), max(m.id for m in group), len(group))
 
     kind, _ = get_media(msg)
     if kind:
         item = ArchiveItem(media=msg, entry=Entry(message=msg, route=ROUTE_FORWARD))
-        outcome = await archive_single(item)
-        settled = await _settle_all([outcome])
+        outcome = await ctx.pipeline.archive_one(item)
+        settled = await _settle_all(ctx, [outcome])
         return EntryResult(settled, msg.id, 1 if outcome.ok else 0)
 
     if _has_tme_link(msg):
         entry = Entry(message=msg, route=ROUTE_LINK)
-        outcomes = await process_link_message(entry)
-        settled = await _settle_all(outcomes)
+        outcomes = await process_link_message(ctx, entry)
+        settled = await _settle_all(ctx, outcomes)
         return EntryResult(settled, msg.id, sum(1 for o in outcomes if o.ok))
 
     # 非媒体且无链接的消息不归档，但依然推进 checkpoint，避免反复扫描
     return EntryResult(True, msg.id, 0)
 
 
-async def scan_once():
-    last_id = db.get_checkpoint(RECEIVE_CHAT)
+async def scan_once(ctx: ListenerContext):
+    last_id = ctx.db.get_checkpoint(ctx.receive_chat)
     new_messages = []
     # reverse=True 让消息从旧到新排列——配合 min_id checkpoint 机制，
     # 每处理完一条就推进 checkpoint，中途崩溃可以从最后成功的那条继续
     # min_id 在 Pyrogram 是包含边界 >=，+1 确保不重复拉取已 checkpoint 的消息
-    async for msg in app.get_chat_history(RECEIVE_CHAT, min_id=last_id + 1, reverse=True):
+    async for msg in ctx.client.get_chat_history(ctx.receive_chat, min_id=last_id + 1,
+                                                 reverse=True):
         new_messages.append(msg)
 
     if not new_messages:
@@ -411,14 +425,14 @@ async def scan_once():
         if msg.media_group_id and msg.media_group_id in handled_groups:
             continue
 
-        result = await _handle_entry(msg, handled_groups)
+        result = await _handle_entry(ctx, msg, handled_groups)
         processed += result.handled
         if not result.settled:
             # 必须停止本轮：否则下一条消息会把 checkpoint 推过这个未结清的入口，
             # 它永远不会被重试
             logger.info("入口 %s 未结清，本轮停止，不推进 checkpoint", msg.id)
             break
-        db.set_checkpoint(RECEIVE_CHAT, result.advance_to)
+        ctx.db.set_checkpoint(ctx.receive_chat, result.advance_to)
 
     if processed:
         logger.info("本轮完成：处理 %s 条消息", processed)
@@ -431,9 +445,10 @@ async def main():
         logger.error("ffmpeg/ffprobe 未安装，退出")
         sys.exit(1)
 
-    async with app:
-        db.ensure_channel(RECEIVE_CHAT, "manual_forward")
-        me = await app.get_me()
+    ctx = _build_context()
+    async with ctx.client:
+        ctx.db.ensure_channel(ctx.receive_chat, "manual_forward")
+        me = await ctx.client.get_me()
         logger.info("已登录：%s (id=%s)，冷却间隔 %ss", me.first_name, me.id, SCAN_INTERVAL_SECONDS)
         last_processed_at = 0.0
 
@@ -445,7 +460,7 @@ async def main():
                     logger.debug("冷却中，%.0fs 后扫描", wait)
                     await asyncio.sleep(wait)
 
-                n = await scan_once()
+                n = await scan_once(ctx)
                 if n > 0:
                     last_processed_at = time.time()
                 else:
