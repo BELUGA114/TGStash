@@ -178,3 +178,129 @@ class TestThumbnailPath:
         thumbs = [t for _, t, _ in thumb_calls]
         assert len(set(thumbs)) == 2, f"两条缩略图指向同一个文件：{thumbs}"
         assert sorted(os.path.basename(t) for t in thumbs) == ["thumb_41.jpg", "thumb_42.jpg"]
+
+
+class TestGroupUploadShapes:
+    def test_distinct_captions_split_into_single_uploads(self, tmp_path, make_pipeline):
+        """
+        多条转发消息各带独立文字被 Telegram 编组 → 拆组单发，每条带自己的 caption，
+        还原「文件A+文字A、文件B+文字B」的原始布局，不走 send_media_group。
+        """
+        client = FakeClient()
+        items = [item_of(msg_stub(mid, group="g1", caption=f"文字{mid}")) for mid in (41, 42)]
+        pipeline = make_pipeline(
+            client=client, db=fake_db(),
+            downloader=fake_downloader({mid: local_file(tmp_path, f"b/{mid}.pdf")
+                                        for mid in (41, 42)}),
+        )
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        assert all(o.ok for o in outcomes)
+        assert [c[0] for c in client.calls] == ["send_document", "send_document"]
+        assert [c[2]["caption"] for c in client.calls] == ["文字41", "文字42"]
+
+    def test_shared_caption_uses_media_group_with_caption_on_first_only(
+            self, tmp_path, make_pipeline):
+        client = FakeClient()
+        items = [item_of(msg_stub(mid, group="g1", caption="同一段说明")) for mid in (41, 42)]
+        pipeline = make_pipeline(
+            client=client, db=fake_db(),
+            downloader=fake_downloader({mid: local_file(tmp_path, f"b/{mid}.pdf")
+                                        for mid in (41, 42)}),
+        )
+
+        asyncio.run(pipeline.archive_batch(items))
+
+        assert [c[0] for c in client.calls] == ["send_media_group"]
+        assert client.calls[0][2]["captions"] == ["同一段说明", ""]
+
+    def test_photo_ext_invalid_falls_back_to_document_group(self, tmp_path, make_pipeline):
+        """WebP 等格式不能作为 photo 编组 → 整组回退 document，caption 仍只挂第一条"""
+        from pyrogram.errors import PhotoExtInvalid
+
+        client = FakeClient(media_group_error=PhotoExtInvalid())
+        items = [item_of(msg_stub(mid, "photo", group="g1", caption="猫")) for mid in (41, 42)]
+        pipeline = make_pipeline(
+            client=client, db=fake_db(),
+            downloader=fake_downloader({mid: local_file(tmp_path, f"b/{mid}.bin")
+                                        for mid in (41, 42)}),
+        )
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        assert all(o.ok for o in outcomes)
+        assert [c[0] for c in client.calls] == ["send_media_group", "send_media_group"]
+        assert client.calls[0][2]["classes"] == ["InputMediaPhoto", "InputMediaPhoto"]
+        assert client.calls[1][2]["classes"] == ["InputMediaDocument", "InputMediaDocument"]
+        assert client.calls[1][2]["captions"] == ["猫", ""]
+
+    def test_non_groupable_kind_goes_through_archive_one(self, tmp_path, make_pipeline):
+        """语音不支持编组 → 退回单条 send_voice（这条路径今天没测过）"""
+        client = FakeClient()
+        src = local_file(tmp_path, "b/41.ogg")
+        pipeline = make_pipeline(client=client, db=fake_db(),
+                                downloader=fake_downloader({41: src}))
+
+        outcomes = asyncio.run(
+            pipeline.archive_batch([item_of(msg_stub(41, "voice", group="g1"))]))
+
+        assert [o.ok for o in outcomes] == [True]
+        assert [c[0] for c in client.calls] == ["send_voice"]
+
+
+class TestVideoMetadataFallback:
+    def _run(self, tmp_path, make_pipeline, monkeypatch, probe_result):
+        import media_ops
+
+        client = FakeClient()
+        monkeypatch.setattr(media_ops, "probe_video", lambda p: probe_result)
+        monkeypatch.setattr(media_ops, "make_thumbnail", lambda *a, **k: None)
+        pipeline = make_pipeline(
+            client=client, db=fake_db(),
+            downloader=fake_downloader({41: local_file(tmp_path, "b/41.mp4")}),
+        )
+        assert asyncio.run(pipeline.archive_one(item_of(msg_stub(41, "video")))).ok
+        return client.calls[0]
+
+    def test_probe_wins_when_it_works(self, tmp_path, make_pipeline, monkeypatch):
+        call = self._run(tmp_path, make_pipeline, monkeypatch,
+                         {"duration": 99, "width": 1920, "height": 1080})
+        assert call[0] == "send_video"
+        assert (call[2]["duration"], call[2]["width"], call[2]["height"]) == (99, 1920, 1080)
+
+    def test_probe_failure_falls_back_to_source_message(self, tmp_path, make_pipeline,
+                                                       monkeypatch):
+        """第二层：ffprobe 返回 None（大文件常见）→ 用源消息自带的元数据"""
+        call = self._run(tmp_path, make_pipeline, monkeypatch, None)
+        assert (call[2]["duration"], call[2]["width"], call[2]["height"]) == (5, 640, 360)
+
+    def test_probe_zero_duration_prefers_source_duration(self, tmp_path, make_pipeline,
+                                                        monkeypatch):
+        """ffprobe 探到了尺寸但 duration=0 → 只有 duration 回退源数据"""
+        call = self._run(tmp_path, make_pipeline, monkeypatch,
+                         {"duration": 0, "width": 1920, "height": 1080})
+        assert (call[2]["duration"], call[2]["width"], call[2]["height"]) == (5, 1920, 1080)
+
+
+def test_upload_cooldown_comes_from_config(tmp_path, make_pipeline, monkeypatch):
+    """
+    冷却值走 PipelineConfig：测试不再 monkeypatch 模块常量，也不再真睡 5 秒。
+
+    风控相关，值本身不能改；这里只验证配置真的被用上。
+    """
+    import pipeline as pipeline_mod
+
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(pipeline_mod.asyncio, "sleep", fake_sleep)
+    p = make_pipeline(client=FakeClient(), db=fake_db(),
+                      downloader=fake_downloader({41: local_file(tmp_path, "b/41.pdf")}),
+                      upload_cooldown_seconds=7)
+
+    asyncio.run(p.archive_one(item_of(msg_stub(41))))
+
+    assert slept == [7]
