@@ -153,7 +153,7 @@ def test_single_video_compress_smaller_uses_compressed(monkeypatch, tmp_path):
 
     def send_assert(path):
         assert path != str(src_video)  # 上传的是压缩版
-        assert path.endswith("compressed.mp4")
+        assert path.endswith("compressed_9001.mp4")  # 产物名带消息 id
 
     _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert)
 
@@ -213,6 +213,106 @@ def test_compress_output_lands_in_source_dir(tmp_path):
         return True
 
     with patch("compress_video.compress_video", fake_compress):
-        out = cv.maybe_compress_video(str(src), temp_files, True, 0, 28)
-    assert out == str(src.parent / "compressed.mp4")
-    assert temp_files == [str(src.parent / "compressed.mp4")]
+        out = cv.maybe_compress_video(str(src), temp_files, True, 0, 28, tag=9001)
+    assert out == str(src.parent / "compressed_9001.mp4")
+    assert temp_files == [str(src.parent / "compressed_9001.mp4")]
+
+
+def _write_smaller(src_path, dst_path, crf):
+    """假 ffmpeg：产出比源文件小的文件，内容写源文件名以便追溯产物属于谁。"""
+    with open(dst_path, "wb") as f:
+        f.write(os.path.basename(src_path).encode())
+    return True
+
+
+def test_compress_output_name_is_unique_per_message(tmp_path):
+    """
+    回归：媒体组两个视频都在 batch_dir，产物名固定成 compressed.mp4 会互相覆盖。
+
+    后压的那个覆盖先压的，两条待上传条目指向同一个文件——A 的位置发出 B 的内容，
+    DB 却记着 A 的 sha256 与文件身份，归档内容与去重身份不符。
+    """
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    outs = []
+    for mid in (41, 42):
+        src = batch / f"{mid}.mp4"
+        src.write_bytes(bytes([mid]) * 2048)
+        temp_files = []
+        with patch("compress_video.compress_video", _write_smaller):
+            outs.append(cv.maybe_compress_video(str(src), temp_files, True, 0, 28, tag=mid))
+
+    assert outs[0] != outs[1], "两个视频的压缩产物不能是同一个文件"
+    assert os.path.exists(outs[0]) and os.path.exists(outs[1])
+    # 产物内容对得上各自的源
+    with open(outs[0], "rb") as f:
+        assert f.read() == b"41.mp4"
+    with open(outs[1], "rb") as f:
+        assert f.read() == b"42.mp4"
+
+
+def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path):
+    """
+    整条路径回归：媒体组两个视频压缩后，send_media_group 必须收到两个不同的文件。
+
+    产物名固定时两条 InputMediaVideo 都指向后压的那一个，视频 A 的位置发出 B 的内容。
+    """
+    from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
+
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
+    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
+    monkeypatch.setattr(listener, "UPLOAD_COOLDOWN_SECONDS", 0)
+
+    # tdl 成功时整组文件都落在同一个 batch_dir —— 冲突的前提
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    sources = {}
+    for mid in (41, 42):
+        src = batch / f"{mid}.mp4"
+        src.write_bytes(bytes([mid]) * 2048)
+        sources[mid] = str(src)
+
+    async def fake_download(messages, dest, **k):
+        return {m.id: sources[m.id] for m in messages}
+
+    captured = {}
+    produced = {}
+
+    def recording_compress(src_path, dst_path, crf):
+        """记录「哪个产物由哪个源转码而来」，断言时用它对账。"""
+        produced[dst_path] = os.path.basename(src_path)
+        return _write_smaller(src_path, dst_path, crf)
+
+    async def fake_send_media_group(chat, input_media):
+        captured["paths"] = [m.media for m in input_media]
+        return [SimpleNamespace(id=900 + i) for i in range(len(input_media))]
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(listener, "tdl_downloader", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(cv, "compress_video", recording_compress)
+    monkeypatch.setattr(listener, "probe_video", lambda p: {"duration": 5, "width": 640, "height": 360})
+    monkeypatch.setattr(listener, "make_thumbnail", lambda *a, **k: None)
+    monkeypatch.setattr(listener, "mark_processed", noop)
+    monkeypatch.setattr(listener, "app", SimpleNamespace(send_media_group=fake_send_media_group))
+    monkeypatch.setattr(listener, "db", SimpleNamespace(
+        find_by_unique_id=lambda x: None,
+        find_by_sha256=lambda x: None,
+        record_file=lambda *a, **k: None,
+        record_message=lambda *a, **k: None,
+    ))
+
+    items = []
+    for mid in (41, 42):
+        msg = _stub_message(mid)
+        items.append(ArchiveItem(media=msg, entry=Entry(message=msg, route=ROUTE_FORWARD)))
+
+    outcomes = asyncio.run(listener.archive_group(items))
+
+    assert all(o.ok for o in outcomes), "两条都该归档成功"
+    paths = captured["paths"]
+    assert paths[0] != paths[1], f"两条上传指向同一个文件：{paths}"
+    # 每条上传的产物必须由它自己的源视频转码而来。产物名冲突时两条会指向同一个
+    # 文件、内容都是后压的那个，这行会抓到
+    assert [produced[p] for p in paths] == ["41.mp4", "42.mp4"]
