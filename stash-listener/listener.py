@@ -429,6 +429,8 @@ async def _prepare_video(
             VIDEO_COMPRESS_ENABLED,
             VIDEO_COMPRESS_MIN_SIZE_MB,
             VIDEO_COMPRESS_CRF,
+            # 媒体组整组文件同在 batch_dir，产物名必须按消息 id 区分，否则互相覆盖
+            tag=message_id,
         )
 
     logger.debug("ffprobe 探测 %s ...", message_id)

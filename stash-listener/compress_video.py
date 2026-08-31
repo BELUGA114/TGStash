@@ -70,18 +70,26 @@ def maybe_compress_video(
     enabled: bool,
     min_size_mb: int,
     crf: int,
+    *,
+    tag: str | int,
 ) -> str:
     """
     体积≥阈值且启用时转码，产物比原始小才用压缩版，否则回退原始。
 
     返回实际用于后续管道的文件路径（压缩版或原始）。压缩版会追加进 temp_files
     统一清理；原始文件由调用方已有追踪，不在这里重复添加。失败/未变小删除半成品。
+
+    tag 必填（用消息 id），用来给产物取唯一名字。不给默认值是故意的：
+    一旦有默认值就会有调用方不传，媒体组互相覆盖的缺陷原样复活。
     """
     if not (enabled and os.path.getsize(local_path) >= min_size_mb * 1024 * 1024):
         return local_path
     # 产物放源文件所在目录（媒体组 tdl 文件在 batch_dir，msg_dir 可能已被清理），
-    # 同目录才能保证 ffmpeg 有可写位置，且 finally 清理时不留下空洞
-    dst_path = os.path.join(os.path.dirname(local_path), "compressed.mp4")
+    # 同目录才能保证 ffmpeg 有可写位置，且 finally 清理时不留下空洞。
+    # 名字必须带 tag：媒体组整组文件都在同一个 batch_dir，固定名会被 ffmpeg -y
+    # 覆盖，两条待上传条目指向同一个文件——A 的位置发出 B 的内容，而 DB 记的是
+    # A 的 sha256 与文件身份，归档内容与去重身份从此不符
+    dst_path = os.path.join(os.path.dirname(local_path), f"compressed_{tag}.mp4")
     logger.info("压缩视频 %s (%s bytes) → CRF %s ...",
                 os.path.basename(local_path), os.path.getsize(local_path), crf)
     ok = compress_video(local_path, dst_path, crf)
