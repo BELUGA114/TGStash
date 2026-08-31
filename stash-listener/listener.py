@@ -19,13 +19,10 @@
 """
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -35,8 +32,15 @@ from urllib.parse import urlparse
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
 from compress_video import maybe_compress_video
 from db import ArchiveDB
+from media_ops import (
+    fix_media_format,
+    get_media,
+    make_thumbnail,
+    probe_video,
+    sha256_of_file,
+    verify_download_size,
+)
 from origin import normalize_origin, origin_from_link
-from PIL import Image
 from pyrogram.client import Client
 from pyrogram.errors import PhotoExtInvalid
 from pyrogram.types import (
@@ -114,10 +118,6 @@ logger = logging.getLogger(__name__)
 # Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-MIN_PLAUSIBLE_SIZE = 1024  # 1KB；网络中断留下的文件通常离谱地小或是 0 字节
-
-MEDIA_ATTRS = ("document", "video", "photo", "audio", "animation", "voice", "video_note")
-
 # 各媒体类型对应的发送方法名 / 媒体组 InputMedia 类
 SEND_METHOD = {
     "document": "send_document",
@@ -135,162 +135,6 @@ INPUT_MEDIA_CLASS = {
     "photo": InputMediaPhoto,
     "audio": InputMediaAudio,
 }
-
-
-def get_media(message: Message):
-    """返回 (媒体类型, 媒体对象)，都没有就返回 (None, None)"""
-    for attr in MEDIA_ATTRS:
-        obj = getattr(message, attr, None)
-        if obj:
-            return attr, obj
-    return None, None
-
-
-def sha256_of_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def verify_download_size(local_path: str, expected_size) -> None:
-    """
-    基线校验：抓最离谱的截断情况，不追求精确匹配。
-    expected_size 拿不到就只做最小体积检查，不当作可疑信号。
-    """
-    actual_size = os.path.getsize(local_path)
-
-    if actual_size < MIN_PLAUSIBLE_SIZE:
-        raise RuntimeError(f"文件小到不合理（{actual_size} 字节），大概率下载中断")
-
-    if expected_size and actual_size != expected_size:
-        raise RuntimeError(
-            f"文件大小对不上（期望 {expected_size}，实际 {actual_size}），疑似下载不完整"
-        )
-
-
-def _fix_media_format(path: str, kind: str | None) -> str:
-    """
-    下载后的文件格式可能与 Telegram 声称的类型不匹配。
-
-    - WebP/PNG/GIF → 转 JPEG，保证 Telegram 内联展示
-    - 无后缀视频/图片 → 补后缀，否则 Telegram 解析不出缩略图和时长
-    """
-    if kind == "video":
-        if not os.path.splitext(path)[1]:
-            # Telegram 的视频实际都是 mp4 容器，补后缀它才解析得出时长和缩略图
-            new_path = path + ".mp4"
-            os.rename(path, new_path)
-            logger.debug("补后缀 video → .mp4")
-            return new_path
-        return path
-
-    if kind != "photo":
-        return path
-    try:
-        with Image.open(path) as img:
-            fmt = img.format  # 'JPEG', 'WEBP', 'PNG', 'GIF', etc.
-            ext = os.path.splitext(path)[1]
-
-            # 非 JPEG 格式统一转为 JPEG，Telegram 才能内联显示
-            if fmt in ("WEBP", "PNG", "GIF"):
-                new_path = path + ".jpg"
-                if img.mode in ("RGBA", "P", "PA"):
-                    img = img.convert("RGB")
-                img.save(new_path, "JPEG", quality=95)
-                os.remove(path)
-                logger.debug("格式转换 %s → JPEG", fmt)
-                return new_path
-
-            # 本身就是 JPEG 但文件没有后缀，补上
-            if fmt == "JPEG" and not ext:
-                new_path = path + ".jpg"
-                os.rename(path, new_path)
-                logger.debug("补后缀 %s", fmt)
-                return new_path
-
-            # 其他图片格式但无后缀，统一加 .jpg
-            if not ext:
-                new_path = path + ".jpg"
-                os.rename(path, new_path)
-                logger.debug("补后缀 %s", fmt or "未知")
-                return new_path
-    except Exception:
-        logger.warning("图片格式修正失败，按原文件继续：%s", path, exc_info=True)
-    return path
-
-
-def probe_video(path: str) -> dict | None:
-    """
-    用 ffprobe 量出真实的 duration/width/height。
-    Telegram 对大文件可能解析不出元数据（duration=0），不能信任源消息自带的值。
-    任何失败都返回 None，调用方看到 None 回退到源消息元数据 → 0，不阻塞归档。
-    """
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", "-show_streams", path],
-            capture_output=True, text=True, check=True, timeout=30,
-        )
-        info = json.loads(result.stdout)
-        stream = next((s for s in info["streams"] if s.get("codec_type") == "video"), None)
-        if stream is None:
-            logger.warning("ffprobe 没解析出视频流：%s", path)
-            return None
-        duration = int(float(info.get("format", {}).get("duration", 0)))
-        return {
-            "duration": duration,
-            "width": stream.get("width", 0),
-            "height": stream.get("height", 0),
-        }
-    except FileNotFoundError:
-        logger.error("ffprobe 可执行文件不存在，检查镜像是否装了 ffmpeg")
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.warning("ffprobe 处理失败（退出码 %s）：%s：%s",
-                       e.returncode, path, (e.stderr or "")[:200])
-        return None
-    except subprocess.TimeoutExpired:
-        logger.warning("ffprobe 超时（30s）：%s", path)
-        return None
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        logger.warning("ffprobe 输出解析失败：%s：%s", path, e)
-        return None
-
-
-def make_thumbnail(video_path: str, thumb_path: str,
-                   timestamp: str = "00:00:01") -> str | None:
-    """
-    用 ffmpeg 抽一帧当缩略图。
-    Telegram 对大文件不保证生成缩略图，Pyrogram send_video 的 thumb 参数
-    是唯一可靠途径——客户端主动提供缩略图，不指望服务端。
-    画质从 5 递减到 31 重试；任何失败返回 None，不阻塞归档。
-    """
-    for q in (5, 10, 20, 31):
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-ss", timestamp, "-i", video_path,
-                 "-vframes", "1",
-                 "-vf", "scale=320:320:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                 "-q:v", str(q), thumb_path],
-                capture_output=True, timeout=20, check=False,
-            )
-        except FileNotFoundError:
-            logger.error("ffmpeg 可执行文件不存在，检查镜像是否装了 ffmpeg")
-            return None
-        except subprocess.TimeoutExpired:
-            logger.warning("ffmpeg 截图超时（20s），放弃：%s", video_path)
-            return None  # 超时卡在解码上，换 -q:v 不会变快，直接跳出循环
-
-        if (result.returncode == 0 and os.path.exists(thumb_path)
-                and os.path.getsize(thumb_path) <= 200 * 1024):
-            return thumb_path
-
-    # 所有画质档位都试过了仍超标（320px 下极少发生），放弃
-    if os.path.exists(thumb_path):
-        os.remove(thumb_path)
-    return None
 
 
 def sender_name(message: Message) -> str:
@@ -644,8 +488,8 @@ async def archive_single(item: ArchiveItem) -> Outcome:
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
-        local_path = _fix_media_format(local_path, kind)
-        temp_files[0] = local_path  # _fix_media_format 可能改了路径（WebP→JPEG），跟踪新文件
+        local_path = fix_media_format(local_path, kind)
+        temp_files[0] = local_path  # fix_media_format 可能改了路径（WebP→JPEG），跟踪新文件
 
         dup = db.find_by_sha256(sha256)
         if dup:
@@ -801,8 +645,8 @@ async def archive_group(items: list[ArchiveItem]) -> list[Outcome]:
         size = os.path.getsize(local_path)
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
-        local_path = _fix_media_format(local_path, kind)
-        temp_files[-1] = local_path  # _fix_media_format 可能改了路径，更新追踪
+        local_path = fix_media_format(local_path, kind)
+        temp_files[-1] = local_path  # fix_media_format 可能改了路径，更新追踪
 
         dup = db.find_by_sha256(sha256)
         if dup:
