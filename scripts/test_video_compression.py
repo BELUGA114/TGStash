@@ -68,7 +68,7 @@ def test_compress_video_exception_is_caught(tmp_path):
 def _stub_message(msg_id: int) -> object:
     """构造极简 Message 桩：带 video 属性即可触发 archive_single 的视频路径。
 
-    get_media 按 MEDIA_ATTRS 顺序取第一个非空属性（listener.MEDIA_ATTRS[1] == "video"），
+    get_media 按 MEDIA_ATTRS 顺序取第一个非空属性（media_ops.MEDIA_ATTRS[1] == "video"），
     只有 video 属性才会让 kind == "video" 走压缩段。
     """
     return SimpleNamespace(
