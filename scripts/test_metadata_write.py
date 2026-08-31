@@ -1,8 +1,7 @@
-"""入口/来源分离的写入路径测试。不连 Telegram，monkeypatch 掉 listener 的 db。"""
+"""入口/来源分离的写入路径测试。不连 Telegram，依赖全部注入进 ArchivePipeline。"""
 
 from types import SimpleNamespace
 
-import listener
 import pytest
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry
 from db import ArchiveDB
@@ -10,10 +9,8 @@ from origin import ORIGIN_LINK
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    real = ArchiveDB(str(tmp_path / "t.db"))
-    monkeypatch.setattr(listener, "db", real)
-    return real
+def db(tmp_path):
+    return ArchiveDB(str(tmp_path / "t.db"))
 
 
 @pytest.fixture
@@ -130,25 +127,23 @@ def _doc_message(message_id, chat, file_unique_id, file_name="report.pdf"):
     )
 
 
-def _run_archive_single(monkeypatch, msg, local_file, *, entry=None, route=ROUTE_FORWARD):
-    """跑一遍 archive_single，下载替换成本地已有文件。上传不该发生（去重命中会提前返回）。"""
+def _run_archive_one(make_pipeline, db, msg, local, *, entry=None, route=ROUTE_FORWARD):
+    """跑一遍 archive_one，下载替换成本地已有文件。上传不该发生（去重命中会提前返回）。"""
     import asyncio
 
-    async def fake_download(messages, *a, **k):
-        return {messages[0].id: str(local_file)}
+    async def fake_download(messages, dest_dir, fallback=None, *, links=None, fallback_paths=None):
+        return {messages[0].id: str(local)}
 
     async def boom(*a, **k):
         raise AssertionError("去重命中不应该上传")
 
-    monkeypatch.setattr(listener.tdl_downloader, "download", fake_download)
-    monkeypatch.setattr(listener.app, "send_document", boom)
-    monkeypatch.setattr(listener, "mark_processed", _noop)
+    pipeline = make_pipeline(
+        db=db,
+        client=SimpleNamespace(send_document=boom),
+        downloader=SimpleNamespace(download=fake_download),
+    )
     item = ArchiveItem(media=msg, entry=Entry(message=entry or msg, route=route))
-    return asyncio.run(listener.archive_single(item))
-
-
-async def _noop(*a, **k):
-    return None
+    return asyncio.run(pipeline.archive_one(item))
 
 
 def _seed_dup(db, local_file):
@@ -165,14 +160,14 @@ def _seed_dup(db, local_file):
     return sha
 
 
-def test_sha256_dup_records_file_identity(db: ArchiveDB, tmp_path, monkeypatch):
+def test_sha256_dup_records_file_identity(db: ArchiveDB, tmp_path, make_pipeline):
     """去重命中也要写文件身份——media 就在手边，漏了这三列就永久缺失"""
     local = tmp_path / "same.pdf"
     local.write_bytes(b"\x00" * 2048)
     _seed_dup(db, local)
 
     msg = _doc_message(700, _chat(-1001234567890, "接收频道"), "FUID_NEW", "新名字.pdf")
-    assert _run_archive_single(monkeypatch, msg, local).ok is True
+    assert _run_archive_one(make_pipeline, db, msg, local).ok is True
 
     row = db.find_by_unique_id("FUID_NEW")
     assert row is not None, "去重命中必须留下指向已归档消息的 files 行"
@@ -183,7 +178,7 @@ def test_sha256_dup_records_file_identity(db: ArchiveDB, tmp_path, monkeypatch):
     assert row["source"] == "manual_forward"
 
 
-def test_sha256_dup_on_link_path_records_link_source(db: ArchiveDB, tmp_path, monkeypatch):
+def test_sha256_dup_on_link_path_records_link_source(db: ArchiveDB, tmp_path, make_pipeline):
     """路径二命中去重时 source 必须是 link，不能硬编码成 manual_forward"""
     local = tmp_path / "same.pdf"
     local.write_bytes(b"\x01" * 2048)
@@ -191,8 +186,8 @@ def test_sha256_dup_on_link_path_records_link_source(db: ArchiveDB, tmp_path, mo
 
     entry = _msg(800, _chat(-1001234567890, "接收频道"))
     source_msg = _doc_message(55, _chat(-1009999999999, "私有频道"), "FUID_LINK")
-    outcome = _run_archive_single(monkeypatch, source_msg, local,
-                                 entry=entry, route=ROUTE_LINK)
+    outcome = _run_archive_one(make_pipeline, db, source_msg, local,
+                               entry=entry, route=ROUTE_LINK)
     assert outcome.ok is True
 
     row = db.find_by_unique_id("FUID_LINK")

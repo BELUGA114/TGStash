@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import compress_video as cv
-import listener
 import media_ops
 
 
@@ -84,13 +83,14 @@ def _stub_message(msg_id: int) -> object:
     )
 
 
-def _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert=None):
-    """跑一遍 archive_single 视频路径，fake 下载返回 src_video，mock 压缩与上传。"""
+def _run_single_archive(msg, src_video, fake_compress, monkeypatch, make_pipeline,
+                        send_assert=None, *, compress_enabled=True, min_size_mb=0):
+    """跑一遍 archive_one 视频路径，fake 下载返回 src_video，mock 压缩与上传。"""
     from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
 
-    sent = SimpleNamespace(id=7777)  # archive_single 需要 sent.id 落库
+    sent = SimpleNamespace(id=7777)  # archive_one 需要 sent.id 落库
 
-    async def fake_download(messages, *a, **k):
+    async def fake_download(messages, dest_dir, fallback=None, *, links=None, fallback_paths=None):
         return {messages[0].id: str(src_video)}
 
     async def fake_send_video(chat, path, **k):
@@ -98,27 +98,28 @@ def _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert=
             send_assert(path)
         return sent
 
-    async def noop_mark(*a, **k):
-        return None
-
-    monkeypatch.setattr(listener.tdl_downloader, "download", fake_download)
     monkeypatch.setattr(cv, "compress_video", fake_compress)
-    monkeypatch.setattr(listener.app, "send_video", fake_send_video)
-    monkeypatch.setattr(listener, "mark_processed", noop_mark)
-    monkeypatch.setattr(listener.db, "find_by_sha256", lambda *a, **k: None)
-    monkeypatch.setattr(listener.db, "find_by_unique_id", lambda *a, **k: None)
-    monkeypatch.setattr(listener.db, "record_file", lambda *a, **k: None)
-    monkeypatch.setattr(listener.db, "record_message", lambda *a, **k: None)
+
+    pipeline = make_pipeline(
+        client=SimpleNamespace(send_video=fake_send_video),
+        db=SimpleNamespace(
+            find_by_sha256=lambda *a, **k: None,
+            find_by_unique_id=lambda *a, **k: None,
+            record_file=lambda *a, **k: None,
+            record_message=lambda *a, **k: None,
+        ),
+        downloader=SimpleNamespace(download=fake_download),
+        video_compress_enabled=compress_enabled,
+        video_compress_min_size_mb=min_size_mb,
+    )
 
     item = ArchiveItem(media=msg, entry=Entry(message=msg, route=ROUTE_FORWARD))
-    assert asyncio.run(listener.archive_single(item)).ok is True
+    assert asyncio.run(pipeline.archive_one(item)).ok is True
 
 
-def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_path):
+def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_path,
+                                                             make_pipeline):
     # 开启压缩 + 阈值 0（任何视频都触发）
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
-
     msg = _stub_message(9001)
     calls = {"compress": 0}
 
@@ -131,17 +132,14 @@ def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_p
         return False  # 压缩失败 → 回退原始
 
     _run_single_archive(
-        msg, src_video, fake_compress, monkeypatch,
+        msg, src_video, fake_compress, monkeypatch, make_pipeline,
         send_assert=lambda path: path == str(src_video),  # 回退后上传原始
     )
     assert calls["compress"] == 1
 
 
-def test_single_video_compress_smaller_uses_compressed(monkeypatch, tmp_path):
+def test_single_video_compress_smaller_uses_compressed(monkeypatch, tmp_path, make_pipeline):
     # 压缩成功且更小 → 用压缩版上传
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
-
     msg = _stub_message(9001)
     src_video = tmp_path / "src.mp4"
     src_video.write_bytes(b"\x00" * 4096)
@@ -156,14 +154,11 @@ def test_single_video_compress_smaller_uses_compressed(monkeypatch, tmp_path):
         assert path != str(src_video)  # 上传的是压缩版
         assert path.endswith("compressed_9001.mp4")  # 产物名带消息 id
 
-    _run_single_archive(msg, src_video, fake_compress, monkeypatch, send_assert)
+    _run_single_archive(msg, src_video, fake_compress, monkeypatch, make_pipeline, send_assert)
 
 
-def test_single_video_compress_larger_falls_back(monkeypatch, tmp_path):
+def test_single_video_compress_larger_falls_back(monkeypatch, tmp_path, make_pipeline):
     # 压缩成功但产物≥原始 → 回退原始
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
-
     msg = _stub_message(9001)
     src_video = tmp_path / "src.mp4"
     src_video.write_bytes(b"\x00" * 2048)
@@ -174,15 +169,13 @@ def test_single_video_compress_larger_falls_back(monkeypatch, tmp_path):
         return True
 
     _run_single_archive(
-        msg, src_video, fake_compress, monkeypatch,
+        msg, src_video, fake_compress, monkeypatch, make_pipeline,
         send_assert=lambda path: path == str(src_video),
     )
 
 
-def test_compress_video_not_called_below_threshold(monkeypatch, tmp_path):
+def test_compress_video_not_called_below_threshold(monkeypatch, tmp_path, make_pipeline):
     # 关闭压缩 → 不调用 compress_video，直接走原管道
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", False)
-
     msg = _stub_message(9001)
     src_video = tmp_path / "src.mp4"
     src_video.write_bytes(b"\x00" * 2048)
@@ -193,8 +186,9 @@ def test_compress_video_not_called_below_threshold(monkeypatch, tmp_path):
         return False
 
     _run_single_archive(
-        msg, src_video, fake_compress, monkeypatch,
+        msg, src_video, fake_compress, monkeypatch, make_pipeline,
         send_assert=lambda path: path == str(src_video),
+        compress_enabled=False,
     )
     assert calls["compress"] == 0
 
@@ -252,17 +246,13 @@ def test_compress_output_name_is_unique_per_message(tmp_path):
         assert f.read() == b"42.mp4"
 
 
-def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path):
+def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path, make_pipeline):
     """
     整条路径回归：媒体组两个视频压缩后，send_media_group 必须收到两个不同的文件。
 
     产物名固定时两条 InputMediaVideo 都指向后压的那一个，视频 A 的位置发出 B 的内容。
     """
     from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
-
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_ENABLED", True)
-    monkeypatch.setattr(listener, "VIDEO_COMPRESS_MIN_SIZE_MB", 0)
-    monkeypatch.setattr(listener, "UPLOAD_COOLDOWN_SECONDS", 0)
 
     # tdl 成功时整组文件都落在同一个 batch_dir —— 冲突的前提
     batch = tmp_path / "batch"
@@ -291,25 +281,29 @@ def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path):
     async def noop(*a, **k):
         return None
 
-    monkeypatch.setattr(listener, "tdl_downloader", SimpleNamespace(download=fake_download))
     monkeypatch.setattr(cv, "compress_video", recording_compress)
     monkeypatch.setattr(media_ops, "probe_video", lambda p: {"duration": 5, "width": 640, "height": 360})
     monkeypatch.setattr(media_ops, "make_thumbnail", lambda *a, **k: None)
-    monkeypatch.setattr(listener, "mark_processed", noop)
-    monkeypatch.setattr(listener, "app", SimpleNamespace(send_media_group=fake_send_media_group))
-    monkeypatch.setattr(listener, "db", SimpleNamespace(
-        find_by_unique_id=lambda x: None,
-        find_by_sha256=lambda x: None,
-        record_file=lambda *a, **k: None,
-        record_message=lambda *a, **k: None,
-    ))
+
+    pipeline = make_pipeline(
+        client=SimpleNamespace(send_media_group=fake_send_media_group),
+        db=SimpleNamespace(
+            find_by_unique_id=lambda x: None,
+            find_by_sha256=lambda x: None,
+            record_file=lambda *a, **k: None,
+            record_message=lambda *a, **k: None,
+        ),
+        downloader=SimpleNamespace(download=fake_download),
+        video_compress_enabled=True,
+        video_compress_min_size_mb=0,
+    )
 
     items = []
     for mid in (41, 42):
         msg = _stub_message(mid)
         items.append(ArchiveItem(media=msg, entry=Entry(message=msg, route=ROUTE_FORWARD)))
 
-    outcomes = asyncio.run(listener.archive_group(items))
+    outcomes = asyncio.run(pipeline.archive_batch(items))
 
     assert all(o.ok for o in outcomes), "两条都该归档成功"
     paths = captured["paths"]
