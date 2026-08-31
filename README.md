@@ -134,7 +134,7 @@ docker compose run --rm stash-listener python scripts/backfill_metadata.py --dry
 
 ## 本地开发
 
-测试使用 pytest，覆盖 `db.py`（schema/迁移/checkpoint/去重/FTS5/并发场景）、`origin.py`（forward_origin 五变体归一化）、入口/来源写入路径、回填决策逻辑，以及 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
+测试使用 pytest，覆盖 `db.py`（schema/迁移/checkpoint/去重/FTS5/并发场景）、`origin.py`（forward_origin 五变体归一化）、归档管道 `pipeline.py`（注入假 client/db/downloader，覆盖媒体组拆组上传、`PhotoExtInvalid` 回退整组 document、视频元数据三层回退、临时产物命名）、`media_ops.py`（格式修正与 ffprobe/ffmpeg 失败回退）、入口/来源写入路径、失败重试与 checkpoint 推进、回填决策逻辑，以及 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -144,7 +144,7 @@ python -m pytest
 ## 目录结构
 
 ```
-├── stash-listener/    # 主服务（listener/tdl_downloader/compress_video/origin/login/search/db）
+├── stash-listener/    # 主服务（listener/pipeline/media_ops/archive_entry/tdl_downloader/compress_video/origin/login/search/db）
 ├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata）与测试
 ├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
 ├── .env.example       # 配置模板

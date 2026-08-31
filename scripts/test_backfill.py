@@ -18,7 +18,7 @@ def _media(file_unique_id, file_name="cat.mp4", mime_type="video/mp4"):
 
 
 def _msg(message_id, file_unique_id, forward_origin=None):
-    """带 video 媒体的接收频道消息 stub。get_media 按 MEDIA_ATTRS 顺序取属性。"""
+    """带 video 媒体的接收频道消息 stub。get_media 按 media_ops.MEDIA_ATTRS 顺序取属性。"""
     return SimpleNamespace(
         id=message_id, forward_origin=forward_origin,
         document=None, video=_media(file_unique_id), photo=None,

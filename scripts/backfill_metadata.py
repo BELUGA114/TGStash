@@ -25,24 +25,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "stash-listener"))
 
 from db import ArchiveDB
+from media_ops import get_media
 from origin import normalize_origin
 
 # 每批拉取的消息数与批间等待秒数。账号安全优先，与主服务的保守取向一致
 BATCH_SIZE = 100
 BATCH_DELAY_SECONDS = 2
 
-MEDIA_ATTRS = ("document", "video", "photo", "audio", "animation", "voice", "video_note")
-
 logger = logging.getLogger(__name__)
-
-
-def get_media(message):
-    """返回 (媒体类型, 媒体对象)，都没有就返回 (None, None)。与 listener 同逻辑。"""
-    for attr in MEDIA_ATTRS:
-        obj = getattr(message, attr, None)
-        if obj:
-            return attr, obj
-    return None, None
 
 
 def plan_updates(rows, fetched):
