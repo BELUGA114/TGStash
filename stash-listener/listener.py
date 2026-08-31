@@ -38,10 +38,6 @@ from pyrogram.client import Client
 from pyrogram.types import Message, ReplyParameters
 from tdl_downloader import TDLDownloader
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-RECEIVE_CHAT = int(os.environ["RECEIVE_CHAT_ID"])
-ARCHIVE_CHAT = int(os.environ["ARCHIVE_CHAT_ID"])
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 # 每轮最多处理的消息数。宁可慢不可冒险——账号比速度重要
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
@@ -60,45 +56,25 @@ VIDEO_COMPRESS_ENABLED = os.environ.get("VIDEO_COMPRESS_ENABLED", "false").lower
 VIDEO_COMPRESS_MIN_SIZE_MB = int(os.environ.get("VIDEO_COMPRESS_MIN_SIZE_MB", "100"))
 VIDEO_COMPRESS_CRF = int(os.environ.get("VIDEO_COMPRESS_CRF", "28"))
 
-# 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖，避免模块导入期就往根目录建目录
+# 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 SESSION_DIR = os.path.join(DATA_DIR, "session")
 DB_PATH = os.path.join(DATA_DIR, "db", "archive.db")
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "tmp", "listener")
 
-os.makedirs(SESSION_DIR, exist_ok=True)
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-db = ArchiveDB(DB_PATH)
-
-if HTTP_PROXY:
-    u = urlparse(HTTP_PROXY)
-    app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
-                 max_concurrent_transmissions=2,
-                 proxy={"scheme": u.scheme, "hostname": u.hostname, "port": u.port})
-else:
-    app = Client("listener", api_id=API_ID, api_hash=API_HASH, workdir=SESSION_DIR,
-                 max_concurrent_transmissions=2)
-tdl_downloader = TDLDownloader(
-    namespace=TDL_NAMESPACE,
-    threads=TDL_THREADS,
-    limit=TDL_LIMIT,
-    delay=TDL_DELAY_SECONDS,
-    timeout=TDL_TIMEOUT_SECONDS,
-    proxy=HTTP_PROXY,
-)
-
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
-# Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+def _configure_logging() -> None:
+    """日志配置属于进程启动，不属于 import。"""
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
+    logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -117,24 +93,59 @@ class ListenerContext:
     receive_chat: int
 
 
+def _build_client(api_id: int, api_hash: str) -> Client:
+    """构造 Pyrogram Client。单独拆出来是为了测试能替掉它（它会碰 workdir）。"""
+    kwargs = {"api_id": api_id, "api_hash": api_hash, "workdir": SESSION_DIR,
+              "max_concurrent_transmissions": 2}
+    if HTTP_PROXY:
+        u = urlparse(HTTP_PROXY)
+        kwargs["proxy"] = {"scheme": u.scheme, "hostname": u.hostname, "port": u.port}
+    return Client("listener", **kwargs)
+
+
 def _build_context() -> ListenerContext:
-    """组装运行时依赖。"""
+    """
+    组装运行时依赖。必填环境变量在这里读、目录在这里建、库在这里开、
+    client 在这里构造 —— import listener 不该有任何副作用，否则「测一条归档」
+    先得凑齐四个环境变量和一个可写的数据目录。
+    """
+    # chat_id 必须 int：字符串会触发 Pyrogram 的解析路径 bug
+    api_id = int(os.environ["TG_API_ID"])
+    api_hash = os.environ["TG_API_HASH"]
+    receive_chat = int(os.environ["RECEIVE_CHAT_ID"])
+    archive_chat = int(os.environ["ARCHIVE_CHAT_ID"])
+
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+    archive_db = ArchiveDB(DB_PATH)
+    client = _build_client(api_id, api_hash)
+    downloader = TDLDownloader(
+        namespace=TDL_NAMESPACE,
+        threads=TDL_THREADS,
+        limit=TDL_LIMIT,
+        delay=TDL_DELAY_SECONDS,
+        timeout=TDL_TIMEOUT_SECONDS,
+        proxy=HTTP_PROXY,
+    )
     pipeline = ArchivePipeline(
-        client=app,
-        db=db,
-        downloader=tdl_downloader,
-        mark_processed=functools.partial(mark_processed, app),
+        client=client,
+        db=archive_db,
+        downloader=downloader,
+        mark_processed=functools.partial(mark_processed, client),
         config=PipelineConfig(
             upload_cooldown_seconds=UPLOAD_COOLDOWN_SECONDS,
             video_compress_enabled=VIDEO_COMPRESS_ENABLED,
             video_compress_min_size_mb=VIDEO_COMPRESS_MIN_SIZE_MB,
             video_compress_crf=VIDEO_COMPRESS_CRF,
         ),
-        archive_chat=ARCHIVE_CHAT,
-        receive_chat=RECEIVE_CHAT,
+        archive_chat=archive_chat,
+        receive_chat=receive_chat,
         download_dir=DOWNLOAD_DIR,
     )
-    return ListenerContext(client=app, db=db, pipeline=pipeline, receive_chat=RECEIVE_CHAT)
+    return ListenerContext(client=client, db=archive_db, pipeline=pipeline,
+                           receive_chat=receive_chat)
 
 
 def parse_message_link(link: str) -> tuple[str, int]:
@@ -440,6 +451,7 @@ async def scan_once(ctx: ListenerContext):
 
 
 async def main():
+    _configure_logging()
     # 启动预检：ffmpeg/ffprobe 缺失时直接退出，让 Docker 重启
     if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
         logger.error("ffmpeg/ffprobe 未安装，退出")
