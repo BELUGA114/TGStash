@@ -9,7 +9,9 @@ def make_pipeline(tmp_path):
     """
     按需组装 ArchivePipeline：只传要断言的依赖，其余给不会被调用的空桩。
 
-    冷却默认 0：测试不该真的睡 5 秒。要验证冷却本身就显式传值。
+    PipelineConfig 构造时必填的三个值（冷却、压缩阈值、CRF）在这里给测试默认值；
+    生产的真相只有一处：listener.py 读环境变量那一段。冷却默认 0：测试不该真的睡 5 秒，
+    要验证冷却本身就显式传值。
     """
     from pipeline import ArchivePipeline, PipelineConfig
 

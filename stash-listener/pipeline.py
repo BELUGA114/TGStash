@@ -19,7 +19,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import media_ops
@@ -66,8 +66,10 @@ class PipelineConfig:
     """
     今天散在 listener 模块级的那些常量。测试里想关掉冷却就传 0。
 
-    风控三件套（冷却、压缩阈值、CRF）没有默认值：生产由 listener 从环境变量读出后
-    显式传入，那里才是唯一的真相。测试的默认值由 conftest 的 make_pipeline 提供。
+    构造时必填的三个值（冷却、压缩阈值、CRF）没有默认值：生产由 listener 从环境变量
+    读出后显式传入，那里才是唯一的真相。测试的默认值由 conftest 的 make_pipeline 提供。
+    （别把这三个叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
+    UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS，后两个压缩参数只是调参。）
     """
 
     upload_cooldown_seconds: int
@@ -97,8 +99,10 @@ class _PendingUpload:
     sha256: str
     size: int
     local_path: str
+    # 缩略图真的可能没有（make_thumbnail 失败返回 None），这个 None 是诚实的；
+    # meta 则恒为 dict：非视频是空 dict，视频由 _prepare_video 填满
     thumb_path: str | None = None
-    meta: dict | None = None
+    meta: dict = field(default_factory=dict)
 
 
 class _Planned(NamedTuple):
@@ -348,17 +352,21 @@ class ArchivePipeline:
         caption: str,
         *,
         thumb_path: str | None = None,
-        meta: dict | None = None,
+        meta: dict,
     ) -> Message | None:
-        """上传单个媒体；照片格式不被 Telegram 接受时回退为 document。"""
+        """
+        上传单个媒体；照片格式不被 Telegram 接受时回退为 document。
+
+        meta 必填：唯一的调用方 _upload_one 恒从 _PendingUpload.meta 取，
+        那个字段恒为 dict（非视频是空 dict）。
+        """
         if kind == "video":
-            video_meta = meta or {}
             sent = await self._client.send_video(
                 self._archive_chat,
                 local_path,
-                duration=video_meta["duration"],
-                width=video_meta["width"],
-                height=video_meta["height"],
+                duration=meta["duration"],
+                width=meta["width"],
+                height=meta["height"],
                 thumb=thumb_path,  # type: ignore[arg-type]
                 caption=caption,
             )
@@ -378,9 +386,10 @@ class ArchivePipeline:
         """
         下载产物 → 待上传条目。两条路径共用，唯一的一份实现。
 
-        temp_files 由调用方持有：进来时最后一项必须是本条的下载产物，本方法只替换它
-        （格式修正可能改了路径）或往后追加（压缩产物、缩略图）。这样单条那边原先的
-        temp_files[0] 与整组那边的 temp_files[-1] 统一成「刚 append 的就是本条」。
+        temp_files 由调用方持有，且下载产物已由调用方登记：本方法只往后追加自己造出来的
+        新文件（格式修正后的新路径、压缩产物、缩略图），从不替换已有条目。因此这里不再有
+        「最后一项必须是本条的下载产物」那个契约 —— 它曾经要求替换动作排在 _prepare_video
+        之前（之后 temp_files[-1] 已经是缩略图了）。
 
         不产出 Outcome.failure("download")：下载归调用方 —— 单条与整组的批次形状不同。
         视频处理留在这里：产物命名依赖 local_path 所在目录（见 CLAUDE.md「临时产物命名」），
@@ -407,8 +416,13 @@ class ArchivePipeline:
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
-        local_path = media_ops.fix_media_format(local_path, kind)
-        temp_files[-1] = local_path  # 可能改了路径，跟踪新文件
+        fixed_path = media_ops.fix_media_format(local_path, kind)
+        if fixed_path != local_path:
+            # 追加而不是替换：fix_media_format 换路径时已经把原文件删掉/改名了，
+            # 旧条目留在列表里只会在 _cleanup_temp_files 的 exists 检查上落空。
+            # 这样就不必维持「temp_files[-1] 必须是本条的下载产物」那个契约
+            temp_files.append(fixed_path)
+        local_path = fixed_path
 
         dup = self._db.find_by_sha256(sha256)
         if dup:
@@ -540,6 +554,9 @@ class ArchivePipeline:
             planned = self._plan(items)
             outcomes.extend(Outcome.success(it) for it in planned.duplicates)
             paths = await self._download(planned.tasks)
+            # 下载产物一落盘就登记：_process_each 中途抛异常时，还没轮到的那几条
+            # 也得被 finally 清掉（否则永久留在 batch_dir）
+            temp_files.extend(paths.values())
             processed = await self._process_each(planned.tasks, paths, temp_files)
             outcomes.extend(processed.outcomes)
             duplicates = planned.duplicates + processed.duplicates
@@ -636,7 +653,9 @@ class ArchivePipeline:
         """阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）。
 
         临时文件登记在调用方的 temp_files 里：本方法抛异常时 archive_batch 的
-        finally 仍然要清得掉它们。
+        finally 仍然要清得掉它们。下载产物由调用方在 _download 返回后一次登记完
+        （本方法中途抛异常时，还没轮到的条目也已经落盘了）；本方法只让 _prepare_item
+        往后追加它自己造出来的文件。
         """
         pending: list[_PendingUpload] = []
         duplicates: list[ArchiveItem] = []
@@ -659,7 +678,6 @@ class ArchivePipeline:
                 except OSError:
                     pass
 
-            temp_files.append(local_path)
             result = await self._prepare_item(task, local_path, temp_files)
             if result.outcome is not None:
                 outcomes.append(result.outcome)
@@ -701,13 +719,12 @@ class ArchivePipeline:
         for i, upload in enumerate(pending):
             caption = group_caption if i == 0 else ""
             if upload.kind == "video":
-                meta = upload.meta or {}
                 input_media.append(InputMediaVideo(
                     upload.local_path,
                     caption=caption,
-                    duration=meta["duration"],
-                    width=meta["width"],
-                    height=meta["height"],
+                    duration=upload.meta["duration"],
+                    width=upload.meta["width"],
+                    height=upload.meta["height"],
                     thumb=upload.thumb_path,
                 ))
             else:

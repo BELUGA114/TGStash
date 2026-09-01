@@ -911,6 +911,30 @@ class TestGroupExceptionBoundary:
         assert [(o.item.media.id, o.ok, o.stage) for o in outcomes] == [(41, False, "process")]
         assert not os.path.exists(src), "异常路径没清临时文件"
 
+    def test_process_exception_cleans_files_not_yet_processed(self, tmp_path, make_pipeline,
+                                                             monkeypatch):
+        """
+        第一条就抛异常时，后面几条已经落盘的下载产物同样要被清掉。
+
+        修复前 temp_files 是在 _process_each 的循环体内逐条登记的，还没轮到的
+        条目永久留在 batch_dir。
+        """
+        import media_ops
+
+        def boom(path):
+            raise OSError("磁盘读挂了")
+
+        monkeypatch.setattr(media_ops, "sha256_of_file", boom)
+        paths = {mid: local_file(tmp_path, f"b/{mid}.pdf") for mid in (41, 42, 43)}
+        pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                                 downloader=fake_downloader(paths))
+
+        outcomes = asyncio.run(pipeline.archive_batch(
+            [item_of(msg_stub(mid, group="g1")) for mid in (41, 42, 43)]))
+
+        assert [(o.item.media.id, o.ok, o.stage) for o in outcomes] == [(41, False, "process")]
+        assert [p for p in paths.values() if os.path.exists(p)] == [], "有下载产物没被清掉"
+
 
 def test_single_process_exception_becomes_failure_and_cleans_up(tmp_path, make_pipeline,
                                                                monkeypatch):
@@ -953,11 +977,14 @@ def test_single_plan_exception_becomes_failure(make_pipeline):
     assert outcome.ok is False and outcome.stage == "process"
 
 
-def test_pipeline_config_requires_risk_control_values():
+def test_pipeline_config_requires_explicit_values():
     """
-    风控三件套没有默认值：真相只有 listener 从环境变量读的那一份。
+    构造时必填的三个值（冷却、压缩阈值、CRF）没有默认值：真相只有 listener
+    从环境变量读的那一份，测试默认值在 conftest.make_pipeline。
 
-    CLAUDE.md 点名 UPLOAD_COOLDOWN_SECONDS=5 是风控值，写两遍就会有人改错一边。
+    别管它们叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
+    UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS。冷却确实是限流值，
+    写两遍就会有人改错一边；另两个压缩参数只是调参。
     """
     import pytest
     from pipeline import PipelineConfig
