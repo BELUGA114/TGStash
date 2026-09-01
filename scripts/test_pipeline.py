@@ -236,8 +236,8 @@ class TestGroupUploadShapes:
         assert client.calls[1][2]["classes"] == ["InputMediaDocument", "InputMediaDocument"]
         assert client.calls[1][2]["captions"] == ["猫", ""]
 
-    def test_non_groupable_kind_goes_through_archive_one(self, tmp_path, make_pipeline):
-        """语音不支持编组 → 退回单条 send_voice（这条路径今天没测过）"""
+    def test_non_groupable_kind_uploads_singly(self, tmp_path, make_pipeline):
+        """语音不支持编组 → 逐条 send_voice（不进 send_media_group）"""
         client = FakeClient()
         src = local_file(tmp_path, "b/41.ogg")
         pipeline = make_pipeline(client=client, db=fake_db(),
@@ -248,6 +248,47 @@ class TestGroupUploadShapes:
 
         assert [o.ok for o in outcomes] == [True]
         assert [c[0] for c in client.calls] == ["send_voice"]
+
+    def test_non_groupable_kind_is_downloaded_once(self, tmp_path, make_pipeline):
+        """
+        不可编组条目不再回调 archive_one，因此只下载一次。
+
+        修复前：_download 拉过一次，archive_one 又从零来一遍（重新下载、重新算
+        SHA-256、重新查两遍去重）。
+        """
+        client = FakeClient()
+        downloader = fake_downloader({41: local_file(tmp_path, "b/41.ogg")})
+        pipeline = make_pipeline(client=client, db=fake_db(), downloader=downloader)
+
+        outcomes = asyncio.run(
+            pipeline.archive_batch([item_of(msg_stub(41, "voice", group="g1"))]))
+
+        assert [o.ok for o in outcomes] == [True]
+        assert [c[0] for c in client.calls] == ["send_voice"]
+        assert downloader.seen["calls"] == 1, "不可编组条目被重新下载了"
+
+    def test_group_with_voice_uploads_group_then_single_and_marks_both(self, tmp_path,
+                                                                      make_pipeline):
+        """可编组的走 send_media_group，voice 紧跟其后单发；两条都要打上标记"""
+        marks = []
+
+        async def mark(message, duplicate):
+            marks.append((message.id, duplicate))
+
+        client = FakeClient()
+        pipeline = make_pipeline(
+            client=client, db=fake_db(), mark=mark,
+            downloader=fake_downloader({41: local_file(tmp_path, "b/41.pdf"),
+                                        42: local_file(tmp_path, "b/42.ogg")}))
+        items = [item_of(msg_stub(41, group="g1")),
+                 item_of(msg_stub(42, "voice", group="g1"))]
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        assert [(o.item.media.id, o.ok) for o in outcomes] == [(41, True), (42, True)]
+        assert [c[0] for c in client.calls] == ["send_media_group", "send_voice"]
+        # voice 上传成功后就地标记，可编组那条随全组在最后统一标记（与今天的顺序一致）
+        assert marks == [(42, False), (41, False)]
 
 
 class TestVideoMetadataFallback:

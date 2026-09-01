@@ -117,9 +117,9 @@ class _ItemResult(NamedTuple):
 
 class _Processed(NamedTuple):
     pending: list[_PendingUpload]
-    duplicates: list[ArchiveItem]   # SHA-256 命中
-    singles: list[ArchiveItem]      # 不支持编组的类型，退回单条处理
-    outcomes: list[Outcome]         # 下载/校验失败与去重命中的结论
+    duplicates: list[ArchiveItem]     # SHA-256 命中
+    singles: list[_PendingUpload]     # 不支持编组的类型，逐条单发
+    outcomes: list[Outcome]           # 下载/校验失败与去重命中的结论
 
 
 class _Uploaded(NamedTuple):
@@ -551,8 +551,17 @@ class ArchivePipeline:
                     # 不再处理不可编组的条目、不打标记：那些条目本轮根本没被尝试
                     return outcomes
 
-            for it in processed.singles:
-                outcomes.append(await self.archive_one(it))
+            for upload in processed.singles:
+                single_msg = upload.item.media
+                # 不可编组的条目各带自己的文字：它们本来就不在一个媒体组的 caption 里
+                caption = single_msg.caption or single_msg.text or ""
+                outcome = await self._upload_one(upload, caption)
+                outcomes.append(outcome)
+                if outcome.ok:
+                    # 就地标记 + 就地冷却，与原先回调 archive_one 时的顺序一致
+                    if mark:
+                        await self._mark_processed(single_msg, duplicate=False)
+                    await asyncio.sleep(self._config.upload_cooldown_seconds)
 
             if mark:
                 for pending in processed.pending:
@@ -631,7 +640,7 @@ class ArchivePipeline:
         """
         pending: list[_PendingUpload] = []
         duplicates: list[ArchiveItem] = []
-        singles: list[ArchiveItem] = []
+        singles: list[_PendingUpload] = []
         outcomes: list[Outcome] = []
 
         for task in tasks:
@@ -662,8 +671,8 @@ class ArchivePipeline:
             if result.groupable:
                 pending.append(result.pending)
             else:
-                # 语音/视频留言等不支持编组的类型，逐条单发
-                singles.append(it)
+                # 语音/视频留言等不支持编组的类型，逐条单发（不再重新下载一遍）
+                singles.append(result.pending)
 
         return _Processed(pending=pending, duplicates=duplicates, singles=singles,
                           outcomes=outcomes)
