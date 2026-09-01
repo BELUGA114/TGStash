@@ -95,6 +95,14 @@ class FakeClient:
         self.calls.append(("send_voice", path, {"caption": caption}))
         return self._sent()
 
+    async def send_video_note(self, chat, path, duration=None, length=None, thumb=None):
+        # 签名照抄真实的 Client.send_video_note：它是唯一不接受 caption 的
+        # send_* 方法（Telegram 的圆形视频没有 caption 字段）。桩必须跟着少这个
+        # 参数，否则「多传一个不存在的关键字」这类缺陷永远测不出来
+        self.calls.append(("send_video_note", path,
+                           {"duration": duration, "length": length, "thumb": thumb}))
+        return self._sent()
+
     async def send_media_group(self, chat, input_media):
         self.calls.append(("send_media_group", [m.media for m in input_media], {
             "captions": [m.caption for m in input_media],
@@ -1060,3 +1068,59 @@ def test_pipeline_config_requires_explicit_values():
 
     with pytest.raises(TypeError):
         PipelineConfig()
+
+
+class TestVideoNoteUpload:
+    """
+    video_note（圆形视频）的上传形状：Telegram 的圆形视频在协议层就没有 caption 字段。
+
+    缺陷现场：_send_media 对所有非 video 的 kind 一律传 caption=，而
+    send_video_note 是唯一不接受它的 → 任何 video_note 归档抛 TypeError，
+    被吞成 upload 失败、重试 3 轮后跳过并告警。假 client 接受任意关键字，
+    所以 250 个行为用例全绿也照样漏 —— 于是有了下面这条签名对账。
+    """
+
+    def test_send_method_kwargs_match_pyrogram_signatures(self):
+        """
+        SEND_METHOD 里每个方法都必须真的接受我们传的关键字。
+
+        不连网、不发消息，纯拿真实签名对账，顺带盯住升级 Pyrogram 时的签名漂移。
+        """
+        import inspect
+
+        from pipeline import CAPTIONLESS_KINDS, SEND_METHOD
+        from pyrogram.client import Client
+
+        for kind, method_name in SEND_METHOD.items():
+            params = inspect.signature(getattr(Client, method_name)).parameters
+            assert ("caption" in params) is (kind not in CAPTIONLESS_KINDS), (
+                f"{method_name} 的 caption 支持与 CAPTIONLESS_KINDS 不符")
+
+    def test_video_note_uploads_without_caption(self, tmp_path, make_pipeline):
+        """归档 video_note 不该炸，也不该给 send_video_note 传 caption"""
+        client = FakeClient()
+        pipeline = make_pipeline(client=client, db=fake_db(),
+                                 downloader=fake_downloader(
+                                     {41: local_file(tmp_path, "s/41.mp4")}))
+
+        outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41, "video_note"))))
+
+        assert outcome.ok is True, outcome
+        assert [c[0] for c in client.calls] == ["send_video_note"]
+        assert "caption" not in client.calls[0][2]
+
+    def test_video_note_caption_survives_in_db(self, tmp_path, make_pipeline):
+        """
+        文字发不出去，但必须留在库里。
+
+        messages.caption 进 FTS，搜索照样找得到；丢的只是备份频道那条消息上的可见文字。
+        """
+        db = fake_db()
+        pipeline = make_pipeline(client=FakeClient(), db=db,
+                                 downloader=fake_downloader(
+                                     {41: local_file(tmp_path, "s/41.mp4")}))
+        item = item_of(msg_stub(41, "video_note", caption="转发时带的文字"))
+
+        assert asyncio.run(pipeline.archive_one(item)).ok
+        assert [kw["caption"] for tag, kw in db.writes
+                if tag == "message"] == ["转发时带的文字"]
