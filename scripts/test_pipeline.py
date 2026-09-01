@@ -511,6 +511,36 @@ class TestSingleVsGroupDifferences:
         assert group_client.calls[0][1] == [group_src + ".jpg"]
         assert not os.path.exists(group_src + ".jpg")
 
+    def test_format_fix_tracks_each_item_in_a_multi_item_group(self, tmp_path, make_pipeline,
+                                                              monkeypatch):
+        """
+        整组里每一条的格式修正产物都要各自被追踪。
+
+        新契约是「往 temp_files 追加新路径」而不是「替换最后一项」：替换在 ≥2 条的组里
+        会把前一条的追踪抹掉（只有一条时 [-1] 恰好是它自己，看不出问题）。
+        """
+        import media_ops
+
+        def fake_fix(path, kind):
+            new_path = path + ".jpg"
+            os.rename(path, new_path)
+            return new_path
+
+        monkeypatch.setattr(media_ops, "fix_media_format", fake_fix)
+
+        srcs = {mid: local_file(tmp_path, f"b/{mid}.bin") for mid in (41, 42)}
+        client = FakeClient()
+        pipeline = make_pipeline(client=client, db=fake_db(),
+                                 downloader=fake_downloader(srcs))
+
+        outcomes = asyncio.run(pipeline.archive_batch(
+            [item_of(msg_stub(mid, "photo", group="g1")) for mid in (41, 42)]))
+
+        assert all(o.ok for o in outcomes)
+        assert client.calls[0][1] == [srcs[41] + ".jpg", srcs[42] + ".jpg"]
+        leftovers = [p for p in (srcs[41] + ".jpg", srcs[42] + ".jpg") if os.path.exists(p)]
+        assert leftovers == [], f"转换产物没被清掉：{leftovers}"
+
     def test_group_caption_is_shared_single_keeps_its_own(self, tmp_path, make_pipeline):
         """表行 8：整组写库用组级 caption（每条都写同一份），单条写库用自己那条的文字"""
         db = fake_db()
@@ -776,9 +806,9 @@ def test_video_thumb_is_tracked_and_cleaned(tmp_path, make_pipeline, monkeypatch
     """
     缩略图也要进 temp_files 并被清掉。
 
-    回归 _prepare_item 里「temp_files[-1] = local_path 必须在 _prepare_video 之前」
-    这条顺序：挪到之后，替换会把刚追加的缩略图从追踪里抹掉，缩略图永久残留在
-    /data/tmp，而原始下载产物反而被追踪两次。
+    不变量：_prepare_video 生成缩略图后必须把它追加进 temp_files，由调用方的 finally
+    统一清掉 —— 漏登记的缩略图会永久留在 /data/tmp（下载产物由调用方登记，
+    这里钉的是「本条自己造出来的文件也算」那一半）。
     """
     import media_ops
 
