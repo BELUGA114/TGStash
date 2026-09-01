@@ -772,3 +772,27 @@ class TestGroupExceptionBoundary:
 
         assert [(o.item.media.id, o.ok, o.stage) for o in outcomes] == [(41, False, "process")]
         assert not os.path.exists(src), "异常路径没清临时文件"
+
+
+def test_single_process_exception_becomes_failure_and_cleans_up(tmp_path, make_pipeline,
+                                                               monkeypatch):
+    """
+    单条路径的非预期异常同样进失败账（与整组对称），临时文件照清。
+
+    修复前它冒到 main() 的兜底 except：不计次、不告警，下一轮同样炸。
+    """
+    import media_ops
+
+    def boom(path):
+        raise OSError("磁盘读挂了")
+
+    monkeypatch.setattr(media_ops, "sha256_of_file", boom)
+    src = local_file(tmp_path, "s/41.pdf")
+    pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                             downloader=fake_downloader({41: src}))
+
+    outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
+
+    assert outcome.ok is False and outcome.stage == "process"
+    assert "磁盘读挂了" in (outcome.error or "")
+    assert not os.path.exists(src)
