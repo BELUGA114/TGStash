@@ -463,6 +463,9 @@ class ArchivePipeline:
                 await self._mark_processed(message, duplicate=False)
             logger.info("归档 %s (%s)", message.id, kind)
             await asyncio.sleep(self._config.upload_cooldown_seconds)
+        except Exception as e:
+            logger.warning("处理 %s 失败，下轮重试", message.id, exc_info=True)
+            return Outcome.failure(item, "process", str(e))
         finally:
             _cleanup_temp_files(temp_files)
 
