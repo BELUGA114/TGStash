@@ -149,8 +149,10 @@ def _build_context() -> ListenerContext:
 
 
 TME_LINK_RE = re.compile(r"https?://t\.me/\S+")
-# 链接尾部紧跟的句读不属于链接本身
-LINK_TRAILING_PUNCT = ".,;:!?)"
+# 链接尾部紧跟的句读不属于链接本身。全角那串是中文语境的常客：
+# 漏掉它们会让 parse_message_link 抛 ValueError，那条链接被 warning 掉，
+# 媒体永久不归档且无告警。合法链接以数字消息 id 或 ?single 结尾，剥这些字符安全
+LINK_TRAILING_PUNCT = ".,;:!?)]>" + "。，、；：！？）】》」』"
 
 
 def extract_tme_links(text: str) -> list[str]:

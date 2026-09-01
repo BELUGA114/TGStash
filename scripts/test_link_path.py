@@ -41,3 +41,18 @@ class TestExtractTmeLinks:
         """?single 留给 parse_message_link 去掉 —— 提取阶段不该猜它的语义"""
         assert listener.extract_tme_links(
             "https://t.me/c/1/2?single") == ["https://t.me/c/1/2?single"]
+
+    def test_strips_trailing_fullwidth_punctuation(self):
+        """
+        中文句读同样要剥掉。
+
+        修复前：链接连着 `。` 一起进 parse_message_link → ValueError → 只记 warning，
+        那条媒体永久不被归档且无告警（checkpoint 照常推进）。
+        """
+        for punct in ("。", "，", "、", "；", "：", "！", "？", "）", "】", "》", "」", "』"):
+            assert listener.extract_tme_links(
+                f"看这个 https://t.me/c/123456/78{punct}") == ["https://t.me/c/123456/78"]
+
+    def test_strips_bracket_and_angle_wrappers(self):
+        assert listener.extract_tme_links("<https://t.me/a/1>") == ["https://t.me/a/1"]
+        assert listener.extract_tme_links("[https://t.me/a/1]") == ["https://t.me/a/1"]
