@@ -796,3 +796,20 @@ def test_single_process_exception_becomes_failure_and_cleans_up(tmp_path, make_p
     assert outcome.ok is False and outcome.stage == "process"
     assert "磁盘读挂了" in (outcome.error or "")
     assert not os.path.exists(src)
+
+
+def test_single_plan_exception_becomes_failure(make_pipeline):
+    """
+    去重查询/建目录炸了也要进失败账 —— 与整组路径对称。
+
+    archive_batch 的 try 覆盖 _plan（Task 4），archive_one 也必须覆盖。
+    """
+    def boom(file_unique_id):
+        raise RuntimeError("db 锁住了")
+
+    pipeline = make_pipeline(client=FakeClient(), db=fake_db(find_by_unique_id=boom),
+                             downloader=fake_downloader({}))
+
+    outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
+
+    assert outcome.ok is False and outcome.stage == "process"
