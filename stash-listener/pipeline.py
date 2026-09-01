@@ -179,11 +179,14 @@ def _first_unconcluded_failure(items: list[ArchiveItem], outcomes: list[Outcome]
 
     与整组上传失败的既有约定一致：一次故障只产出一条结论。路径一的媒体组里
     每条媒体各是自己的入口，给每条都产结论会变成 N 条告警。全都有结论了就不补。
+
+    error 一律 `str(e) or repr(e)`：无参异常（尤其 assert 失败）的 str 是空串，
+    直接落库会让 last_error 为空、告警文案里「最近错误」一片空白，只剩 stage 可查。
     """
     concluded = {o.item.media.id for o in outcomes}
     for it in items:
         if it.media.id not in concluded:
-            return Outcome.failure(it, "process", str(error))
+            return Outcome.failure(it, "process", str(error) or repr(error))
     return None
 
 
@@ -441,7 +444,7 @@ class ArchivePipeline:
                 thumb_path=upload.thumb_path, meta=upload.meta)
         except Exception as e:
             logger.warning("上传 %s %s 失败，记录待重试", upload.kind, message.id, exc_info=True)
-            return Outcome.failure(upload.item, "upload", str(e))
+            return Outcome.failure(upload.item, "upload", str(e) or repr(e))
 
         assert sent is not None and sent.id is not None
         self._record_archived_media(upload.item, upload.sha256, upload.size, sent, caption)
@@ -487,7 +490,7 @@ class ArchivePipeline:
                 )
             except Exception as e:
                 logger.warning("下载 %s 失败，下轮重试", message.id)
-                return Outcome.failure(item, "download", str(e))
+                return Outcome.failure(item, "download", str(e) or repr(e))
             local_path = paths.get(message.id)
             if local_path is None:
                 logger.warning("下载 %s 失败，下轮重试", message.id)
@@ -511,7 +514,7 @@ class ArchivePipeline:
             await asyncio.sleep(self._config.upload_cooldown_seconds)
         except Exception as e:
             logger.warning("处理 %s 失败，下轮重试", message.id, exc_info=True)
-            return Outcome.failure(item, "process", str(e))
+            return Outcome.failure(item, "process", str(e) or repr(e))
         finally:
             _cleanup_temp_files(temp_files)
 
@@ -528,12 +531,12 @@ class ArchivePipeline:
         给每条都产结论会让路径一的媒体组变成 N 条告警。
         """
         outcomes: list[Outcome] = []
-        mark = bool(items) and items[0].entry.route == ROUTE_FORWARD
-        caps = _collect_captions(items)
-        group_caption = "\n".join(caps)
         temp_files: list[str] = []
 
         try:
+            mark = bool(items) and items[0].entry.route == ROUTE_FORWARD
+            caps = _collect_captions(items)
+            group_caption = "\n".join(caps)
             planned = self._plan(items)
             outcomes.extend(Outcome.success(it) for it in planned.duplicates)
             paths = await self._download(planned.tasks)
@@ -557,10 +560,15 @@ class ArchivePipeline:
                 for it in duplicates:
                     await self._mark_processed(it.media, duplicate=True)
         except Exception as e:
-            logger.warning("媒体组处理失败，记录待重试", exc_info=True)
             failure = _first_unconcluded_failure(items, outcomes, e)
             if failure is not None:
+                logger.warning("媒体组处理失败，记录待重试", exc_info=True)
                 outcomes.append(failure)
+            else:
+                # 所有条目都已有结论（异常发生在结算之后，例如统一打标记那一段）：
+                # 没有条目能承载这个失败，_settle_all 会按全成功结算并推进 checkpoint，
+                # 这个异常就此消失 —— 只剩这行日志
+                logger.exception("媒体组收尾出错，本轮已无条目可记账，checkpoint 仍会推进")
         finally:
             _cleanup_temp_files(temp_files)
 
