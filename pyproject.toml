@@ -1,6 +1,9 @@
 [tool.pytest.ini_options]
-testpaths = ["scripts"]
-pythonpath = ["stash-listener"]
+testpaths = ["test"]
+# 被测模块都不是安装包，靠 pythonpath 才 import 得到：
+# stash-listener/ 是主服务（pipeline / listener / db / media_ops ...），
+# scripts/ 是运维脚本（backfill_metadata / delete_message，各有用例）
+pythonpath = ["stash-listener", "scripts"]
 filterwarnings = ["ignore:There is no current event loop:DeprecationWarning"]
 
 [tool.ruff]
