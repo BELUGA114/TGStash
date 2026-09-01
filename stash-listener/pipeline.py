@@ -19,7 +19,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import media_ops
@@ -66,15 +66,17 @@ class PipelineConfig:
     """
     今天散在 listener 模块级的那些常量。测试里想关掉冷却就传 0。
 
-    默认值只服务测试：生产由 listener 从环境变量读出后显式传入，
-    风控相关的真实默认值以 listener 那边的环境变量默认值为准。
+    构造时必填的三个值（冷却、压缩阈值、CRF）没有默认值：生产由 listener 从环境变量
+    读出后显式传入，那里才是唯一的真相。测试的默认值由 conftest 的 make_pipeline 提供。
+    （别把这三个叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
+    UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS，后两个压缩参数只是调参。）
     """
 
-    upload_cooldown_seconds: int = 5
+    upload_cooldown_seconds: int
+    video_compress_min_size_mb: int
+    video_compress_crf: int
     min_plausible_size: int = media_ops.MIN_PLAUSIBLE_SIZE
     video_compress_enabled: bool = False
-    video_compress_min_size_mb: int = 100
-    video_compress_crf: int = 28
 
 
 @dataclass
@@ -97,8 +99,10 @@ class _PendingUpload:
     sha256: str
     size: int
     local_path: str
+    # 缩略图真的可能没有（make_thumbnail 失败返回 None），这个 None 是诚实的；
+    # meta 则恒为 dict：非视频是空 dict，视频由 _prepare_video 填满
     thumb_path: str | None = None
-    meta: dict | None = None
+    meta: dict = field(default_factory=dict)
 
 
 class _Planned(NamedTuple):
@@ -106,12 +110,20 @@ class _Planned(NamedTuple):
     duplicates: list[ArchiveItem]   # file_unique_id 命中，不下载
 
 
+class _ItemResult(NamedTuple):
+    """一条条目走完「校验→SHA-256→格式修正→去重→视频处理」之后的结论。"""
+
+    pending: _PendingUpload | None   # 可以上传了
+    outcome: Outcome | None          # 已有确定结论（校验失败 / 去重命中），不必上传
+    groupable: bool = False          # kind in INPUT_MEDIA_CLASS，决定上传形状
+    duplicate: bool = False          # SHA-256 命中 —— 调用方要按「重复」打标记
+
+
 class _Processed(NamedTuple):
     pending: list[_PendingUpload]
-    duplicates: list[ArchiveItem]   # SHA-256 命中
-    singles: list[ArchiveItem]      # 不支持编组的类型，退回单条处理
-    outcomes: list[Outcome]         # 下载/校验失败与去重命中的结论
-    temp_files: list[str]           # 下载产物 + 压缩产物 + 缩略图，调用方统一清理
+    duplicates: list[ArchiveItem]     # SHA-256 命中
+    singles: list[_PendingUpload]     # 不支持编组的类型，逐条单发
+    outcomes: list[Outcome]           # 下载/校验失败与去重命中的结论
 
 
 class _Uploaded(NamedTuple):
@@ -162,6 +174,24 @@ def _collect_captions(items: list[ArchiveItem]) -> list[str]:
         if cap and cap not in caps:
             caps.append(cap)
     return caps
+
+
+def _first_unconcluded_failure(items: list[ArchiveItem], outcomes: list[Outcome],
+                               error: Exception) -> Outcome | None:
+    """
+    非预期异常 → 给本轮尚无结论的第一条条目产出一条失败结论。
+
+    与整组上传失败的既有约定一致：一次故障只产出一条结论。路径一的媒体组里
+    每条媒体各是自己的入口，给每条都产结论会变成 N 条告警。全都有结论了就不补。
+
+    error 一律 `str(e) or repr(e)`：无参异常（尤其 assert 失败）的 str 是空串，
+    直接落库会让 last_error 为空、告警文案里「最近错误」一片空白，只剩 stage 可查。
+    """
+    concluded = {o.item.media.id for o in outcomes}
+    for it in items:
+        if it.media.id not in concluded:
+            return Outcome.failure(it, "process", str(error) or repr(error))
+    return None
 
 
 class ArchivePipeline:
@@ -322,17 +352,21 @@ class ArchivePipeline:
         caption: str,
         *,
         thumb_path: str | None = None,
-        meta: dict | None = None,
+        meta: dict,
     ) -> Message | None:
-        """上传单个媒体；照片格式不被 Telegram 接受时回退为 document。"""
+        """
+        上传单个媒体；照片格式不被 Telegram 接受时回退为 document。
+
+        meta 必填：唯一的调用方 _upload_one 恒从 _PendingUpload.meta 取，
+        那个字段恒为 dict（非视频是空 dict）。
+        """
         if kind == "video":
-            video_meta = meta or {}
             sent = await self._client.send_video(
                 self._archive_chat,
                 local_path,
-                duration=video_meta["duration"],
-                width=video_meta["width"],
-                height=video_meta["height"],
+                duration=meta["duration"],
+                width=meta["width"],
+                height=meta["height"],
                 thumb=thumb_path,  # type: ignore[arg-type]
                 caption=caption,
             )
@@ -347,108 +381,154 @@ class ArchivePipeline:
 
         return sent
 
+    async def _prepare_item(self, task: _DownloadTask, local_path: str,
+                            temp_files: list[str]) -> _ItemResult:
+        """
+        下载产物 → 待上传条目。两条路径共用，唯一的一份实现。
+
+        temp_files 由调用方持有，且下载产物已由调用方登记：本方法只往后追加自己造出来的
+        新文件（格式修正后的新路径、压缩产物、缩略图），从不替换已有条目。因此这里不再有
+        「最后一项必须是本条的下载产物」那个契约 —— 它曾经要求替换动作排在 _prepare_video
+        之前（之后 temp_files[-1] 已经是缩略图了）。
+
+        不产出 Outcome.failure("download")：下载归调用方 —— 单条与整组的批次形状不同。
+        视频处理留在这里：产物命名依赖 local_path 所在目录（见 CLAUDE.md「临时产物命名」），
+        这条约束必须只有一处实现。
+        """
+        it, kind, media = task.item, task.kind, task.media
+        message = it.media
+        logger.debug("下载完成 %s → %s (%s bytes)",
+                     message.id, local_path, os.path.getsize(local_path))
+
+        # 校验只包住 verify_download_size 自己：把整段包在 except RuntimeError 里
+        # 会把别处的 RuntimeError 也误报成校验失败
+        try:
+            media_ops.verify_download_size(
+                local_path, getattr(media, "file_size", None),
+                min_size=self._config.min_plausible_size)
+        except RuntimeError as e:
+            logger.warning("文件校验失败 %s，记录待重试", message.id)
+            return _ItemResult(pending=None, outcome=Outcome.failure(it, "verify", str(e)))
+        logger.debug("校验通过 %s", message.id)
+
+        sha256 = media_ops.sha256_of_file(local_path)
+        size = os.path.getsize(local_path)
+        logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
+
+        # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
+        fixed_path = media_ops.fix_media_format(local_path, kind)
+        if fixed_path != local_path:
+            # 追加而不是替换：fix_media_format 换路径时已经把原文件删掉/改名了，
+            # 旧条目留在列表里只会在 _cleanup_temp_files 的 exists 检查上落空。
+            # 这样就不必维持「temp_files[-1] 必须是本条的下载产物」那个契约
+            temp_files.append(fixed_path)
+        local_path = fixed_path
+
+        dup = self._db.find_by_sha256(sha256)
+        if dup:
+            self._record_dedup_file(it, sha256, size, dup)
+            return _ItemResult(pending=None, outcome=Outcome.success(it), duplicate=True)
+
+        # 视频：（可选）压缩 → ffprobe 探测真实元数据（三层回退） → ffmpeg 生成缩略图
+        thumb_path = None
+        meta: dict = {}
+        if kind == "video":
+            local_path, thumb_path, meta = await self._prepare_video(
+                local_path, media, temp_files, message.id,
+            )
+
+        return _ItemResult(
+            pending=_PendingUpload(item=it, kind=kind, sha256=sha256, size=size,
+                                   local_path=local_path, thumb_path=thumb_path, meta=meta),
+            outcome=None,
+            groupable=kind in INPUT_MEDIA_CLASS,
+        )
+
+    async def _upload_one(self, upload: _PendingUpload, caption: str) -> Outcome:
+        """
+        单条上传 + 写库，产出结论。archive_one、拆组分支、不可编组条目共用。
+
+        不含冷却：调用方在成功后自己 sleep —— 打包上传整组只睡一次，逐条上传每条都睡。
+        """
+        message = upload.item.media
+        logger.debug("上传 %s %s ...", upload.kind, message.id)
+        try:
+            sent = await self._send_media(
+                upload.local_path, upload.kind, caption,
+                thumb_path=upload.thumb_path, meta=upload.meta)
+        except Exception as e:
+            logger.warning("上传 %s %s 失败，记录待重试", upload.kind, message.id, exc_info=True)
+            return Outcome.failure(upload.item, "upload", str(e) or repr(e))
+
+        assert sent is not None and sent.id is not None
+        self._record_archived_media(upload.item, upload.sha256, upload.size, sent, caption)
+        logger.info("归档 %s (%s)", message.id, upload.kind)
+        return Outcome.success(upload.item)
+
     async def archive_one(self, item: ArchiveItem) -> Outcome:
         """
         处理单条媒体消息，返回该条目的结论。
 
         失败不就地记账 —— 调用方用 _settle_all 按入口统一结算。
         去重跳过算 ok：文件已在备份频道，没有待重试的事。
+
+        中间那段（校验→SHA-256→格式修正→去重→视频处理）走 _prepare_item，与整组路径
+        共用唯一一份实现；这里只负责单条的下载形状（自己的 msg_dir、无 Semaphore）
+        与单条的上传形状（_send_media，PhotoExtInvalid 只回退这一条）。
         """
         message = item.media
-        entry = item.entry
-        mark = entry.route == ROUTE_FORWARD
-        kind, media = media_ops.get_media(message)
-        if not media or kind is None:
-            return Outcome.success(item)
-
-        if self._db.find_by_unique_id(media.file_unique_id):
-            if mark:
-                await self._mark_processed(message, duplicate=True)
-            logger.info("跳过重复 %s (%s)", message.id, kind)
-            return Outcome.success(item)
-
-        # 每条消息下载到独立子目录，文件名保持原名（上传时不会带 num_ 前缀）
-        msg_dir = os.path.join(self._download_dir, str(message.id))
-        os.makedirs(msg_dir, exist_ok=True)
-        dl_name = getattr(media, "file_name", None) or f"{message.id}_"
-
-        logger.info("开始处理 %s (%s)", message.id, kind)
-
-        # 下载：tdl 并行分块，失败自动回退 Pyrogram；下载失败不推进 checkpoint
-        links = {message.id: item.link} if item.link else None
-        try:
-            paths = await self._downloader.download(
-                [message],
-                msg_dir,
-                fallback=lambda m, path: self._client.download_media(message=m, file_name=path),  # type: ignore[call-overload]
-                links=links,
-                fallback_paths={message.id: os.path.join(msg_dir, dl_name)},
-            )
-        except Exception as e:
-            logger.warning("下载 %s 失败，下轮重试", message.id)
-            return Outcome.failure(item, "download", str(e))
-        local_path = paths.get(message.id)
-        if local_path is None:
-            logger.warning("下载 %s 失败，下轮重试", message.id)
-            return Outcome.failure(item, "download", "tdl 返回空路径")
-        logger.debug("下载完成 %s → %s (%s bytes)",
-                     message.id, local_path, os.path.getsize(local_path))
-
-        # 显式追踪所有临时文件，finally 统一清理
-        temp_files = [local_path]
+        mark = item.entry.route == ROUTE_FORWARD
+        temp_files: list[str] = []
 
         try:
-            # 校验只包住 verify_download_size 自己：把整段包在 except RuntimeError 里
-            # 会把别处的 RuntimeError 也误报成校验失败
-            try:
-                media_ops.verify_download_size(
-                    local_path, getattr(media, "file_size", None),
-                    min_size=self._config.min_plausible_size)
-            except RuntimeError as e:
-                logger.warning("文件校验失败 %s，下轮重试", message.id)
-                return Outcome.failure(item, "verify", str(e))
-            logger.debug("校验通过 %s", message.id)
-
-            sha256 = media_ops.sha256_of_file(local_path)
-            size = os.path.getsize(local_path)
-            logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
-
-            # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
-            local_path = media_ops.fix_media_format(local_path, kind)
-            temp_files[0] = local_path  # fix_media_format 可能改了路径（WebP→JPEG），跟踪新文件
-
-            dup = self._db.find_by_sha256(sha256)
-            if dup:
-                self._record_dedup_file(item, sha256, size, dup)
+            planned = self._plan([item])
+            if planned.duplicates:
                 if mark:
                     await self._mark_processed(message, duplicate=True)
+                logger.info("跳过重复 %s", message.id)
                 return Outcome.success(item)
+            if not planned.tasks:
+                return Outcome.success(item)   # 无媒体：本轮有结论，checkpoint 可推进
+            task = planned.tasks[0]
+            logger.info("开始处理 %s (%s)", message.id, task.kind)
 
+            # 下载：tdl 并行分块，失败自动回退 Pyrogram；下载失败不推进 checkpoint
+            links = {message.id: item.link} if item.link else None
+            try:
+                paths = await self._downloader.download(
+                    [message],
+                    task.msg_dir,
+                    fallback=lambda m, path: self._client.download_media(message=m, file_name=path),  # type: ignore[call-overload]
+                    links=links,
+                    fallback_paths={message.id: os.path.join(task.msg_dir, task.dl_name)},
+                )
+            except Exception as e:
+                logger.warning("下载 %s 失败，下轮重试", message.id)
+                return Outcome.failure(item, "download", str(e) or repr(e))
+            local_path = paths.get(message.id)
+            if local_path is None:
+                logger.warning("下载 %s 失败，下轮重试", message.id)
+                return Outcome.failure(item, "download", "tdl 返回空路径")
+
+            temp_files.append(local_path)
+            result = await self._prepare_item(task, local_path, temp_files)
+            if result.outcome is not None:
+                if result.duplicate and mark:
+                    await self._mark_processed(message, duplicate=True)
+                return result.outcome
+
+            assert result.pending is not None
             # 转发到频道的文档类消息（.iso/.apk），文本可能在 text 而非 caption 字段
             caption = message.caption or message.text or ""
-
-            # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
-            thumb_path = None
-            meta = None
-            if kind == "video":
-                local_path, thumb_path, meta = await self._prepare_video(
-                    local_path, media, temp_files, message.id,
-                )
-
-            logger.debug("上传 %s %s ...", kind, message.id)
-            try:
-                sent = await self._send_media(
-                    local_path, kind, caption, thumb_path=thumb_path, meta=meta)
-            except Exception as e:
-                logger.warning("上传 %s %s 失败，记录待重试", kind, message.id, exc_info=True)
-                return Outcome.failure(item, "upload", str(e))
-
-            assert sent is not None and sent.id is not None
-            self._record_archived_media(item, sha256, size, sent, caption)
+            outcome = await self._upload_one(result.pending, caption)
+            if not outcome.ok:
+                return outcome
             if mark:
                 await self._mark_processed(message, duplicate=False)
-            logger.info("归档 %s (%s)", message.id, kind)
             await asyncio.sleep(self._config.upload_cooldown_seconds)
+        except Exception as e:
+            logger.warning("处理 %s 失败，下轮重试", message.id, exc_info=True)
+            return Outcome.failure(item, "process", str(e) or repr(e))
         finally:
             _cleanup_temp_files(temp_files)
 
@@ -458,23 +538,29 @@ class ArchivePipeline:
         """
         媒体组：并行下载（最多 2 个）→ 顺序处理 → 打包成 send_media_group 上传。
 
-        返回每个有确定结论的条目的 Outcome。整组上传失败时只有第一条待上传条目
+        返回每个有确定结论的条目的 Outcome。任一阶段的非预期异常都在这里翻译成
+        一条失败结论（只给本轮尚无结论的第一条），交回 listener 记账/熔断 ——
+        阶段方法保持「出错就抛」，不在内部就地降级。整组上传失败同样只有第一条
         产出失败结论，其余条目本轮无结论（根本没被尝试），由调用方留到下轮 ——
         给每条都产结论会让路径一的媒体组变成 N 条告警。
         """
         outcomes: list[Outcome] = []
-        mark = bool(items) and items[0].entry.route == ROUTE_FORWARD
-        caps = _collect_captions(items)
-        group_caption = "\n".join(caps)
-
-        planned = self._plan(items)
-        outcomes.extend(Outcome.success(it) for it in planned.duplicates)
-        paths = await self._download(planned.tasks)
-        processed = await self._process_each(planned.tasks, paths)
-        outcomes.extend(processed.outcomes)
-        duplicates = planned.duplicates + processed.duplicates
+        temp_files: list[str] = []
 
         try:
+            mark = bool(items) and items[0].entry.route == ROUTE_FORWARD
+            caps = _collect_captions(items)
+            group_caption = "\n".join(caps)
+            planned = self._plan(items)
+            outcomes.extend(Outcome.success(it) for it in planned.duplicates)
+            paths = await self._download(planned.tasks)
+            # 下载产物一落盘就登记：_process_each 中途抛异常时，还没轮到的那几条
+            # 也得被 finally 清掉（否则永久留在 batch_dir）
+            temp_files.extend(paths.values())
+            processed = await self._process_each(planned.tasks, paths, temp_files)
+            outcomes.extend(processed.outcomes)
+            duplicates = planned.duplicates + processed.duplicates
+
             if processed.pending:
                 uploaded = await self._upload(processed.pending, caps, group_caption)
                 outcomes.extend(uploaded.outcomes)
@@ -482,16 +568,35 @@ class ArchivePipeline:
                     # 不再处理不可编组的条目、不打标记：那些条目本轮根本没被尝试
                     return outcomes
 
-            for it in processed.singles:
-                outcomes.append(await self.archive_one(it))
+            for upload in processed.singles:
+                single_msg = upload.item.media
+                # 不可编组的条目各带自己的文字：它们本来就不在一个媒体组的 caption 里
+                caption = single_msg.caption or single_msg.text or ""
+                outcome = await self._upload_one(upload, caption)
+                outcomes.append(outcome)
+                if outcome.ok:
+                    # 就地标记 + 就地冷却，与原先回调 archive_one 时的顺序一致
+                    if mark:
+                        await self._mark_processed(single_msg, duplicate=False)
+                    await asyncio.sleep(self._config.upload_cooldown_seconds)
 
             if mark:
                 for pending in processed.pending:
                     await self._mark_processed(pending.item.media, duplicate=False)
                 for it in duplicates:
                     await self._mark_processed(it.media, duplicate=True)
+        except Exception as e:
+            failure = _first_unconcluded_failure(items, outcomes, e)
+            if failure is not None:
+                logger.warning("媒体组处理失败，记录待重试", exc_info=True)
+                outcomes.append(failure)
+            else:
+                # 所有条目都已有结论（异常发生在结算之后，例如统一打标记那一段）：
+                # 没有条目能承载这个失败，_settle_all 会按全成功结算并推进 checkpoint，
+                # 这个异常就此消失 —— 只剩这行日志
+                logger.exception("媒体组收尾出错，本轮已无条目可记账，checkpoint 仍会推进")
         finally:
-            _cleanup_temp_files(processed.temp_files)
+            _cleanup_temp_files(temp_files)
 
         return outcomes
 
@@ -543,17 +648,22 @@ class ArchivePipeline:
             fallback_paths=fallback_paths,
         )
 
-    async def _process_each(self, tasks: list[_DownloadTask],
-                            paths: dict[int, str]) -> _Processed:
-        """阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）。"""
+    async def _process_each(self, tasks: list[_DownloadTask], paths: dict[int, str],
+                            temp_files: list[str]) -> _Processed:
+        """阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）。
+
+        临时文件登记在调用方的 temp_files 里：本方法抛异常时 archive_batch 的
+        finally 仍然要清得掉它们。下载产物由调用方在 _download 返回后一次登记完
+        （本方法中途抛异常时，还没轮到的条目也已经落盘了）；本方法只让 _prepare_item
+        往后追加它自己造出来的文件。
+        """
         pending: list[_PendingUpload] = []
         duplicates: list[ArchiveItem] = []
-        singles: list[ArchiveItem] = []
+        singles: list[_PendingUpload] = []
         outcomes: list[Outcome] = []
-        temp_files: list[str] = []
 
         for task in tasks:
-            it, kind, media = task.item, task.kind, task.media
+            it = task.item
             message = it.media
             local_path = paths.get(message.id)
             if local_path is None:
@@ -568,55 +678,22 @@ class ArchivePipeline:
                 except OSError:
                     pass
 
-            temp_files.append(local_path)
-            logger.debug("下载完成 %s → %s (%s bytes)",
-                         message.id, local_path, os.path.getsize(local_path))
-
-            # 文件完整性校验（失败跳过本条，不阻塞整组）
-            try:
-                media_ops.verify_download_size(
-                    local_path, getattr(media, "file_size", None),
-                    min_size=self._config.min_plausible_size)
-            except RuntimeError as e:
-                logger.warning("文件校验失败 %s，记录待重试", message.id)
-                outcomes.append(Outcome.failure(it, "verify", str(e)))
-                continue
-            logger.debug("校验通过 %s", message.id)
-
-            sha256 = media_ops.sha256_of_file(local_path)
-            size = os.path.getsize(local_path)
-            logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
-
-            local_path = media_ops.fix_media_format(local_path, kind)
-            temp_files[-1] = local_path  # fix_media_format 可能改了路径，更新追踪
-
-            dup = self._db.find_by_sha256(sha256)
-            if dup:
-                self._record_dedup_file(it, sha256, size, dup)
-                duplicates.append(it)
-                outcomes.append(Outcome.success(it))
+            result = await self._prepare_item(task, local_path, temp_files)
+            if result.outcome is not None:
+                outcomes.append(result.outcome)
+                if result.duplicate:
+                    duplicates.append(it)
                 continue
 
-            if kind not in INPUT_MEDIA_CLASS:
-                # 语音/视频留言等不支持编组的类型，退回单条处理
-                singles.append(it)
-                continue
-
-            # 视频：ffprobe 探测真实元数据（三层回退） + ffmpeg 生成缩略图
-            thumb_path = None
-            meta: dict = {}
-            if kind == "video":
-                local_path, thumb_path, meta = await self._prepare_video(
-                    local_path, media, temp_files, message.id,
-                )
-
-            pending.append(_PendingUpload(
-                item=it, kind=kind, sha256=sha256, size=size,
-                local_path=local_path, thumb_path=thumb_path, meta=meta,
-            ))
+            assert result.pending is not None
+            if result.groupable:
+                pending.append(result.pending)
+            else:
+                # 语音/视频留言等不支持编组的类型，逐条单发（不再重新下载一遍）
+                singles.append(result.pending)
 
         return _Processed(pending=pending, duplicates=duplicates, singles=singles,
-                          outcomes=outcomes, temp_files=temp_files)
+                          outcomes=outcomes)
 
     async def _upload(self, pending: list[_PendingUpload], caps: list[str],
                       group_caption: str) -> _Uploaded:
@@ -629,24 +706,10 @@ class ArchivePipeline:
             for upload in pending:
                 message = upload.item.media
                 caption = message.caption or message.text or ""
-                try:
-                    sent = await self._send_media(
-                        upload.local_path,
-                        upload.kind,
-                        caption,
-                        thumb_path=upload.thumb_path,
-                        meta=upload.meta,
-                    )
-                except Exception as e:
-                    logger.warning("拆组上传 %s 失败，记录待重试", message.id, exc_info=True)
-                    outcomes.append(Outcome.failure(upload.item, "upload", str(e)))
+                outcome = await self._upload_one(upload, caption)
+                outcomes.append(outcome)
+                if not outcome.ok:
                     return _Uploaded(outcomes, aborted=True)
-
-                assert sent is not None and sent.id is not None
-                self._record_archived_media(
-                    upload.item, upload.sha256, upload.size, sent, caption,
-                )
-                outcomes.append(Outcome.success(upload.item))
                 await asyncio.sleep(self._config.upload_cooldown_seconds)
             logger.info("归档媒体组（拆组）%s 条", len(pending))
             return _Uploaded(outcomes, aborted=False)
@@ -656,13 +719,12 @@ class ArchivePipeline:
         for i, upload in enumerate(pending):
             caption = group_caption if i == 0 else ""
             if upload.kind == "video":
-                meta = upload.meta or {}
                 input_media.append(InputMediaVideo(
                     upload.local_path,
                     caption=caption,
-                    duration=meta["duration"],
-                    width=meta["width"],
-                    height=meta["height"],
+                    duration=upload.meta["duration"],
+                    width=upload.meta["width"],
+                    height=upload.meta["height"],
                     thumb=upload.thumb_path,
                 ))
             else:

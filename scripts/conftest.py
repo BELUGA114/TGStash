@@ -9,7 +9,9 @@ def make_pipeline(tmp_path):
     """
     按需组装 ArchivePipeline：只传要断言的依赖，其余给不会被调用的空桩。
 
-    冷却默认 0：测试不该真的睡 5 秒。要验证冷却本身就显式传值。
+    PipelineConfig 构造时必填的三个值（冷却、压缩阈值、CRF）在这里给测试默认值；
+    生产的真相只有一处：listener.py 读环境变量那一段。冷却默认 0：测试不该真的睡 5 秒，
+    要验证冷却本身就显式传值。
     """
     from pipeline import ArchivePipeline, PipelineConfig
 
@@ -20,6 +22,9 @@ def make_pipeline(tmp_path):
               download_dir=None, archive_chat=-1009876543210,
               receive_chat=-1001234567890, **config_kwargs):
         config_kwargs.setdefault("upload_cooldown_seconds", 0)
+        # 生产默认值在 listener 那边（环境变量）；这里只给测试一个够用的值
+        config_kwargs.setdefault("video_compress_min_size_mb", 100)
+        config_kwargs.setdefault("video_compress_crf", 28)
         return ArchivePipeline(
             client=client if client is not None else SimpleNamespace(),
             db=db if db is not None else SimpleNamespace(),

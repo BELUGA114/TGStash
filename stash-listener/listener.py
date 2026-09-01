@@ -148,6 +148,28 @@ def _build_context() -> ListenerContext:
                            receive_chat=receive_chat)
 
 
+TME_LINK_RE = re.compile(r"https?://t\.me/\S+")
+# 链接尾部紧跟的句读不属于链接本身。全角那串是中文语境的常客：
+# 漏掉它们会让 parse_message_link 抛 ValueError，那条链接被 warning 掉，
+# 媒体永久不归档且无告警。合法链接以数字消息 id 或 ?single 结尾，剥这些字符安全
+LINK_TRAILING_PUNCT = ".,;:!?)]>" + "。，、；：！？）】》」』"
+
+
+def extract_tme_links(text: str) -> list[str]:
+    """
+    从消息文本里提取 t.me 链接，去掉尾部标点，保序去重。
+
+    只剥 LINK_TRAILING_PUNCT 里那几个字符。合法的 t.me 链接总以数字消息 id
+    （或 ?single 这类查询串）结尾，剥尾部标点不会伤到它。
+    """
+    links: list[str] = []
+    for raw in TME_LINK_RE.findall(text or ""):
+        link = raw.rstrip(LINK_TRAILING_PUNCT)
+        if link and link not in links:
+            links.append(link)
+    return links
+
+
 def parse_message_link(link: str) -> tuple[str, int]:
     """
     解析 t.me 链接，返回 (chat_identifier, message_id)
@@ -295,14 +317,7 @@ async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outco
     """
     message = entry.message
     text = message.text or ""
-    raw_links = re.findall(r"https?://t\.me/\S+", text)
-    seen = set()
-    links: list[str] = []
-    for link in raw_links:
-        link = link.rstrip(".,;:!?)")
-        if link not in seen:
-            seen.add(link)
-            links.append(link)
+    links = extract_tme_links(text)
 
     outcomes: list[Outcome] = []
     for link in links:
