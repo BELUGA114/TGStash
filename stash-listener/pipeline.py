@@ -148,6 +148,29 @@ def _file_identity(kind: str, media: object) -> dict:
     }
 
 
+def _safe_dl_name(raw: str | None) -> str | None:
+    """
+    把 Telegram 自带的 file_name 收成一个纯文件名；收不出来返回 None，调用方自己兜。
+
+    file_name 由上传者控制，可以是 `../../../db/archive.db` 或绝对路径。它会被拼成
+    Pyrogram 回退下载的落点（`download_media` 只做 `os.path.split` + `makedirs`，
+    不校验穿越段），于是一个恶意命名的文档足以让 `open(..., "wb")` 落到 msg_dir 之外，
+    把 archive.db 整个截断。只取最后一段并挡掉纯点名字，落点就恒在 msg_dir 内。
+    tdl 主路径不受影响（DOWNLOAD_TEMPLATE 走 filenamify），这里补的是回退那一路。
+
+    分隔符两种都切：来源平台未知，POSIX 上 `os.path.basename` 不认 `\\`。
+    盘符交给 `splitdrive`（POSIX 上是空操作，Windows 上挡掉 `C:x` 这种盘符相对路径）。
+    """
+    if not raw:
+        return None
+    name = os.path.splitdrive(raw.replace("\\", "/"))[1].rsplit("/", 1)[-1]
+    # NUL 会让 open 直接抛 ValueError，顺手去掉
+    name = name.replace("\x00", "").strip()
+    if name in ("", ".", ".."):
+        return None
+    return name
+
+
 def _cleanup_temp_files(temp_files: list[str]) -> None:
     """删除临时文件，并尽力清理其所在的空目录。"""
     for path in temp_files:
@@ -614,7 +637,8 @@ class ArchivePipeline:
 
             msg_dir = os.path.join(self._download_dir, str(it.media.id))
             os.makedirs(msg_dir, exist_ok=True)
-            dl_name = getattr(media, "file_name", None) or f"{it.media.id}_"
+            # file_name 由上传者控制，必须先收成纯文件名：它是回退下载的落点
+            dl_name = _safe_dl_name(getattr(media, "file_name", None)) or f"{it.media.id}_"
             tasks.append(_DownloadTask(item=it, kind=kind, msg_dir=msg_dir,
                                        dl_name=dl_name, media=media))
         return _Planned(tasks=tasks, duplicates=duplicates)

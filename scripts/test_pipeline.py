@@ -56,6 +56,7 @@ def fake_downloader(paths):
     async def download(messages, dest_dir, fallback=None, *, links=None, fallback_paths=None):
         seen["links"] = links
         seen["dest_dir"] = dest_dir
+        seen["fallback_paths"] = fallback_paths
         seen["calls"] = seen.get("calls", 0) + 1
         return {m.id: paths[m.id] for m in messages if m.id in paths}
 
@@ -131,6 +132,44 @@ def test_archive_one_uploads_and_records(tmp_path, make_pipeline):
     assert [w[0] for w in db.writes] == ["file", "message"]
     assert db.writes[0][1]["source"] == "manual_forward"
     assert db.writes[1][1]["source_message_id"] == 41
+
+
+class TestDownloadNameSanitizing:
+    """回归：file_name 由上传者控制，回退下载的落点必须留在 msg_dir 内。"""
+
+    def test_safe_dl_name_keeps_only_the_last_segment(self):
+        from pipeline import _safe_dl_name
+
+        assert _safe_dl_name("photo.jpg") == "photo.jpg"
+        assert _safe_dl_name("../../../db/archive.db") == "archive.db"
+        assert _safe_dl_name("/data/db/archive.db") == "archive.db"
+        assert _safe_dl_name("..\\..\\db\\archive.db") == "archive.db"
+        assert _safe_dl_name("a\x00b.pdf") == "ab.pdf"
+        # 收不出文件名的一律 None，由调用方回退成消息 id
+        assert _safe_dl_name("..") is None
+        assert _safe_dl_name("dir/") is None
+        assert _safe_dl_name("   ") is None
+        assert _safe_dl_name(None) is None
+
+    def test_traversal_name_lands_inside_msg_dir(self, tmp_path, make_pipeline):
+        """
+        修复前 dl_name 原样拼进 fallback_paths：Pyrogram 回退下载只做
+        os.path.split + makedirs，不校验穿越段，于是 open(..., "wb") 落到
+        msg_dir 之外 —— 一条名叫 ../../../db/archive.db 的转发文档
+        就能把归档库整个截断。
+        """
+        msg = msg_stub(51, file_name="../../../db/archive.db")
+        download_dir = str(tmp_path / "dl")
+        downloader = fake_downloader({51: local_file(tmp_path, "src/51.pdf")})
+        pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                                 downloader=downloader, download_dir=download_dir)
+
+        outcome = asyncio.run(pipeline.archive_one(item_of(msg)))
+
+        assert outcome.ok is True
+        fallback = downloader.seen["fallback_paths"][51]
+        assert (os.path.realpath(os.path.dirname(fallback))
+                == os.path.realpath(os.path.join(download_dir, "51")))
 
 
 class TestThumbnailPath:
