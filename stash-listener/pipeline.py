@@ -66,15 +66,15 @@ class PipelineConfig:
     """
     今天散在 listener 模块级的那些常量。测试里想关掉冷却就传 0。
 
-    默认值只服务测试：生产由 listener 从环境变量读出后显式传入，
-    风控相关的真实默认值以 listener 那边的环境变量默认值为准。
+    风控三件套（冷却、压缩阈值、CRF）没有默认值：生产由 listener 从环境变量读出后
+    显式传入，那里才是唯一的真相。测试的默认值由 conftest 的 make_pipeline 提供。
     """
 
-    upload_cooldown_seconds: int = 5
+    upload_cooldown_seconds: int
+    video_compress_min_size_mb: int
+    video_compress_crf: int
     min_plausible_size: int = media_ops.MIN_PLAUSIBLE_SIZE
     video_compress_enabled: bool = False
-    video_compress_min_size_mb: int = 100
-    video_compress_crf: int = 28
 
 
 @dataclass
