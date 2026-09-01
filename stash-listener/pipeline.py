@@ -56,6 +56,12 @@ INPUT_MEDIA_CLASS = {
     "photo": InputMediaPhoto,
     "audio": InputMediaAudio,
 }
+# send_video_note 是唯一不接受 caption 的 send_* 方法 —— Telegram 的圆形视频在协议层
+# 就没有 caption 字段，不是 Pyrogram 的疏漏。文字仍会写进 messages.caption（进 FTS，
+# 搜得到），只是备份频道那条消息上看不到。
+# scripts/test_pipeline.py 的 test_send_method_kwargs_match_pyrogram_signatures
+# 拿真实签名对账盯着这个集合：假 client 接受任意关键字，行为用例盖不住这类缺陷
+CAPTIONLESS_KINDS = frozenset({"video_note"})
 
 # 标记回调：(媒体消息, 是否去重命中) -> None。listener 注入，pipeline 不管它怎么发
 MarkProcessed = Callable[[Message, bool], Awaitable[None]]
@@ -395,8 +401,15 @@ class ArchivePipeline:
             )
         else:
             send = getattr(self._client, SEND_METHOD[kind])
+            # 不接受 caption 的类型不能传这个关键字（传了就是 TypeError）
+            caption_kwargs: dict = {}
+            if kind in CAPTIONLESS_KINDS:
+                if caption:
+                    logger.warning("%s 不支持 caption，文字只留在 DB 里（FTS 仍可搜到）", kind)
+            else:
+                caption_kwargs["caption"] = caption
             try:
-                sent = await send(self._archive_chat, local_path, caption=caption)
+                sent = await send(self._archive_chat, local_path, **caption_kwargs)
             except PhotoExtInvalid:
                 logger.debug("PhotoExtInvalid，回退 send_document")
                 sent = await self._client.send_document(
