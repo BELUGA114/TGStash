@@ -731,6 +731,103 @@ class TestSingleFailureTranslation:
         assert by_id[42].ok is True
 
 
+def test_video_thumb_is_tracked_and_cleaned(tmp_path, make_pipeline, monkeypatch):
+    """
+    缩略图也要进 temp_files 并被清掉。
+
+    回归 _prepare_item 里「temp_files[-1] = local_path 必须在 _prepare_video 之前」
+    这条顺序：挪到之后，替换会把刚追加的缩略图从追踪里抹掉，缩略图永久残留在
+    /data/tmp，而原始下载产物反而被追踪两次。
+    """
+    import media_ops
+
+    def fake_make_thumbnail(video_path, thumb_path, timestamp="00:00:01"):
+        with open(thumb_path, "wb") as f:
+            f.write(b"jpg")
+        return thumb_path
+
+    monkeypatch.setattr(media_ops, "make_thumbnail", fake_make_thumbnail)
+    monkeypatch.setattr(media_ops, "probe_video",
+                        lambda p: {"duration": 5, "width": 640, "height": 360})
+
+    src = local_file(tmp_path, "s/41.mp4")
+    client = FakeClient()
+    pipeline = make_pipeline(client=client, db=fake_db(),
+                             downloader=fake_downloader({41: src}))
+
+    assert asyncio.run(pipeline.archive_one(item_of(msg_stub(41, "video")))).ok
+    thumb = client.calls[0][2]["thumb"]
+    assert thumb is not None and os.path.basename(thumb) == "thumb_41.jpg"
+    assert not os.path.exists(thumb), "缩略图没被清掉"
+    assert not os.path.exists(src)
+
+
+def test_sha256_hit_marks_duplicate_and_records_file_only(tmp_path, make_pipeline):
+    """
+    单条 SHA-256 命中：标记 duplicate=True、只补一条 files 记录、不写 messages、不上传。
+
+    没有新的归档消息可记，但文件身份必须照写（否则回填脚本救不了这些行）。
+    """
+    marks = []
+
+    async def mark(message, duplicate):
+        marks.append((message.id, duplicate))
+
+    client = FakeClient()
+    db = fake_db(find_by_sha256=lambda sha: {"archived_chat_id": "-1009876543210",
+                                             "archived_message_id": 55})
+    pipeline = make_pipeline(client=client, db=db, mark=mark,
+                             downloader=fake_downloader({41: local_file(tmp_path, "s/41.pdf")}))
+
+    outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
+
+    assert outcome.ok is True
+    assert marks == [(41, True)]
+    assert [tag for tag, _ in db.writes] == ["file"]
+    assert db.writes[0][1]["archived_message_id"] == 55
+    assert client.calls == [], "去重命中不该上传"
+
+
+def test_sha256_hit_in_group_marks_duplicate(tmp_path, make_pipeline):
+    """整组里 SHA-256 命中的条目进 duplicates 名单，标记 duplicate=True，不上传"""
+    marks = []
+
+    async def mark(message, duplicate):
+        marks.append((message.id, duplicate))
+
+    client = FakeClient()
+    db = fake_db(find_by_sha256=lambda sha: {"archived_chat_id": "-1009876543210",
+                                             "archived_message_id": 55})
+    pipeline = make_pipeline(client=client, db=db, mark=mark,
+                             downloader=fake_downloader({41: local_file(tmp_path, "b/41.pdf")}))
+
+    outcomes = asyncio.run(pipeline.archive_batch([item_of(msg_stub(41, group="g1"))]))
+
+    assert [o.ok for o in outcomes] == [True]
+    assert marks == [(41, True)]
+    assert client.calls == []
+
+
+def test_single_upload_failure_marks_nothing(tmp_path, make_pipeline):
+    """单条上传失败不打归档标记（合流后 mark 留在调用方手上，这是那个决定的不变量）"""
+    marks = []
+
+    async def mark(message, duplicate):
+        marks.append((message.id, duplicate))
+
+    class BoomClient(FakeClient):
+        async def send_document(self, chat, path, caption=""):
+            raise RuntimeError("上传炸了")
+
+    pipeline = make_pipeline(client=BoomClient(), db=fake_db(), mark=mark,
+                             downloader=fake_downloader({41: local_file(tmp_path, "s/41.pdf")}))
+
+    outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
+
+    assert outcome.ok is False and outcome.stage == "upload"
+    assert marks == []
+
+
 class TestGroupExceptionBoundary:
     """
     债二：整组的准备阶段（_plan / _download / _process_each）异常必须变成 Outcome。
