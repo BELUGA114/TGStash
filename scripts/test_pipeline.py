@@ -729,3 +729,46 @@ class TestSingleFailureTranslation:
         by_id = {o.item.media.id: o for o in outcomes}
         assert by_id[41].ok is False and by_id[41].stage == "verify"
         assert by_id[42].ok is True
+
+
+class TestGroupExceptionBoundary:
+    """
+    债二：整组的准备阶段（_plan / _download / _process_each）异常必须变成 Outcome。
+
+    修复前这些异常冒到 main() 的兜底 except，既不记账也不告警，下一轮重扫同样炸 ——
+    那条消息永久卡住 checkpoint。
+    """
+
+    def test_download_exception_yields_one_process_failure(self, tmp_path, make_pipeline):
+        async def boom(messages, dest_dir, fallback=None, *, links=None, fallback_paths=None):
+            raise RuntimeError("tdl 炸了")
+
+        pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                                 downloader=SimpleNamespace(download=boom))
+        items = [item_of(msg_stub(mid, group="g1")) for mid in (41, 42)]
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        assert [(o.item.media.id, o.ok, o.stage) for o in outcomes] == [(41, False, "process")]
+
+    def test_process_exception_cleans_temp_files(self, tmp_path, make_pipeline, monkeypatch):
+        """
+        阶段三抛异常时也要清临时文件。
+
+        修复前 temp_files 随异常一起丢掉（它是 _process_each 的返回值），
+        下载好的文件永久留在 /data/tmp。
+        """
+        import media_ops
+
+        def boom(path):
+            raise OSError("磁盘读挂了")
+
+        monkeypatch.setattr(media_ops, "sha256_of_file", boom)
+        src = local_file(tmp_path, "b/41.pdf")
+        pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                                 downloader=fake_downloader({41: src}))
+
+        outcomes = asyncio.run(pipeline.archive_batch([item_of(msg_stub(41, group="g1"))]))
+
+        assert [(o.item.media.id, o.ok, o.stage) for o in outcomes] == [(41, False, "process")]
+        assert not os.path.exists(src), "异常路径没清临时文件"
