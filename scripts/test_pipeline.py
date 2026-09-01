@@ -323,7 +323,7 @@ class TestSingleVsGroupDifferences:
         outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41, None))))
 
         assert outcome.ok is True
-        assert "calls" not in downloader.seen, "无媒体不该走下载"
+        assert downloader.seen == {}, "无媒体不该走下载"
 
     def test_no_media_in_group_yields_no_outcome(self, make_pipeline):
         """表行 1：整组里的无媒体条目不产出任何 Outcome —— 该入口本轮无结论"""
@@ -348,7 +348,7 @@ class TestSingleVsGroupDifferences:
 
         assert outcome.ok is True
         assert marks == [(41, True)]
-        assert "calls" not in downloader.seen
+        assert downloader.seen == {}, "unique_id 命中不该走下载"
 
     def test_group_marks_after_upload_pending_before_duplicates(self, tmp_path, make_pipeline):
         """
@@ -402,15 +402,25 @@ class TestSingleVsGroupDifferences:
 
     def test_group_removes_empty_msg_dir_when_file_lands_elsewhere(self, tmp_path,
                                                                   make_pipeline):
-        """表行 3：tdl 命中 batch_dir 之后，msg_dir 必须被 rmdir 掉，不留空目录"""
+        """
+        表行 3：tdl 命中 batch_dir 之后，msg_dir 必须被 rmdir 掉，不留空目录。
+
+        不只是「不留垃圾」：msg_dir 被 rmdir 是既有事实，缩略图与压缩产物因此必须写
+        源文件所在目录。历史上缩略图写的是 msg_dir，命中 batch_dir 时那个目录已经不在，
+        ffmpeg 恒失败，还白跑四档画质重试 —— 媒体组视频永远没有缩略图。
+        """
         dl_root = str(tmp_path / "dl")
         pipeline = make_pipeline(
             client=FakeClient(), db=fake_db(),
             downloader=fake_downloader({41: local_file(tmp_path, "b/41.pdf")}),
             download_dir=dl_root)
 
-        assert all(o.ok for o in asyncio.run(
-            pipeline.archive_batch([item_of(msg_stub(41, group="g1"))])))
+        outcomes = asyncio.run(
+            pipeline.archive_batch([item_of(msg_stub(41, group="g1"))]))
+
+        # 少了这条，「一条都没规划」时下面两个断言会一起真空通过
+        assert len(outcomes) == 1
+        assert all(o.ok for o in outcomes)
         assert not os.path.isdir(os.path.join(dl_root, "41"))
 
     def test_group_missing_path_fails_only_that_item(self, tmp_path, make_pipeline):
@@ -542,6 +552,10 @@ class TestSingleVsGroupDifferences:
         async def fake_sleep(seconds):
             slept.append(seconds)
 
+        # 打的是全局 asyncio 模块的 sleep（pipeline 里的 asyncio 就是它），沿用既有写法。
+        # 代价：本进程内所有 await asyncio.sleep 都不再真的等 —— 因此这一手不能和
+        # TestFallbackConcurrency 混在同一个用例里，那边靠真 sleep 撑出并发窗口，
+        # 被替掉之后三个协程会一个接一个跑完，量到的峰值静默塌成 1。
         monkeypatch.setattr(pipeline_mod.asyncio, "sleep", fake_sleep)
 
         shared = make_pipeline(
@@ -650,3 +664,68 @@ class TestFallbackConcurrency:
             return await self._peak(captured, probe)
 
         assert asyncio.run(run()) == 3
+
+
+class TestSingleFailureTranslation:
+    """
+    差异表行 5 / 11 的单条半格：archive_one 把下载/校验/上传的异常翻译成 Outcome。
+
+    这三个 except 是单条路径唯一的熔断入口 —— listener._handle_entry 与 scan_once
+    都没有 try 包住 archive_one，丢掉任何一个都等于让异常冒到扫描循环：不记账、
+    不告警、checkpoint 也不推进，就是债二那种永久卡死。变异测试证明这三条在补网
+    之前一个用例都没钉住（改成 raise，209 个用例全绿），所以要在动结构之前先织网。
+    """
+
+    def test_download_exception_becomes_download_failure(self, make_pipeline):
+        """downloader 抛异常 → failure('download')，原始错误信息带进 Outcome"""
+        async def boom(messages, dest_dir, fallback=None, *, links=None, fallback_paths=None):
+            raise RuntimeError("tdl 炸了")
+
+        pipeline = make_pipeline(client=FakeClient(), db=fake_db(),
+                                 downloader=SimpleNamespace(download=boom))
+
+        outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
+
+        assert outcome.ok is False and outcome.stage == "download"
+        assert "tdl 炸了" in (outcome.error or "")
+
+    def test_upload_exception_becomes_upload_failure(self, tmp_path, make_pipeline):
+        """上传抛异常 → failure('upload')，且 finally 仍然清掉已下载的临时文件"""
+        class BoomClient(FakeClient):
+            async def send_document(self, chat, path, caption=""):
+                raise RuntimeError("上传炸了")
+
+        src = local_file(tmp_path, "s/41.pdf")
+        pipeline = make_pipeline(client=BoomClient(), db=fake_db(),
+                                 downloader=fake_downloader({41: src}))
+
+        outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
+
+        assert outcome.ok is False and outcome.stage == "upload"
+        assert not os.path.exists(src), "上传失败也要清临时文件"
+
+    def test_size_mismatch_becomes_verify_failure(self, tmp_path, make_pipeline):
+        """校验只比对体积：源消息说 9999 字节，实际下来 2048 → failure('verify')"""
+        pipeline = make_pipeline(
+            client=FakeClient(), db=fake_db(),
+            downloader=fake_downloader({41: local_file(tmp_path, "s/41.pdf")}))
+
+        outcome = asyncio.run(
+            pipeline.archive_one(item_of(msg_stub(41, file_size=9999))))
+
+        assert outcome.ok is False and outcome.stage == "verify"
+
+    def test_group_size_mismatch_fails_only_that_item(self, tmp_path, make_pipeline):
+        """整组的校验失败只跳过那一条，不阻塞整组（行 6 的近邻，同样没网）"""
+        pipeline = make_pipeline(
+            client=FakeClient(), db=fake_db(),
+            downloader=fake_downloader({mid: local_file(tmp_path, f"b/{mid}.pdf")
+                                        for mid in (41, 42)}))
+        items = [item_of(msg_stub(41, group="g1", file_size=9999)),
+                 item_of(msg_stub(42, group="g1"))]
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        by_id = {o.item.media.id: o for o in outcomes}
+        assert by_id[41].ok is False and by_id[41].stage == "verify"
+        assert by_id[42].ok is True
