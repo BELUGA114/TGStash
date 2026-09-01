@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS archive_failures (
     -- 那条失败既不重试也不阻塞 checkpoint
     source_chat_id TEXT NOT NULL,
     source_message_id INTEGER NOT NULL,
-    failure_stage TEXT NOT NULL,   -- 'download' | 'verify' | 'convert' | 'upload' | 'unknown'
+    failure_stage TEXT NOT NULL,   -- 'download' | 'verify' | 'convert' | 'upload' | 'process' | 'unknown'
     last_error TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'retrying',  -- 'retrying' | 'skipped'
