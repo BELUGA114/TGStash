@@ -530,3 +530,28 @@ class TestArchiveGroupOutcomes:
         asyncio.run(pipeline.archive_batch(items))
 
         assert captured["links"] == {42: link}
+
+    def test_group_process_exception_lands_in_failures(self, db: ArchiveDB, make_pipeline):
+        """
+        债二闭环：整组准备阶段的非预期异常经 _settle_all 进 archive_failures。
+
+        修复前异常冒到 main()，_settle_all 从没被调用 —— 不计次、不告警，
+        下一轮重扫同样炸，那条消息永久卡住 checkpoint。
+        """
+        async def boom(messages, dest, fallback=None, *, links=None, fallback_paths=None):
+            raise RuntimeError("tdl 炸了")
+
+        pipeline = make_pipeline(
+            db=SimpleNamespace(find_by_unique_id=lambda x: None),
+            downloader=SimpleNamespace(download=boom),
+        )
+        msg = _doc_stub(41, "F41")
+        entry = Entry(message=msg, route=ROUTE_FORWARD)
+
+        outcomes = asyncio.run(pipeline.archive_batch([ArchiveItem(media=msg, entry=entry)]))
+        settled = asyncio.run(listener._settle_all(_ctx(db, client=_sender([])), outcomes))
+
+        assert settled is False, "未结清才对：下一轮要重试"
+        row = db.get_failure("-1001234567890", 41)
+        assert row is not None and row["attempt_count"] == 1
+        assert row["failure_stage"] == "process"

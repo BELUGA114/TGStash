@@ -111,7 +111,6 @@ class _Processed(NamedTuple):
     duplicates: list[ArchiveItem]   # SHA-256 命中
     singles: list[ArchiveItem]      # 不支持编组的类型，退回单条处理
     outcomes: list[Outcome]         # 下载/校验失败与去重命中的结论
-    temp_files: list[str]           # 下载产物 + 压缩产物 + 缩略图，调用方统一清理
 
 
 class _Uploaded(NamedTuple):
@@ -162,6 +161,21 @@ def _collect_captions(items: list[ArchiveItem]) -> list[str]:
         if cap and cap not in caps:
             caps.append(cap)
     return caps
+
+
+def _first_unconcluded_failure(items: list[ArchiveItem], outcomes: list[Outcome],
+                               error: Exception) -> Outcome | None:
+    """
+    非预期异常 → 给本轮尚无结论的第一条条目产出一条失败结论。
+
+    与整组上传失败的既有约定一致：一次故障只产出一条结论。路径一的媒体组里
+    每条媒体各是自己的入口，给每条都产结论会变成 N 条告警。全都有结论了就不补。
+    """
+    concluded = {o.item.media.id for o in outcomes}
+    for it in items:
+        if it.media.id not in concluded:
+            return Outcome.failure(it, "process", str(error))
+    return None
 
 
 class ArchivePipeline:
@@ -458,7 +472,9 @@ class ArchivePipeline:
         """
         媒体组：并行下载（最多 2 个）→ 顺序处理 → 打包成 send_media_group 上传。
 
-        返回每个有确定结论的条目的 Outcome。整组上传失败时只有第一条待上传条目
+        返回每个有确定结论的条目的 Outcome。任一阶段的非预期异常都在这里翻译成
+        一条失败结论（只给本轮尚无结论的第一条），交回 listener 记账/熔断 ——
+        阶段方法保持「出错就抛」，不在内部就地降级。整组上传失败同样只有第一条
         产出失败结论，其余条目本轮无结论（根本没被尝试），由调用方留到下轮 ——
         给每条都产结论会让路径一的媒体组变成 N 条告警。
         """
@@ -466,15 +482,16 @@ class ArchivePipeline:
         mark = bool(items) and items[0].entry.route == ROUTE_FORWARD
         caps = _collect_captions(items)
         group_caption = "\n".join(caps)
-
-        planned = self._plan(items)
-        outcomes.extend(Outcome.success(it) for it in planned.duplicates)
-        paths = await self._download(planned.tasks)
-        processed = await self._process_each(planned.tasks, paths)
-        outcomes.extend(processed.outcomes)
-        duplicates = planned.duplicates + processed.duplicates
+        temp_files: list[str] = []
 
         try:
+            planned = self._plan(items)
+            outcomes.extend(Outcome.success(it) for it in planned.duplicates)
+            paths = await self._download(planned.tasks)
+            processed = await self._process_each(planned.tasks, paths, temp_files)
+            outcomes.extend(processed.outcomes)
+            duplicates = planned.duplicates + processed.duplicates
+
             if processed.pending:
                 uploaded = await self._upload(processed.pending, caps, group_caption)
                 outcomes.extend(uploaded.outcomes)
@@ -490,8 +507,13 @@ class ArchivePipeline:
                     await self._mark_processed(pending.item.media, duplicate=False)
                 for it in duplicates:
                     await self._mark_processed(it.media, duplicate=True)
+        except Exception as e:
+            logger.warning("媒体组处理失败，记录待重试", exc_info=True)
+            failure = _first_unconcluded_failure(items, outcomes, e)
+            if failure is not None:
+                outcomes.append(failure)
         finally:
-            _cleanup_temp_files(processed.temp_files)
+            _cleanup_temp_files(temp_files)
 
         return outcomes
 
@@ -543,14 +565,17 @@ class ArchivePipeline:
             fallback_paths=fallback_paths,
         )
 
-    async def _process_each(self, tasks: list[_DownloadTask],
-                            paths: dict[int, str]) -> _Processed:
-        """阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）。"""
+    async def _process_each(self, tasks: list[_DownloadTask], paths: dict[int, str],
+                            temp_files: list[str]) -> _Processed:
+        """阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）。
+
+        临时文件登记在调用方的 temp_files 里：本方法抛异常时 archive_batch 的
+        finally 仍然要清得掉它们。
+        """
         pending: list[_PendingUpload] = []
         duplicates: list[ArchiveItem] = []
         singles: list[ArchiveItem] = []
         outcomes: list[Outcome] = []
-        temp_files: list[str] = []
 
         for task in tasks:
             it, kind, media = task.item, task.kind, task.media
@@ -616,7 +641,7 @@ class ArchivePipeline:
             ))
 
         return _Processed(pending=pending, duplicates=duplicates, singles=singles,
-                          outcomes=outcomes, temp_files=temp_files)
+                          outcomes=outcomes)
 
     async def _upload(self, pending: list[_PendingUpload], caps: list[str],
                       group_caption: str) -> _Uploaded:

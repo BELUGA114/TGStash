@@ -71,7 +71,7 @@ class Outcome:
 
     item: ArchiveItem
     ok: bool
-    stage: str | None = None   # 'download' | 'verify' | 'convert' | 'upload'
+    stage: str | None = None   # 'download' | 'verify' | 'convert' | 'upload' | 'process'
     error: str | None = None
 
     @classmethod
