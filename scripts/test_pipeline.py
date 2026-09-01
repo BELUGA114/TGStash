@@ -951,3 +951,16 @@ def test_single_plan_exception_becomes_failure(make_pipeline):
     outcome = asyncio.run(pipeline.archive_one(item_of(msg_stub(41))))
 
     assert outcome.ok is False and outcome.stage == "process"
+
+
+def test_pipeline_config_requires_risk_control_values():
+    """
+    风控三件套没有默认值：真相只有 listener 从环境变量读的那一份。
+
+    CLAUDE.md 点名 UPLOAD_COOLDOWN_SECONDS=5 是风控值，写两遍就会有人改错一边。
+    """
+    import pytest
+    from pipeline import PipelineConfig
+
+    with pytest.raises(TypeError):
+        PipelineConfig()

@@ -20,6 +20,9 @@ def make_pipeline(tmp_path):
               download_dir=None, archive_chat=-1009876543210,
               receive_chat=-1001234567890, **config_kwargs):
         config_kwargs.setdefault("upload_cooldown_seconds", 0)
+        # 生产默认值在 listener 那边（环境变量）；这里只给测试一个够用的值
+        config_kwargs.setdefault("video_compress_min_size_mb", 100)
+        config_kwargs.setdefault("video_compress_crf", 28)
         return ArchivePipeline(
             client=client if client is not None else SimpleNamespace(),
             db=db if db is not None else SimpleNamespace(),
