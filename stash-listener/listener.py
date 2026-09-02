@@ -188,17 +188,25 @@ def entry_text(message: Message) -> str:
     return message.text or message.caption or ""
 
 
-def parse_message_link(link: str) -> tuple[str, int]:
+def parse_message_link(link: str) -> tuple[int | str, int]:
     """
     解析 t.me 链接，返回 (chat_identifier, message_id)
 
     https://t.me/username/123    → ("@username", 123)
-    https://t.me/c/123456/123    → ("-100123456", 123)
+    https://t.me/c/123456/123    → (-100123456, 123)
+
+    私有频道那一支必须是 int。Kurigram 的 resolve_peer 拿到字符串 peer 先剥掉
+    `+()-` 与空白，剩下全是数字就当电话号码：`"-1002680051096"` 剥成
+    `"1002680051096"`，于是走 contacts.ResolvePhone 查号码，回来一个
+    PHONE_NOT_OCCUPIED —— 路径二的每条 /c/ 链接都死在这里，重试三轮后被跳过，
+    媒体永久不归档。int 走的是另一条分支：storage 查不到就用 channels.GetChannels
+    补 access_hash（自己是成员的频道能补上），补不到才 PeerIdInvalid。
+    公开频道相反，必须留 "@username" 字符串，那条分支靠用户名解析。
     """
     link = link.strip().split("?")[0].rstrip("/")
     m = re.match(r"https?://t\.me/c/(\d+)/(\d+)$", link)
     if m:
-        return (f"-100{m.group(1)}", int(m.group(2)))
+        return (int(f"-100{m.group(1)}"), int(m.group(2)))
     m = re.match(r"https?://t\.me/([^/]+)/(\d+)$", link)
     if m:
         return (f"@{m.group(1)}", int(m.group(2)))
