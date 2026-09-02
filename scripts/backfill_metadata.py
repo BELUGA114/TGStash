@@ -188,7 +188,10 @@ async def main():
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO"), logging.INFO),
+        # getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
+        # LOG_LEVEL=debug 会取到 logging.debug 函数，basicConfig 直接抛 TypeError
+        level=logging.getLevelNamesMapping().get(
+            os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )

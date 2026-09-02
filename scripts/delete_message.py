@@ -22,6 +22,7 @@ source_message_id 依旧不可信。本脚本对跨度过大的回退会拦下�
 会删除 / 回退：
   - messages 表中匹配 source_message_id 的行（FTS 索引由触发器自动清理）
   - files 表中对应的行（仅当没有其他消息引用同一个 file_unique_id 时）
+  - archive_failures 中这些入口的失败账（残留的 attempt_count 会让重来的那次一失败就跳过）
   - channels 表中对应 source_chat_id 的 checkpoint，回退到 min(source_message_id) - 1
 """
 
@@ -98,6 +99,10 @@ def main():
         elif chat_id:
             chat_min_msg[chat_id] = min(chat_min_msg[chat_id], msg_id)
 
+    # 这些行对应的入口（失败账以入口的复合键为准）
+    entry_keys = sorted({(str(row[3]), row[1]) for row in rows if row[3]})
+    pending_keys = [k for k in entry_keys if db.get_failure(*k) is not None]
+
     # 先算回退跨度：跨度离谱通常意味着选中了 source_message_id 不可信的历史行
     far_back = []
     for chat_id, min_id in chat_min_msg.items():
@@ -108,6 +113,8 @@ def main():
 
     if args.dry_run:
         print("\n--dry-run，不执行删除")
+        if pending_keys:
+            print(f"将清除 {len(pending_keys)} 条失败账：{pending_keys}")
         if chat_min_msg:
             print("checkpoint 将回退到：")
             for chat_id, min_id in chat_min_msg.items():
@@ -153,6 +160,13 @@ def main():
                 if cur.rowcount:
                     deleted_files += 1
                     print(f"  同时删除 files: {fuid}（无其他消息引用）")
+
+    # 失败账：回退 checkpoint 是为了让这条入口重来一次，而 archive_failures 里残留的
+    # attempt_count（或 status='skipped'）会让重来的那次一失败就直接跳过、不再重试满
+    # N 轮。路径二一个入口对多个条目，部分成功部分失败时既留下 messages 行也留下失败行
+    for chat_id, msg_id in pending_keys:
+        db.delete_failure(chat_id, msg_id)
+        print(f"  同时清除失败账: chat={chat_id} msg_id={msg_id}")
 
     # 回退 checkpoint：确保下次扫描会重新处理这些消息
     print()

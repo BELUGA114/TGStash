@@ -50,10 +50,25 @@ def _item(media_msg, entry_msg, route=ROUTE_FORWARD, link=None):
     )
 
 
+def _upload(item, sha256, size):
+    """
+    待上传条目桩。kind/media 由 get_media 从媒体消息推出来，与 _plan 的做法一致。
+
+    写库不再自己 get_media 推一遍：媒体对象顺着 _PendingUpload 传下来。
+    """
+    from media_ops import get_media
+    from pipeline import _PendingUpload
+
+    kind, media = get_media(item.media)
+    return _PendingUpload(item=item, kind=kind, media=media, sha256=sha256, size=size,
+                          local_path="")
+
+
 def test_forward_path_entry_is_the_message_itself(db: ArchiveDB, pipeline):
     """路径一：入口就是接收频道那条消息，未转发则来源为 original"""
     entry = _msg(100, _chat(-1001234567890, "接收频道"), kind="video", media=_media())
-    pipeline._record_archived_media(_item(entry, entry), "a" * 64, 2048, _sent(), "正文内容")
+    pipeline._record_archived_media(
+        _upload(_item(entry, entry), "a" * 64, 2048), _sent(), "正文内容")
     row = db.search("正文内容")[0]
     assert row["source_message_id"] == 100
     assert row["source_chat_id"] == "-1001234567890"
@@ -76,7 +91,8 @@ def test_forwarded_message_records_channel_origin(db: ArchiveDB, pipeline):
     )
     entry = _msg(101, _chat(-1001234567890, "接收频道"), forward_origin=origin,
                  kind="photo", media=_media("FUID_F", file_name=None, mime_type="image/jpeg"))
-    pipeline._record_archived_media(_item(entry, entry), "c" * 64, 512, _sent(), "转发的内容")
+    pipeline._record_archived_media(
+        _upload(_item(entry, entry), "c" * 64, 512), _sent(), "转发的内容")
     row = db.search("某个公开频道")[0]
     assert row["source_message_id"] == 101
     assert row["origin_chat_id"] == "-1001111111111"
@@ -96,7 +112,7 @@ def test_link_path_entry_is_the_link_message_not_the_source(db: ArchiveDB, pipel
     source = _msg(42, _chat(-1009999999999, "私有频道"),
                   kind="video", media=_media("FUID_L"))
     pipeline._record_archived_media(
-        _item(source, entry, ROUTE_LINK), "b" * 64, 1024, _sent(), "链接来的内容",
+        _upload(_item(source, entry, ROUTE_LINK), "b" * 64, 1024), _sent(), "链接来的内容",
     )
     row = db.search("链接来的内容")[0]
     # 入口 = 接收频道的链接消息

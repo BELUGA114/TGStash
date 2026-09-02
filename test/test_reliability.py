@@ -94,8 +94,8 @@ class TestFailures:
         db.increment_failure("-100123", 41, "download", "e")
         db.increment_failure("-100123", 42, "download", "e")
         db.mark_failure_skipped("-100123", 42, "skip")
-        pending = db.pending_failures()
-        assert pending == ["-100123:41"]
+        # 返回复合键本身（入口 chat_id, 入口 message_id），调用方不必再 split
+        assert db.pending_failures() == {("-100123", 41)}
 
 
 def _stub_message(message_id, chat_id=-1001234567890, caption=None, text=None):
@@ -223,7 +223,7 @@ class TestFailureKeyedByEntry:
 
         assert result == "retry"
         assert db.get_failure("-1001234567890", 300) is not None
-        assert db.pending_failures() == ["-1001234567890:300"]
+        assert db.pending_failures() == {("-1001234567890", 300)}
 
     def test_link_path_alert_goes_to_entry_channel(self, db: ArchiveDB):
         """缺陷三回归：告警发到入口所在频道，不是源频道"""
@@ -270,12 +270,12 @@ class TestArchiveOneFailure:
 class TestGroupSettled:
     def test_pending_failure_blocks(self):
         """组内有未满 N 轮的失败：未结清"""
-        ctx = _ctx(SimpleNamespace(pending_failures=lambda: ["-1001234567890:41"]))
+        ctx = _ctx(SimpleNamespace(pending_failures=lambda: {("-1001234567890", 41)}))
         assert listener._group_settled(ctx, [_stub_message(41), _stub_message(42)]) is False
 
     def test_no_pending_failure_settles(self):
         """组内无未满 N 轮的失败：已结清"""
-        ctx = _ctx(SimpleNamespace(pending_failures=list))
+        ctx = _ctx(SimpleNamespace(pending_failures=set))
         assert listener._group_settled(ctx, [_stub_message(41), _stub_message(42)]) is True
 
 
@@ -375,7 +375,7 @@ class TestScanOnceCheckpoint:
             SimpleNamespace(
                 get_checkpoint=lambda c: 0,
                 set_checkpoint=lambda c, m: set_calls.append(m),
-                pending_failures=lambda: ["-1001234567890:41"],
+                pending_failures=lambda: {("-1001234567890", 41)},
             ),
             client=_fake_app([group[0], tail], group),
             pipeline=SimpleNamespace(archive_batch=fake_archive_batch),
@@ -398,7 +398,7 @@ class TestScanOnceCheckpoint:
             SimpleNamespace(
                 get_checkpoint=lambda c: 0,
                 set_checkpoint=lambda c, m: set_calls.append(m),
-                pending_failures=list,
+                pending_failures=set,
             ),
             client=_fake_app([group[0], group[1], tail], group),
             pipeline=SimpleNamespace(archive_batch=fake_archive_batch),
@@ -555,3 +555,103 @@ class TestArchiveGroupOutcomes:
         row = db.get_failure("-1001234567890", 41)
         assert row is not None and row["attempt_count"] == 1
         assert row["failure_stage"] == "process"
+
+
+def _history(messages, yielded=None):
+    """假 get_chat_history：按序吐消息，顺带记下实际吐了哪些 id。"""
+    async def get_chat_history(chat_id, min_id=0, reverse=False):
+        for m in messages:
+            if yielded is not None:
+                yielded.append(m.id)
+            yield m
+
+    return get_chat_history
+
+
+class TestScanOnceEntryBoundary:
+    """
+    入口级异常边界。
+
+    _handle_entry 里 get_media_group / _settle_all 这些调用在管道之外，管道自己的
+    兜底 except 管不到它们。修复前这些异常一路冒到 main() 的兜底：不记
+    archive_failures、不告警、也没有满 N 轮跳过 —— 一个持续失败的入口就是每轮炸一次、
+    checkpoint 永远停在那里，而且本轮后面的消息全都不处理。
+    """
+
+    def _ctx_with_raising_group(self, db, error, alerts, messages):
+        client = SimpleNamespace(
+            get_chat_history=_history(messages),
+            get_media_group=self._raiser(error),
+            send_message=_sender(alerts).send_message,
+        )
+        return _ctx(db, client=client)
+
+    @staticmethod
+    def _raiser(error):
+        async def get_media_group(chat_id, message_id):
+            raise error
+
+        return get_media_group
+
+    def test_entry_exception_lands_in_failure_ledger(self, db: ArchiveDB):
+        db.ensure_channel(-1001234567890, "manual_forward")
+        alerts = []
+        ctx = self._ctx_with_raising_group(
+            db, ValueError("媒体组取不到"), alerts,
+            [_group_message(41), _stub_message(42)])
+
+        asyncio.run(listener.scan_once(ctx))
+
+        row = db.get_failure("-1001234567890", 41)
+        assert row is not None, "入口级异常必须进 archive_failures"
+        assert row["failure_stage"] == "process"
+        assert "媒体组取不到" in row["last_error"]
+        assert row["attempt_count"] == 1
+        assert alerts, "首次失败要在接收频道回复告警"
+        # 未结清 → 不推进，且本轮就此停下（42 不该被处理）
+        assert db.get_checkpoint(-1001234567890) == 0
+
+    def test_entry_exception_skips_after_max_attempts(self, db: ArchiveDB):
+        """满 N 轮后标 skipped 并放行 checkpoint —— 否则这个入口永久卡住整个扫描"""
+        db.ensure_channel(-1001234567890, "manual_forward")
+        for _ in range(listener.RETRY_MAX_ATTEMPTS - 1):
+            db.increment_failure("-1001234567890", 41, "process", "上几轮也失败")
+        ctx = self._ctx_with_raising_group(
+            db, ValueError("还是取不到"), [], [_group_message(41)])
+
+        asyncio.run(listener.scan_once(ctx))
+
+        row = db.get_failure("-1001234567890", 41)
+        assert row["status"] == "skipped"
+        assert db.get_checkpoint(-1001234567890) == 41
+
+    def test_empty_message_exception_still_gets_an_error_text(self, db: ArchiveDB):
+        """无参异常的 str() 是空串，last_error 不能因此变空（只剩 stage 可查）"""
+        db.ensure_channel(-1001234567890, "manual_forward")
+        ctx = self._ctx_with_raising_group(
+            db, AssertionError(), [], [_group_message(41)])
+
+        asyncio.run(listener.scan_once(ctx))
+
+        assert db.get_failure("-1001234567890", 41)["last_error"] == "AssertionError()"
+
+
+class TestScanOnceHistoryBound:
+    def test_stops_pulling_after_batch_size(self):
+        """
+        攒够 BATCH_SIZE 就停止拉取历史，多收一条只为知道后面还有。
+
+        修复前是「先把 checkpoint 之后的全部消息拉进 list 再切片」：积压几千条时，
+        每 SCAN_INTERVAL_SECONDS 一轮都要把整段历史重扫一遍（get_chat_history
+        每 100 条一次请求），只为推进 BATCH_SIZE 条 —— 与项目自身的风控取向相反。
+        """
+        yielded = []
+        messages = [_stub_message(i) for i in range(100, 160)]
+        ctx = _ctx(
+            SimpleNamespace(get_checkpoint=lambda c: 0,
+                            set_checkpoint=lambda c, m: None),
+            client=SimpleNamespace(get_chat_history=_history(messages, yielded)),
+        )
+
+        assert asyncio.run(listener.scan_once(ctx)) == 0  # 全是非媒体消息
+        assert len(yielded) <= listener.BATCH_SIZE + 1, f"多拉了 {len(yielded)} 条"

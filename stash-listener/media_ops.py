@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+from typing import Literal, get_args
 
 from PIL import Image
 
@@ -20,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 MIN_PLAUSIBLE_SIZE = 1024  # 1KB；网络中断留下的文件通常离谱地小或是 0 字节
 
-MEDIA_ATTRS = ("document", "video", "photo", "audio", "animation", "voice", "video_note")
+# 媒体类型的取值表。pipeline.MEDIA_KINDS 按这份取值给出每种类型的上传形状，
+# test_pipeline.py 的 test_media_kind_vocabulary_matches 盯着两边一致
+MediaKind = Literal["document", "video", "photo", "audio", "animation", "voice", "video_note"]
+
+# get_media 的检测顺序 = Literal 的声明顺序。从 MediaKind 推导而不是再抄一遍：
+# 同一份取值写两处，加类型时必然漏一边
+MEDIA_ATTRS: tuple[MediaKind, ...] = get_args(MediaKind)
 
 
 def get_media(message):

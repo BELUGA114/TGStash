@@ -11,6 +11,7 @@
 
 media_ops 一律用模块限定调用（media_ops.probe_video(...)），不用 from-import：
 测试要能 monkeypatch media_ops 上的函数而不必知道是谁在调用它。
+（`MediaKind` 是类型别名，不是可替换的函数，所以按名字 import 不违反这条。）
 """
 
 from __future__ import annotations
@@ -20,12 +21,13 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import media_ops
 from archive_entry import ROUTE_FORWARD, ArchiveItem, Outcome
 from compress_video import maybe_compress_video
 from db import ArchiveDB
+from media_ops import MediaKind
 from origin import normalize_origin, origin_from_link
 from pyrogram.client import Client
 from pyrogram.errors import PhotoExtInvalid
@@ -39,29 +41,55 @@ from pyrogram.types import (
 
 logger = logging.getLogger(__name__)
 
-# 各媒体类型对应的发送方法名 / 媒体组 InputMedia 类
-SEND_METHOD = {
-    "document": "send_document",
-    "video": "send_video",
-    "photo": "send_photo",
-    "audio": "send_audio",
-    "animation": "send_animation",
-    "voice": "send_voice",
-    "video_note": "send_video_note",
+
+class MediaFile(Protocol):
+    """
+    Pyrogram 的 Document / Video / Photo / ... 没有公共基类，但它们都有 file_unique_id。
+
+    只标这一个必需属性：其余（file_name / mime_type / file_size / duration ...）各类型
+    有无不一，一律 getattr 带默认值取。标成 object 会让 file_unique_id 也取不到，
+    标成 Any 等于什么都不检查。
+    """
+
+    file_unique_id: str
+
+
+@dataclass(frozen=True)
+class MediaKindSpec:
+    """
+    一种媒体类型的上传形状。
+
+    这四件事以前分散在 SEND_METHOD / INPUT_MEDIA_CLASS / CAPTIONLESS_KINDS 三张表
+    加若干处 `kind == "video"` 里，加一种类型要同时想起四个地方，漏一个不会有任何
+    静态错误 —— video_note 的 caption 缺陷就是这么来的。现在一种类型一行。
+    """
+
+    # Client 上的发送方法名，单条上传用
+    send_method: str
+    # send_media_group 用的 InputMedia 类；None 表示不能编组，只能单发
+    input_media: type | None = None
+    # send_* 是否接受 caption。send_video_note 是唯一不接受的 —— Telegram 的圆形视频
+    # 在协议层就没有 caption 字段，不是 Pyrogram 的疏漏。文字仍写进 messages.caption
+    # （进 FTS，搜得到），只是备份频道那条消息上看不到
+    accepts_caption: bool = True
+    # 是否走 _prepare_video（压缩 / ffprobe / 缩略图）并按视频形状上传
+    # （duration / width / height / thumb）。video_note 今天是 False，于是它拿不到
+    # duration 与 length —— 见 CLAUDE.md 里记的已知限制。要修就从这一行开始，
+    # 但 send_video_note 不接受 width/height，届时这个标志要拆成两个
+    video_meta: bool = False
+
+
+# 取值表以 media_ops.MediaKind 为准，test_pipeline.py 的
+# test_media_kind_vocabulary_matches 盯着两边一致
+MEDIA_KINDS: dict[MediaKind, MediaKindSpec] = {
+    "document": MediaKindSpec("send_document", InputMediaDocument),
+    "video": MediaKindSpec("send_video", InputMediaVideo, video_meta=True),
+    "photo": MediaKindSpec("send_photo", InputMediaPhoto),
+    "audio": MediaKindSpec("send_audio", InputMediaAudio),
+    "animation": MediaKindSpec("send_animation"),
+    "voice": MediaKindSpec("send_voice"),
+    "video_note": MediaKindSpec("send_video_note", accepts_caption=False),
 }
-# send_media_group 只支持这四种类型，voice/video_note/animation 不能编组
-INPUT_MEDIA_CLASS = {
-    "document": InputMediaDocument,
-    "video": InputMediaVideo,
-    "photo": InputMediaPhoto,
-    "audio": InputMediaAudio,
-}
-# send_video_note 是唯一不接受 caption 的 send_* 方法 —— Telegram 的圆形视频在协议层
-# 就没有 caption 字段，不是 Pyrogram 的疏漏。文字仍会写进 messages.caption（进 FTS，
-# 搜得到），只是备份频道那条消息上看不到。
-# test/test_pipeline.py 的 test_send_method_kwargs_match_pyrogram_signatures
-# 拿真实签名对账盯着这个集合：假 client 接受任意关键字，行为用例盖不住这类缺陷
-CAPTIONLESS_KINDS = frozenset({"video_note"})
 
 # 标记回调：(媒体消息, 是否去重命中) -> None。listener 注入，pipeline 不管它怎么发
 MarkProcessed = Callable[[Message, bool], Awaitable[None]]
@@ -72,15 +100,17 @@ class PipelineConfig:
     """
     今天散在 listener 模块级的那些常量。测试里想关掉冷却就传 0。
 
-    构造时必填的三个值（冷却、压缩阈值、CRF）没有默认值：生产由 listener 从环境变量
-    读出后显式传入，那里才是唯一的真相。测试的默认值由 conftest 的 make_pipeline 提供。
-    （别把这三个叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
-    UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS，后两个压缩参数只是调参。）
+    构造时必填的四个值（冷却、压缩阈值、CRF、编码线程数）没有默认值：生产由 listener
+    从环境变量读出后显式传入，那里才是唯一的真相。测试的默认值由 conftest 的
+    make_pipeline 提供。
+    （别把这几个叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
+    UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS，后三个压缩参数只是调参。）
     """
 
     upload_cooldown_seconds: int
     video_compress_min_size_mb: int
     video_compress_crf: int
+    video_compress_threads: int
     min_plausible_size: int = media_ops.MIN_PLAUSIBLE_SIZE
     video_compress_enabled: bool = False
 
@@ -90,10 +120,10 @@ class _DownloadTask:
     """阶段一产出、阶段二三消费。取代原先 5 元素的 tuple。"""
 
     item: ArchiveItem
-    kind: str
+    kind: MediaKind
     msg_dir: str      # 回退下载的落点；tdl 命中 batch_dir 时阶段三会 rmdir 掉
     dl_name: str
-    media: object     # Pyrogram 媒体对象，没有公共基类可标
+    media: MediaFile
 
 
 @dataclass
@@ -101,7 +131,11 @@ class _PendingUpload:
     """阶段三产出、阶段四消费的待上传条目。取代原先 9 元素的 tuple。"""
 
     item: ArchiveItem
-    kind: str
+    kind: MediaKind
+    # 媒体对象顺着条目一起传下来。写库时别再 get_media(item.media) 推一遍：
+    # 重新推导除了多一次遍历，还要在结果上 assert 非空，等于把「已经知道的事」
+    # 又变成一次运行期断言
+    media: MediaFile
     sha256: str
     size: int
     local_path: str
@@ -121,7 +155,7 @@ class _ItemResult(NamedTuple):
 
     pending: _PendingUpload | None   # 可以上传了
     outcome: Outcome | None          # 已有确定结论（校验失败 / 去重命中），不必上传
-    groupable: bool = False          # kind in INPUT_MEDIA_CLASS，决定上传形状
+    groupable: bool = False          # 该类型能进 send_media_group，决定上传形状
     duplicate: bool = False          # SHA-256 命中 —— 调用方要按「重复」打标记
 
 
@@ -145,7 +179,7 @@ def sender_name(message: Message) -> str:
     return ""
 
 
-def _file_identity(kind: str, media: object) -> dict:
+def _file_identity(kind: MediaKind, media: MediaFile) -> dict:
     """files 表的文件身份三件套。Photo 类型没有 file_name / mime_type，取不到就是 None。"""
     return {
         "file_name": getattr(media, "file_name", None),
@@ -178,14 +212,24 @@ def _safe_dl_name(raw: str | None) -> str | None:
 
 
 def _cleanup_temp_files(temp_files: list[str]) -> None:
-    """删除临时文件，并尽力清理其所在的空目录。"""
+    """
+    删除临时文件，并尽力清理其所在的空目录。
+
+    单个文件删不掉不能中断整轮清理，也不能让异常冒出去：这个函数只在 finally 里被调用，
+    从那里抛出的异常会顶掉已经算好的 Outcome，并绕过 listener 的失败记账与熔断。
+    """
     for path in temp_files:
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            continue
+        try:
             os.remove(path)
-            try:
-                os.rmdir(os.path.dirname(path))
-            except OSError:
-                pass
+        except OSError:
+            logger.warning("临时文件删除失败，留待下次：%s", path, exc_info=True)
+            continue
+        try:
+            os.rmdir(os.path.dirname(path))
+        except OSError:
+            pass
 
 
 def _collect_captions(items: list[ArchiveItem]) -> list[str]:
@@ -212,14 +256,11 @@ def _first_unconcluded_failure(items: list[ArchiveItem], outcomes: list[Outcome]
 
     与整组上传失败的既有约定一致：一次故障只产出一条结论。路径一的媒体组里
     每条媒体各是自己的入口，给每条都产结论会变成 N 条告警。全都有结论了就不补。
-
-    error 一律 `str(e) or repr(e)`：无参异常（尤其 assert 失败）的 str 是空串，
-    直接落库会让 last_error 为空、告警文案里「最近错误」一片空白，只剩 stage 可查。
     """
     concluded = {o.item.media.id for o in outcomes}
     for it in items:
         if it.media.id not in concluded:
-            return Outcome.failure(it, "process", str(error) or repr(error))
+            return Outcome.failure(it, "process", error)
     return None
 
 
@@ -256,7 +297,8 @@ class ArchivePipeline:
         """入口所在频道。入口恒来自接收频道，chat 缺失时兜底到 receive_chat。"""
         return entry.chat_id or str(self._receive_chat)
 
-    def _record_dedup_file(self, item: ArchiveItem, sha256: str, size: int, dup) -> None:
+    def _record_dedup_file(self, item: ArchiveItem, kind: MediaKind, media: MediaFile,
+                           sha256: str, size: int, dup) -> None:
         """
         SHA-256 去重命中：文件已在备份频道，只补一条指向它的 files 记录。
 
@@ -264,8 +306,6 @@ class ArchivePipeline:
         否则去重命中的行会永久缺 file_name/mime_type/media_kind，而且回填脚本救不了：
         它按 messages.origin_type IS NULL 选行，这些行没有对应的 messages 记录。
         """
-        kind, media = media_ops.get_media(item.media)
-        assert kind is not None and media is not None
         self._db.record_file(
             file_unique_id=media.file_unique_id,
             sha256=sha256,
@@ -278,54 +318,50 @@ class ArchivePipeline:
         )
 
     def _record_archived_media(
-        self, item: ArchiveItem, sha256: str, size: int, sent: Message, caption: str,
+        self, upload: _PendingUpload, sent: Message, caption: str,
     ) -> None:
         """
-        记录已上传文件及其来源消息。
+        记录已上传文件及其来源消息 —— files 与 messages 一个事务写完。
 
         入口（item.entry）落到 messages.source_* 与 files.source，delete_message.py
         靠前者回退 checkpoint；来源（item.media）落到 origin_*。两者混用会让路径二的
         记录落在错误的 id 空间 —— 源频道的消息 id 被当成接收频道的 id 去回退 checkpoint。
+
+        走 record_archived 而不是 record_file + record_message：两次调用是两个事务，
+        第二次失败会留下「files 有行、messages 没行」的库，而下轮重试会因为
+        file_unique_id 命中被当成去重跳过，那条 messages 永远补不上。
         """
         assert sent.id is not None
-        kind, media = media_ops.get_media(item.media)
-        assert kind is not None and media is not None
+        item = upload.item
         entry = item.entry
         entry_chat = self._entry_chat(entry)
-        identity = _file_identity(kind, media)
+        identity = _file_identity(upload.kind, upload.media)
         origin = (normalize_origin(item.media) if entry.route == ROUTE_FORWARD
                   else origin_from_link(item.media))
 
-        self._db.record_file(
-            file_unique_id=media.file_unique_id,
-            sha256=sha256,
-            size=size,
-            archived_chat_id=self._archive_chat,
-            archived_message_id=sent.id,
+        self._db.record_archived(
+            file_unique_id=upload.media.file_unique_id,
+            sha256=upload.sha256,
+            size=upload.size,
             source=entry.route,
             source_channel=entry_chat,
-            **identity,
-        )
-        self._db.record_message(
+            archived_chat_id=self._archive_chat,
+            archived_message_id=sent.id,
             source_chat_id=entry_chat,
             source_message_id=entry.message_id,
             source_channel_title=entry.chat_title,
             sender=sender_name(item.media),
             sent_at=item.media.date.isoformat() if item.media.date else None,
             caption=caption,
-            file_unique_id=media.file_unique_id,
             media_group_id=item.media.media_group_id,
-            archived_chat_id=self._archive_chat,
-            archived_message_id=sent.id,
-            file_name=identity["file_name"],
-            media_kind=kind,
+            **identity,
             **origin,
         )
 
     async def _prepare_video(
         self,
         local_path: str,
-        media: object,
+        media: MediaFile,
         temp_files: list[str],
         message_id: int,
     ) -> tuple[str, str | None, dict]:
@@ -340,6 +376,7 @@ class ArchivePipeline:
                 self._config.video_compress_crf,
                 # 媒体组整组文件同在 batch_dir，产物名必须按消息 id 区分，否则互相覆盖
                 tag=message_id,
+                threads=self._config.video_compress_threads,
             )
 
         logger.debug("ffprobe 探测 %s ...", message_id)
@@ -377,7 +414,7 @@ class ArchivePipeline:
     async def _send_media(
         self,
         local_path: str,
-        kind: str,
+        kind: MediaKind,
         caption: str,
         *,
         thumb_path: str | None = None,
@@ -386,36 +423,35 @@ class ArchivePipeline:
         """
         上传单个媒体；照片格式不被 Telegram 接受时回退为 document。
 
+        方法名与关键字全部由 MEDIA_KINDS 那一行决定，这里不再有 `kind == "video"`：
+        新增类型只改表。
+
         meta 必填：唯一的调用方 _upload_one 恒从 _PendingUpload.meta 取，
         那个字段恒为 dict（非视频是空 dict）。
         """
-        if kind == "video":
-            sent = await self._client.send_video(
-                self._archive_chat,
-                local_path,
-                duration=meta["duration"],
-                width=meta["width"],
-                height=meta["height"],
-                thumb=thumb_path,  # type: ignore[arg-type]
-                caption=caption,
-            )
-        else:
-            send = getattr(self._client, SEND_METHOD[kind])
-            # 不接受 caption 的类型不能传这个关键字（传了就是 TypeError）
-            caption_kwargs: dict = {}
-            if kind in CAPTIONLESS_KINDS:
-                if caption:
-                    logger.warning("%s 不支持 caption，文字只留在 DB 里（FTS 仍可搜到）", kind)
-            else:
-                caption_kwargs["caption"] = caption
-            try:
-                sent = await send(self._archive_chat, local_path, **caption_kwargs)
-            except PhotoExtInvalid:
-                logger.debug("PhotoExtInvalid，回退 send_document")
-                sent = await self._client.send_document(
-                    self._archive_chat, local_path, caption=caption)
+        spec = MEDIA_KINDS[kind]
+        send = getattr(self._client, spec.send_method)
 
-        return sent
+        kwargs: dict = {}
+        if spec.accepts_caption:
+            kwargs["caption"] = caption
+        elif caption:
+            # 不接受 caption 的类型不能传这个关键字（传了就是 TypeError）
+            logger.warning("%s 不支持 caption，文字只留在 DB 里（FTS 仍可搜到）", kind)
+        if spec.video_meta:
+            kwargs |= {
+                "duration": meta["duration"],
+                "width": meta["width"],
+                "height": meta["height"],
+                "thumb": thumb_path,
+            }
+
+        try:
+            return await send(self._archive_chat, local_path, **kwargs)
+        except PhotoExtInvalid:
+            logger.debug("PhotoExtInvalid，回退 send_document")
+            return await self._client.send_document(
+                self._archive_chat, local_path, caption=caption)
 
     async def _prepare_item(self, task: _DownloadTask, local_path: str,
                             temp_files: list[str]) -> _ItemResult:
@@ -444,15 +480,19 @@ class ArchivePipeline:
                 min_size=self._config.min_plausible_size)
         except RuntimeError as e:
             logger.warning("文件校验失败 %s，记录待重试", message.id)
-            return _ItemResult(pending=None, outcome=Outcome.failure(it, "verify", str(e)))
+            return _ItemResult(pending=None, outcome=Outcome.failure(it, "verify", e))
         logger.debug("校验通过 %s", message.id)
 
-        sha256 = media_ops.sha256_of_file(local_path)
+        # 整文件哈希与图片转码都是同步的重活，必须丢线程池：几 GB 的视频在事件循环里
+        # 哈希会一并卡住 Pyrogram 的 ping（session.PING_INTERVAL=5s，
+        # 服务端的 disconnect_delay 是 WAIT_TIMEOUT+10=25s），慢盘上足以掉线重连。
+        # 旁边的压缩 / ffprobe / 抽帧本来就在 to_thread 里，这里的形状要一致
+        sha256 = await asyncio.to_thread(media_ops.sha256_of_file, local_path)
         size = os.path.getsize(local_path)
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
         # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
-        fixed_path = media_ops.fix_media_format(local_path, kind)
+        fixed_path = await asyncio.to_thread(media_ops.fix_media_format, local_path, kind)
         if fixed_path != local_path:
             # 追加而不是替换：fix_media_format 换路径时已经把原文件删掉/改名了，
             # 旧条目留在列表里只会在 _cleanup_temp_files 的 exists 检查上落空。
@@ -462,22 +502,23 @@ class ArchivePipeline:
 
         dup = self._db.find_by_sha256(sha256)
         if dup:
-            self._record_dedup_file(it, sha256, size, dup)
+            self._record_dedup_file(it, kind, media, sha256, size, dup)
             return _ItemResult(pending=None, outcome=Outcome.success(it), duplicate=True)
 
         # 视频：（可选）压缩 → ffprobe 探测真实元数据（三层回退） → ffmpeg 生成缩略图
+        spec = MEDIA_KINDS[kind]
         thumb_path = None
         meta: dict = {}
-        if kind == "video":
+        if spec.video_meta:
             local_path, thumb_path, meta = await self._prepare_video(
                 local_path, media, temp_files, message.id,
             )
 
         return _ItemResult(
-            pending=_PendingUpload(item=it, kind=kind, sha256=sha256, size=size,
+            pending=_PendingUpload(item=it, kind=kind, media=media, sha256=sha256, size=size,
                                    local_path=local_path, thumb_path=thumb_path, meta=meta),
             outcome=None,
-            groupable=kind in INPUT_MEDIA_CLASS,
+            groupable=spec.input_media is not None,
         )
 
     async def _upload_one(self, upload: _PendingUpload, caption: str) -> Outcome:
@@ -494,10 +535,10 @@ class ArchivePipeline:
                 thumb_path=upload.thumb_path, meta=upload.meta)
         except Exception as e:
             logger.warning("上传 %s %s 失败，记录待重试", upload.kind, message.id, exc_info=True)
-            return Outcome.failure(upload.item, "upload", str(e) or repr(e))
+            return Outcome.failure(upload.item, "upload", e)
 
         assert sent is not None and sent.id is not None
-        self._record_archived_media(upload.item, upload.sha256, upload.size, sent, caption)
+        self._record_archived_media(upload, sent, caption)
         logger.info("归档 %s (%s)", message.id, upload.kind)
         return Outcome.success(upload.item)
 
@@ -540,7 +581,7 @@ class ArchivePipeline:
                 )
             except Exception as e:
                 logger.warning("下载 %s 失败，下轮重试", message.id)
-                return Outcome.failure(item, "download", str(e) or repr(e))
+                return Outcome.failure(item, "download", e)
             local_path = paths.get(message.id)
             if local_path is None:
                 logger.warning("下载 %s 失败，下轮重试", message.id)
@@ -564,7 +605,7 @@ class ArchivePipeline:
             await asyncio.sleep(self._config.upload_cooldown_seconds)
         except Exception as e:
             logger.warning("处理 %s 失败，下轮重试", message.id, exc_info=True)
-            return Outcome.failure(item, "process", str(e) or repr(e))
+            return Outcome.failure(item, "process", e)
         finally:
             _cleanup_temp_files(temp_files)
 
@@ -755,7 +796,8 @@ class ArchivePipeline:
         input_media = []
         for i, upload in enumerate(pending):
             caption = group_caption if i == 0 else ""
-            if upload.kind == "video":
+            spec = MEDIA_KINDS[upload.kind]
+            if spec.video_meta:
                 input_media.append(InputMediaVideo(
                     upload.local_path,
                     caption=caption,
@@ -765,9 +807,9 @@ class ArchivePipeline:
                     thumb=upload.thumb_path,
                 ))
             else:
-                input_media.append(
-                    INPUT_MEDIA_CLASS[upload.kind](upload.local_path, caption=caption)
-                )
+                # pending 里只有 groupable 的条目，input_media 必非 None
+                assert spec.input_media is not None
+                input_media.append(spec.input_media(upload.local_path, caption=caption))
 
         logger.debug("上传媒体组 %s 条 ...", len(pending))
         try:
@@ -786,13 +828,15 @@ class ArchivePipeline:
             # 整组上传失败：只有第一条产出失败结论，其余条目本轮无结论
             # （它们根本没被尝试）。给每条都产结论会让路径一变成 N 条告警
             logger.warning("媒体组上传失败，记录待重试", exc_info=True)
-            outcomes.append(Outcome.failure(pending[0].item, "upload", str(e)))
+            outcomes.append(Outcome.failure(pending[0].item, "upload", e))
             return _Uploaded(outcomes, aborted=True)
 
-        for upload, sent in zip(pending, sent_list):
-            self._record_archived_media(
-                upload.item, upload.sha256, upload.size, sent, group_caption,
-            )
+        # strict=True：sent_list 比 pending 短就抛，而不是静默漏记。少记一条等于
+        # 「文件已在备份频道、DB 里没有任何行」，而那一条也拿不到 Outcome，
+        # _settle_all 会跳过它、checkpoint 照常推进 —— 永久的去重盲区。
+        # 抛出来则由 archive_batch 的兜底记进失败账
+        for upload, sent in zip(pending, sent_list, strict=True):
+            self._record_archived_media(upload, sent, group_caption)
             outcomes.append(Outcome.success(upload.item))
         await asyncio.sleep(self._config.upload_cooldown_seconds)
         logger.info("归档媒体组 %s 张", len(pending))
