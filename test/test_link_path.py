@@ -98,6 +98,21 @@ class TestParseMessageLink:
             listener.parse_message_link("https://t.me/joinchat/AbCdEf")
 
 
+class TestMarkedLinkText:
+    """归档标记跟在原文末尾，截断只砍原文。"""
+
+    def test_mark_goes_after_the_text(self):
+        assert listener.marked_link_text("https://t.me/c/1/2") == (
+            "https://t.me/c/1/2\n✅ 已归档")
+
+    def test_long_text_keeps_the_mark(self):
+        """整条 [:4096] 砍掉的正好是末尾那行标记，入口会看着像没归档"""
+        marked = listener.marked_link_text("补" * 5000)
+
+        assert len(marked) == 4096
+        assert marked.endswith("\n✅ 已归档")
+
+
 def _link_msg(text, *, msg_id=300, chat_id=-1001234567890):
     """接收频道里那条链接消息 —— 入口。"""
     return SimpleNamespace(id=msg_id, chat=SimpleNamespace(id=chat_id, title="接收频道"),
@@ -311,7 +326,7 @@ class TestProcessLinkMessage:
 
         assert [o.ok for o in outcomes] == [True]
         assert client.edits == [
-            (-1001234567890, 300, "✅ 已归档\nhttps://t.me/c/123456/78")]
+            (-1001234567890, 300, "https://t.me/c/123456/78\n✅ 已归档")]
 
     def test_no_ok_outcome_means_no_edit(self):
         client = FakeLinkClient(messages={78: _source_msg(78)})
@@ -332,13 +347,14 @@ class TestProcessLinkMessage:
         assert len(client.edits) == 1
 
     def test_edit_text_is_truncated_to_4096(self):
-        """Telegram 的文本上限 4096，超了整条编辑会被拒"""
+        """Telegram 的文本上限 4096，超了整条编辑会被拒；标记不能被截掉"""
         client = FakeLinkClient(messages={78: _source_msg(78)})
 
         _, outcomes = _run(client, "https://t.me/c/123456/78 " + "补" * 5000)
 
         assert [o.ok for o in outcomes] == [True]
         assert len(client.edits[0][2]) == 4096
+        assert client.edits[0][2].endswith("\n✅ 已归档")
 
 
 class TestEntryText:
