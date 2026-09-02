@@ -9,6 +9,7 @@ import asyncio
 from types import SimpleNamespace
 
 import listener
+import pytest
 from archive_entry import ROUTE_LINK, Entry, Outcome
 
 
@@ -60,6 +61,41 @@ class TestExtractTmeLinks:
     def test_strips_bracket_and_angle_wrappers(self):
         assert listener.extract_tme_links("<https://t.me/a/1>") == ["https://t.me/a/1"]
         assert listener.extract_tme_links("[https://t.me/a/1]") == ["https://t.me/a/1"]
+
+
+class TestParseMessageLink:
+    """
+    私有频道链接解析出的 chat 必须是 int，公开频道必须留 "@username" 字符串。
+
+    Kurigram 的 resolve_peer 对字符串 peer 先剥掉 `+()-` 与空白再 isdigit()：
+    "-1002680051096" 剥成 "1002680051096" 全是数字，于是被当电话号码送去
+    contacts.ResolvePhone，每条 /c/ 链接都死在 PHONE_NOT_OCCUPIED
+    （resolve_peer.py:106-119）。int 走的是另一条分支：storage 查不到就用
+    channels.GetChannels 补 access_hash，取不到才 PeerIdInvalid。
+    """
+
+    def test_private_channel_chat_is_int(self):
+        assert listener.parse_message_link("https://t.me/c/2680051096/413") == (
+            -1002680051096, 413)
+
+    def test_private_channel_chat_is_not_str(self):
+        chat, _ = listener.parse_message_link("https://t.me/c/123456/78")
+        assert isinstance(chat, int), "字符串 chat 会被 resolve_peer 当成电话号码"
+
+    def test_username_chat_stays_str(self):
+        """公开频道靠用户名解析，int 化没有意义"""
+        assert listener.parse_message_link("https://t.me/somechannel/12") == (
+            "@somechannel", 12)
+
+    def test_query_string_and_trailing_slash_are_stripped(self):
+        assert listener.parse_message_link("https://t.me/c/123456/78?single") == (
+            -100123456, 78)
+        assert listener.parse_message_link("https://t.me/somechannel/12/") == (
+            "@somechannel", 12)
+
+    def test_unparseable_link_raises(self):
+        with pytest.raises(ValueError):
+            listener.parse_message_link("https://t.me/joinchat/AbCdEf")
 
 
 def _link_msg(text, *, msg_id=300, chat_id=-1001234567890):
@@ -168,6 +204,22 @@ class TestProcessLinkMessage:
 
         assert outcomes == []
         assert client.get_calls == []
+
+    def test_client_gets_int_chat_for_private_channel_link(self):
+        """
+        两个取消息的调用点都必须收到 int chat —— 路径二线上全军覆没的那个缺陷。
+
+        字符串 "-100..." 会被 Kurigram 的 resolve_peer 当成电话号码
+        （contacts.ResolvePhone → PHONE_NOT_OCCUPIED），每条 /c/ 链接反复失败
+        三轮后被跳过，媒体永久不归档。
+        """
+        target = _source_msg(413, group="g1")
+        client = FakeLinkClient(messages={413: target}, group=[target])
+
+        _run(client, "https://t.me/c/2680051096/413")
+
+        assert client.get_calls == [(-1002680051096, 413)]
+        assert client.group_calls == [(-1002680051096, 413)]
 
     def test_get_messages_failure_is_download_failure_on_entry_message(self):
         """取消息失败是暂时性失败：产出 failure('download')，条目的 media 是入口消息本身"""
