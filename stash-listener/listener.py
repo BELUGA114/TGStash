@@ -15,7 +15,7 @@
   3. Pyrogram get_messages() 获取消息（你是成员，可直接下载）
   4. 媒体组 → get_media_group() 整组处理；单条 → archive_single()
   5. 复用路径一的 file_unique_id/SHA-256 双层去重 → 上传 → 写 DB
-  6. 原消息编辑为 "✅ 已归档"
+  6. 原消息文本末尾追加 "✅ 已归档"
 """
 
 import asyncio
@@ -186,6 +186,22 @@ def entry_text(message: Message) -> str:
     于是 _settle_all([]) 按全成功结清、checkpoint 静默推过，那条媒体永远不归档。
     """
     return message.text or message.caption or ""
+
+
+# Telegram 单条文本上限 4096（按字符算，与现有截断口径一致），超了整条编辑会被拒
+TELEGRAM_TEXT_LIMIT = 4096
+LINK_ARCHIVED_MARK = "✅ 已归档"
+
+
+def marked_link_text(text: str) -> str:
+    """
+    链接入口归档后的新文本：原文在上，标记跟在末尾。
+
+    截断只砍原文、留住标记。写成 `f"{text}\\n{MARK}"[:4096]` 时，长文本上砍掉的
+    正好是末尾那行标记 —— 入口看着像没归档，下次人工核对会以为漏了。
+    """
+    suffix = f"\n{LINK_ARCHIVED_MARK}"
+    return text[:TELEGRAM_TEXT_LIMIT - len(suffix)] + suffix
 
 
 def parse_message_link(link: str) -> tuple[int | str, int]:
@@ -395,7 +411,7 @@ async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outco
     if any(o.ok for o in outcomes) and entry.chat_id is not None:
         try:
             await ctx.client.edit_message_text(
-                int(entry.chat_id), entry.message_id, f"✅ 已归档\n{text}"[:4096])
+                int(entry.chat_id), entry.message_id, marked_link_text(text))
         except Exception:
             logger.warning("编辑链接消息标记失败（已归档结果不受影响）：%s",
                            entry.message_id, exc_info=True)
