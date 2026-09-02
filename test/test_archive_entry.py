@@ -56,7 +56,7 @@ class TestArchiveItem:
         assert item.media.id == 42
         assert item.entry.message_id == 300
         assert item.entry.route == ROUTE_LINK
-        assert item.link.endswith("/42")
+        assert item.link is not None and item.link.endswith("/42")
 
 
 class TestOutcome:

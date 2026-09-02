@@ -2,3 +2,7 @@
 -r stash-listener/requirements.txt
 pytest==9.1.1
 ruff==0.16.4
+# pyright 是 npm 包的 Python 封装：优先用系统 node（CI runner 自带），找不到才自己下一个。
+# 必须钉版本 —— 它每周发版、新版会加检查，浮动版本能让 CI 在没有代码变更时变红。
+# PyPI 侧比 npm 侧慢一两个版本，升级时以 pip 装得到的为准
+pyright==1.1.411

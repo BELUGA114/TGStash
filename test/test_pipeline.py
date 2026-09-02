@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
 
 
-def msg_stub(msg_id, kind="document", *, chat_id=-1001234567890, caption="",
+def msg_stub(msg_id, kind: str | None = "document", *, chat_id=-1001234567890, caption="",
              group=None, title="接收频道", **media):
     """带一种媒体的消息桩。kind 决定 media_ops.get_media 推导出的类型；kind=None 表示无媒体。"""
     defaults = {"file_unique_id": f"U{msg_id}", "file_size": 2048}
@@ -1077,7 +1077,8 @@ def test_pipeline_config_requires_explicit_values():
     from pipeline import PipelineConfig
 
     with pytest.raises(TypeError):
-        PipelineConfig()
+        # 少传就是本用例要断言的事，pyright 的 reportCallIssue 在这一行是预期的
+        PipelineConfig()  # pyright: ignore[reportCallIssue]
 
 
 def test_media_kind_vocabulary_matches():

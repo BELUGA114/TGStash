@@ -1,4 +1,30 @@
 {
-  "reportMissingImports": "none",
-  "reportMissingModuleSource": "none"
+  // 扁平布局：stash-listener/ 与 scripts/ 不是包，靠 extraPaths 才 import 得到。
+  // pyproject.toml 里的 pythonpath 只管 pytest，pyright 不看那一处，两边要一起改
+  "include": ["stash-listener", "scripts", "test"],
+  "extraPaths": ["stash-listener", "scripts"],
+
+  // 类型解析要能找到 Kurigram / Pillow，指向仓库内的 .venv。命令行 --pythonpath
+  // 覆盖不了这两项（pyright 仍从 venv 取 site-packages），CI 因此也建 .venv
+  "venvPath": ".",
+  "venv": ".venv",
+
+  // 与生产镜像对齐（python:3.12-slim），和 ruff 的 target-version 是同一个值
+  "pythonVersion": "3.12",
+
+  // 不用 strict：strict 在这套代码上是 3000+ 个错，几乎全是 Kurigram 边界与测试
+  // 桩函数的 Unknown，噪声压过信号。standard 下全仓为 0，回归才看得见
+  "typeCheckingMode": "standard",
+
+  "executionEnvironments": [
+    {
+      // 测试拿 SimpleNamespace 结构化假对象顶 Message / Client / ArchiveDB（见
+      // test_link_path.py 头部：不连 Telegram、不碰 DB、不读环境变量），这是刻意的
+      // 设计而不是缺注解。改成 cast 只是把同一个谎抄进十几个桩工厂，还会让
+      // 「桩少给了一个字段」这类真错误被 cast 一起盖住
+      "root": "test",
+      "extraPaths": ["stash-listener", "scripts"],
+      "reportArgumentType": "none"
+    }
+  ]
 }

@@ -68,7 +68,7 @@ def _link_msg(text, *, msg_id=300, chat_id=-1001234567890):
                           text=text, caption=None, media_group_id=None)
 
 
-def _source_msg(msg_id, *, kind="document", group=None):
+def _source_msg(msg_id, *, kind: str | None = "document", group=None):
     """源频道里被链接指到的消息。kind=None 表示那条消息没有媒体。"""
     msg = SimpleNamespace(id=msg_id, chat=SimpleNamespace(id=-1009999999999, title="源频道"),
                          text="", caption="", media_group_id=group, date=None)

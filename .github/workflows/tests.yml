@@ -46,7 +46,7 @@ jobs:
         run: python -m pytest -ra
 
   lint:
-    name: ruff
+    name: ruff + pyright
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,11 +59,20 @@ jobs:
             requirements-dev.txt
             stash-listener/requirements.txt
 
-      - name: 安装依赖
+      - name: 安装依赖到 .venv
+        # 装进 .venv 而不是 runner 自带的 Python：pyrightconfig.json 里写着
+        # venvPath/venv，pyright 只从那里找 Kurigram 与 Pillow 的类型，命令行
+        # --pythonpath 覆盖不了这两项。这样 CI 跑的就是本机那两条命令
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements-dev.txt
 
       # 只做 lint，不做 ruff format：这套代码从没被格式化过，
       # 一次 format 会重排 590 多行，集中在 listener.py 上
-      - run: ruff check --output-format=github .
+      - run: .venv/bin/python -m ruff check --output-format=github .
+
+      # 基线是 0 错。standard 模式盯的是 Kurigram 边界（chat / chat.id 这类
+      # Optional）和升级 Kurigram 时的签名漂移，去重与 checkpoint 那些运行期
+      # 不变量它管不了，仍然由 pytest 负责
+      - run: .venv/bin/python -m pyright
