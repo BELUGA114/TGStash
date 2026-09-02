@@ -747,3 +747,67 @@ class TestBackfillQueries:
         db.update_message_metadata(row_id, origin_title="某个公开频道",
                                    origin_type="channel")
         assert len(db.search("某个公开频道")) == 1
+
+
+# ═══════════════════════════════════════════
+# files + messages 原子写
+# ═══════════════════════════════════════════
+
+
+class TestRecordArchived:
+    """归档成功后的写入口：两张表必须在同一个事务里落地。"""
+
+    def _archive(self, db: ArchiveDB, **overrides):
+        fields = {
+            "file_unique_id": "FUID_ATOMIC", "sha256": "a" * 64, "size": 2048,
+            "source": "manual_forward", "source_channel": "-1001234567890",
+            "file_name": "猫.mp4", "mime_type": "video/mp4", "media_kind": "video",
+            "archived_chat_id": "-1009876543210", "archived_message_id": 555,
+            "source_chat_id": "-1001234567890", "source_message_id": 100,
+            "source_channel_title": "接收频道", "sender": "tester",
+            "sent_at": "2026-01-01T12:00:00+00:00", "caption": "原子写测试内容",
+            "media_group_id": None, "origin_chat_id": "-1001111111111",
+            "origin_message_id": 42, "origin_title": "某频道", "origin_type": "channel",
+        }
+        fields.update(overrides)
+        db.record_archived(**fields)
+
+    def test_writes_both_tables(self, db: ArchiveDB):
+        self._archive(db)
+
+        file_row = db.find_by_unique_id("FUID_ATOMIC")
+        assert file_row["sha256"] == "a" * 64
+        assert file_row["source"] == "manual_forward"
+        assert file_row["mime_type"] == "video/mp4"
+        assert file_row["first_seen_at"] is not None
+
+        msg_row = db.search("原子写测试内容")[0]
+        assert msg_row["source_message_id"] == 100
+        assert msg_row["origin_type"] == "channel"
+        # file_name / media_kind 冗余进 messages 供 FTS 与类型过滤用
+        assert msg_row["file_name"] == "猫.mp4"
+        assert msg_row["media_kind"] == "video"
+        assert msg_row["created_at"] is not None
+
+    def test_second_insert_failure_rolls_back_the_files_row(self, db: ArchiveDB,
+                                                            monkeypatch):
+        """
+        messages 写失败必须把 files 那条一起回滚。
+
+        分两次调用（两个连接、两个事务）时留下的是「files 有行、messages 没行」：
+        去重说这个文件见过、搜索里它从不存在，而回填脚本按 origin_type IS NULL 从
+        messages 选行，救不了没有 messages 行的文件。真实触发路径是第二次写本身抛
+        异常（例如另一个写者占着写锁超过 busy_timeout），下轮重试又会因为
+        file_unique_id 命中被当成去重跳过 —— 那条 messages 永远补不上。
+        """
+        import db as db_module
+
+        monkeypatch.setattr(db_module, "_MESSAGES_INSERT",
+                            "INSERT INTO messages(没有这一列) VALUES (?)")
+
+        with pytest.raises(sqlite3.OperationalError):
+            self._archive(db)
+
+        assert db.find_by_unique_id("FUID_ATOMIC") is None, "files 那条必须跟着回滚"
+        assert db.find_by_sha256("a" * 64) is None
+        assert db.search("原子写测试内容") == []

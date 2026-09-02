@@ -287,3 +287,31 @@ class TestProcessLinkMessage:
 
         assert [o.ok for o in outcomes] == [True]
         assert len(client.edits[0][2]) == 4096
+
+
+class TestEntryText:
+    """
+    「有没有链接」和「提取链接」必须读同一个字段。
+
+    检测曾经读 text or caption、提取只读 text：落进差集的入口会被判成有链接，
+    却提取出 0 条 → process_link_message 返回空 → _settle_all([]) 按全成功结清 →
+    checkpoint 静默推过，那条媒体永远不归档、也没有告警。
+    """
+
+    def _msg(self, *, text=None, caption=None):
+        return SimpleNamespace(text=text, caption=caption)
+
+    def test_detected_link_is_always_extractable(self):
+        for msg in (self._msg(text="看 https://t.me/c/1/2"),
+                    self._msg(caption="看 https://t.me/c/1/2"),
+                    self._msg(text="", caption="https://t.me/abc/9")):
+            assert listener._has_tme_link(msg) is True
+            assert listener.extract_tme_links(listener.entry_text(msg)), (
+                "检测到链接却提取不出来")
+
+    def test_no_link_detected_for_plain_text(self):
+        assert listener._has_tme_link(self._msg(text="今天天气不错")) is False
+        assert listener._has_tme_link(self._msg()) is False
+
+    def test_text_wins_over_caption(self):
+        assert listener.entry_text(self._msg(text="正文", caption="说明")) == "正文"

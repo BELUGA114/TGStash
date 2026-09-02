@@ -55,6 +55,9 @@ RETRY_MAX_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "3"))
 VIDEO_COMPRESS_ENABLED = os.environ.get("VIDEO_COMPRESS_ENABLED", "false").lower() == "true"
 VIDEO_COMPRESS_MIN_SIZE_MB = int(os.environ.get("VIDEO_COMPRESS_MIN_SIZE_MB", "100"))
 VIDEO_COMPRESS_CRF = int(os.environ.get("VIDEO_COMPRESS_CRF", "28"))
+# x264 编码线程上限。它默认按核心数×1.5 开线程，高核数机器上初始化时内存暴增可能被
+# OOM 杀死；0 表示不限制
+VIDEO_COMPRESS_THREADS = int(os.environ.get("VIDEO_COMPRESS_THREADS", "4"))
 
 # 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -69,7 +72,10 @@ logger = logging.getLogger(__name__)
 def _configure_logging() -> None:
     """日志配置属于进程启动，不属于 import。"""
     logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        # 走 getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
+        # LOG_LEVEL=debug 会取到 logging.debug 这个函数，basicConfig 直接抛
+        # TypeError（Level not an integer），服务启动即崩
+        level=logging.getLevelNamesMapping().get(LOG_LEVEL.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -139,6 +145,7 @@ def _build_context() -> ListenerContext:
             video_compress_enabled=VIDEO_COMPRESS_ENABLED,
             video_compress_min_size_mb=VIDEO_COMPRESS_MIN_SIZE_MB,
             video_compress_crf=VIDEO_COMPRESS_CRF,
+            video_compress_threads=VIDEO_COMPRESS_THREADS,
         ),
         archive_chat=archive_chat,
         receive_chat=receive_chat,
@@ -168,6 +175,17 @@ def extract_tme_links(text: str) -> list[str]:
         if link and link not in links:
             links.append(link)
     return links
+
+
+def entry_text(message: Message) -> str:
+    """
+    入口消息里承载文字的字段。
+
+    「这条消息有没有 t.me 链接」和「从它里面提取链接」必须用同一个定义：检测曾经读
+    text or caption、提取只读 text，一旦落进差集，入口会被判成有链接但提取出 0 条，
+    于是 _settle_all([]) 按全成功结清、checkpoint 静默推过，那条媒体永远不归档。
+    """
+    return message.text or message.caption or ""
 
 
 def parse_message_link(link: str) -> tuple[str, int]:
@@ -294,11 +312,10 @@ def _group_settled(ctx: ListenerContext, group: list[Message]) -> bool:
     以库里的 pending 为准而不是本轮的 Outcome：往轮残留的 'retrying' 行同样
     必须挡住推进，否则那条消息永远不会被重试。
     """
-    ids = {str(m.id) for m in group}
+    ids = {m.id for m in group}
     chat_id = (str(group[0].chat.id) if group[0].chat and group[0].chat.id
                else str(ctx.receive_chat))
-    pending = {p.split(":", 1)[1] for p in ctx.db.pending_failures()
-               if p.split(":", 1)[0] == chat_id}
+    pending = {msg_id for chat, msg_id in ctx.db.pending_failures() if chat == chat_id}
     if pending & ids:
         logger.warning("媒体组仍有 %s 条待重试，本轮不推进 checkpoint", len(pending & ids))
         return False
@@ -316,7 +333,7 @@ async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outco
     warning 不产出失败结论：重试无用，当成失败会让这条入口永久卡住 checkpoint。
     """
     message = entry.message
-    text = message.text or ""
+    text = entry_text(message)
     links = extract_tme_links(text)
 
     outcomes: list[Outcome] = []
@@ -332,7 +349,7 @@ async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outco
         except Exception as e:
             logger.warning("获取链接消息 %s 失败，下轮重试", link, exc_info=True)
             outcomes.append(Outcome.failure(
-                ArchiveItem(media=message, entry=entry, link=link), "download", str(e)))
+                ArchiveItem(media=message, entry=entry, link=link), "download", e))
             continue
 
         if msg is None:
@@ -347,7 +364,7 @@ async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outco
             except Exception as e:
                 logger.warning("获取媒体组 %s 失败，下轮重试", link, exc_info=True)
                 outcomes.append(Outcome.failure(
-                    ArchiveItem(media=msg, entry=entry, link=link), "download", str(e)))
+                    ArchiveItem(media=msg, entry=entry, link=link), "download", e))
                 continue
             # link 只挂在链接指向的那一条上：tdl 靠「多条消息只给一个 URL」
             # 决定加 --group 一次拉整组（tdl_downloader.py:113）
@@ -379,9 +396,8 @@ async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outco
 
 
 def _has_tme_link(message: Message) -> bool:
-    """检查消息文本是否包含 t.me 链接"""
-    text = message.text or message.caption or ""
-    return bool(re.search(r"https?://t\.me/", text))
+    """检查消息是否包含 t.me 链接。正则与文本字段都跟 extract_tme_links 共用。"""
+    return bool(TME_LINK_RE.search(entry_text(message)))
 
 
 class EntryResult(NamedTuple):
@@ -428,22 +444,26 @@ async def _handle_entry(ctx: ListenerContext, msg: Message, handled_groups: set)
 
 async def scan_once(ctx: ListenerContext):
     last_id = ctx.db.get_checkpoint(ctx.receive_chat)
-    new_messages = []
+    new_messages: list[Message] = []
+    has_more = False
     # reverse=True 让消息从旧到新排列——配合 min_id checkpoint 机制，
     # 每处理完一条就推进 checkpoint，中途崩溃可以从最后成功的那条继续
     # min_id 在 Pyrogram 是包含边界 >=，+1 确保不重复拉取已 checkpoint 的消息
     async for msg in ctx.client.get_chat_history(ctx.receive_chat, min_id=last_id + 1,
                                                  reverse=True):
         new_messages.append(msg)
+        # 攒够本轮的量就停。get_chat_history 每 100 条一次请求，积压几千条时
+        # 「先全拉下来再切片」等于每轮把整段历史重扫一遍，只为推进 BATCH_SIZE 条 ——
+        # 与本项目「宁可慢不可冒险」的取向相反。多收一条只为知道后面还有，随即丢掉
+        if len(new_messages) > BATCH_SIZE:
+            new_messages.pop()
+            has_more = True
+            break
 
     if not new_messages:
         return 0
-
-    total = len(new_messages)
-    # 限制每轮处理量，剩余留给下轮，避免短时间大量上传触发 Telegram 风控
-    if total > BATCH_SIZE:
-        new_messages = new_messages[:BATCH_SIZE]
-        logger.info("待处理 %s 条，本轮处理 %s 条，剩余 %s 条下轮继续", total, BATCH_SIZE, total - BATCH_SIZE)
+    if has_more:
+        logger.info("本轮处理 %s 条，仍有剩余，下轮继续", len(new_messages))
 
     handled_groups: set = set()
     processed = 0
@@ -451,7 +471,20 @@ async def scan_once(ctx: ListenerContext):
         if msg.media_group_id and msg.media_group_id in handled_groups:
             continue
 
-        result = await _handle_entry(ctx, msg, handled_groups)
+        try:
+            result = await _handle_entry(ctx, msg, handled_groups)
+        except Exception as e:
+            # 入口级兜底。_handle_entry 里 get_media_group / _settle_all 这些调用在
+            # 管道之外，它们抛的异常以前一路冒到 main() 的兜底 except：不记
+            # archive_failures、不告警、也没有满 N 轮跳过 —— 真碰上一个持续失败的入口
+            # 就是每轮炸一次、checkpoint 永远停在那里。这里补齐「每条失败都进失败账」
+            # 那条不变量。route 不参与失败记账（它只决定 files.source），取默认值即可
+            logger.warning("入口 %s 处理出错，记入失败账", msg.id, exc_info=True)
+            entry = Entry(message=msg, route=ROUTE_FORWARD)
+            settled = await _settle(ctx, entry, [
+                Outcome.failure(ArchiveItem(media=msg, entry=entry), "process", e)])
+            result = EntryResult(settled, msg.id, 0)
+
         processed += result.handled
         if not result.settled:
             # 必须停止本轮：否则下一条消息会把 checkpoint 推过这个未结清的入口，

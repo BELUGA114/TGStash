@@ -24,6 +24,20 @@ ROUTE_FORWARD = "manual_forward"  # 路径一：媒体直接转发进接收频�
 ROUTE_LINK = "link"               # 路径二：接收频道里发 t.me 链接
 
 
+def _error_text(error: object) -> str:
+    """
+    异常或字符串统一成可落库的文本。
+
+    无参异常（尤其 assert 失败）的 str() 是空串，直接落库会让
+    archive_failures.last_error 为空、告警文案里「最近错误」一片空白，只剩 stage 可查。
+    归一化收在这里而不是每个调用点各写一遍 `str(e) or repr(e)`：写在调用点就会有一半
+    地方忘掉后半截（历史上 8 处里 4 处是裸 `str(e)`）。调用方直接把异常对象传进
+    Outcome.failure 即可。
+    """
+    text = str(error)
+    return text if text else repr(error)
+
+
 @dataclass(frozen=True)
 class Entry:
     """
@@ -79,5 +93,6 @@ class Outcome:
         return cls(item=item, ok=True)
 
     @classmethod
-    def failure(cls, item: ArchiveItem, stage: str, error: str) -> Outcome:
-        return cls(item=item, ok=False, stage=stage, error=error)
+    def failure(cls, item: ArchiveItem, stage: str, error: object) -> Outcome:
+        """error 收异常对象或字符串，一律经 _error_text 归一化后落库。"""
+        return cls(item=item, ok=False, stage=stage, error=_error_text(error))

@@ -35,13 +35,23 @@ def item_of(msg, *, route=ROUTE_FORWARD, entry_msg=None, link=None):
 
 
 def fake_db(**overrides):
-    """默认「什么都没归档过」；record_* 的入参记进 .writes 供断言。"""
+    """
+    默认「什么都没归档过」；record_* 的入参记进 .writes 供断言。
+
+    record_archived 是 files + messages 的原子写入口，两张表各记一条 —— 生产走的是
+    一次调用一个事务，断言侧仍按 ("file", ...) / ("message", ...) 两条看。
+    """
     writes = []
+
+    def record_archived(**kw):
+        writes.append(("file", kw))
+        writes.append(("message", kw))
+
     db = SimpleNamespace(
         find_by_unique_id=lambda fuid: None,
         find_by_sha256=lambda sha: None,
         record_file=lambda **kw: writes.append(("file", kw)),
-        record_message=lambda **kw: writes.append(("message", kw)),
+        record_archived=record_archived,
         writes=writes,
     )
     for name, value in overrides.items():
@@ -1056,18 +1066,36 @@ def test_single_plan_exception_becomes_failure(make_pipeline):
 
 def test_pipeline_config_requires_explicit_values():
     """
-    构造时必填的三个值（冷却、压缩阈值、CRF）没有默认值：真相只有 listener
-    从环境变量读的那一份，测试默认值在 conftest.make_pipeline。
+    构造时必填的四个值（冷却、压缩阈值、CRF、编码线程数）没有默认值：真相只有
+    listener 从环境变量读的那一份，测试默认值在 conftest.make_pipeline。
 
     别管它们叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
     UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS。冷却确实是限流值，
-    写两遍就会有人改错一边；另两个压缩参数只是调参。
+    写两遍就会有人改错一边；另三个压缩参数只是调参。
     """
     import pytest
     from pipeline import PipelineConfig
 
     with pytest.raises(TypeError):
         PipelineConfig()
+
+
+def test_media_kind_vocabulary_matches():
+    """
+    pipeline.MEDIA_KINDS 与 media_ops.MediaKind 必须是同一份取值。
+
+    检测顺序（MEDIA_ATTRS）在 media_ops，上传形状（MEDIA_KINDS）在 pipeline ——
+    两个模块各存一份取值表，加一种媒体类型时漏掉一边不会有任何静态错误：
+    要么下载得到但上传时 KeyError，要么表里有一行永远不会被命中。
+    """
+    from typing import get_args
+
+    from media_ops import MEDIA_ATTRS, MediaKind
+    from pipeline import MEDIA_KINDS
+
+    assert set(get_args(MediaKind)) == set(MEDIA_KINDS)
+    # MEDIA_ATTRS 直接从 MediaKind 推导，顺序即声明顺序（document 在 video 之前）
+    assert MEDIA_ATTRS == get_args(MediaKind)
 
 
 class TestVideoNoteUpload:
@@ -1082,19 +1110,27 @@ class TestVideoNoteUpload:
 
     def test_send_method_kwargs_match_pyrogram_signatures(self):
         """
-        SEND_METHOD 里每个方法都必须真的接受我们传的关键字。
+        MEDIA_KINDS 每一行声明的关键字，对应的 send_* 方法都必须真的接受。
 
         不连网、不发消息，纯拿真实签名对账，顺带盯住升级 Pyrogram 时的签名漂移。
+        表里一行错（比如给 video_note 打开 video_meta，而它不接受 width/height）
+        在这里就红，而不是等到线上归档时被吞成 upload 失败。
         """
         import inspect
 
-        from pipeline import CAPTIONLESS_KINDS, SEND_METHOD
+        from pipeline import MEDIA_KINDS
         from pyrogram.client import Client
 
-        for kind, method_name in SEND_METHOD.items():
-            params = inspect.signature(getattr(Client, method_name)).parameters
-            assert ("caption" in params) is (kind not in CAPTIONLESS_KINDS), (
-                f"{method_name} 的 caption 支持与 CAPTIONLESS_KINDS 不符")
+        for kind, spec in MEDIA_KINDS.items():
+            params = inspect.signature(getattr(Client, spec.send_method)).parameters
+            assert ("caption" in params) is spec.accepts_caption, (
+                f"{spec.send_method} 的 caption 支持与 MEDIA_KINDS[{kind!r}] 不符")
+            if spec.video_meta:
+                missing = [n for n in ("duration", "width", "height", "thumb")
+                           if n not in params]
+                assert not missing, (
+                    f"{spec.send_method} 不接受 {missing}，但 MEDIA_KINDS[{kind!r}] "
+                    f"声明了 video_meta")
 
     def test_video_note_uploads_without_caption(self, tmp_path, make_pipeline):
         """归档 video_note 不该炸，也不该给 send_video_note 传 caption"""
@@ -1124,3 +1160,50 @@ class TestVideoNoteUpload:
         assert asyncio.run(pipeline.archive_one(item)).ok
         assert [kw["caption"] for tag, kw in db.writes
                 if tag == "message"] == ["转发时带的文字"]
+
+
+class TestMediaGroupSendCountMismatch:
+    def test_short_sent_list_is_not_silently_dropped(self, tmp_path, make_pipeline):
+        """
+        send_media_group 回来的条数比上传的少 → 抛出，而不是静默漏记。
+
+        zip 无 strict 时少的那条既不写 DB 也拿不到 Outcome：文件已经在备份频道，
+        files/messages 里却没有任何行，_settle_all 跳过它、_group_settled 也看不到它，
+        checkpoint 照常推进 —— 永久的去重盲区，且再也不会被扫到。抛出来则由
+        archive_batch 的兜底翻译成一条 process 失败，进失败账、有熔断。
+        """
+        class ShortClient(FakeClient):
+            async def send_media_group(self, chat, input_media):
+                await super().send_media_group(chat, input_media)
+                return [SimpleNamespace(id=901)]  # 两条只回一条
+
+        pipeline = make_pipeline(
+            client=ShortClient(), db=fake_db(),
+            downloader=fake_downloader({41: local_file(tmp_path, "b/41.pdf"),
+                                        42: local_file(tmp_path, "b/42.pdf")}))
+        items = [item_of(msg_stub(41, group="g1")), item_of(msg_stub(42, group="g1"))]
+
+        outcomes = asyncio.run(pipeline.archive_batch(items))
+
+        assert sum(o.ok for o in outcomes) < 2, "少回一条不能算两条都成功"
+        failures = [o for o in outcomes if not o.ok]
+        assert failures and failures[0].stage == "process"
+
+
+def test_cleanup_survives_unremovable_entry(tmp_path):
+    """
+    删不掉的临时文件不能让 _cleanup_temp_files 抛异常，也不能中断后面的清理。
+
+    它只在 finally 里被调用，从那里抛出会顶掉已经算好的 Outcome 并绕过 listener 的
+    失败记账与熔断：归档明明成功，结果既没有结论也没记账。
+    """
+    from pipeline import _cleanup_temp_files
+
+    stuck = tmp_path / "not-a-file"
+    stuck.mkdir()  # os.remove 对目录必然抛 OSError
+    good = local_file(tmp_path, "t/b.bin")
+
+    _cleanup_temp_files([str(stuck), good])
+
+    assert not os.path.exists(good), "第一项失败不能中断后面的清理"
+    assert stuck.exists()

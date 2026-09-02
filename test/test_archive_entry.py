@@ -71,3 +71,14 @@ class TestOutcome:
         assert outcome.ok is False
         assert outcome.stage == "download"
         assert outcome.error == "tdl 返回空路径"
+
+    def test_failure_accepts_exception_and_normalizes_text(self):
+        """
+        异常直接传进来即可，归一化在 Outcome.failure 里。
+
+        无参异常（尤其 assert 失败）的 str() 是空串，落库会让
+        archive_failures.last_error 为空、告警文案里「最近错误」一片空白。
+        以前靠每个调用点自己写 `str(e) or repr(e)`，8 处里 4 处忘了后半截。
+        """
+        assert Outcome.failure(_item(), "upload", RuntimeError("传不上去")).error == "传不上去"
+        assert Outcome.failure(_item(), "process", AssertionError()).error == "AssertionError()"

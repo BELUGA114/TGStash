@@ -18,7 +18,9 @@ DB_PATH = os.path.join(os.environ.get("DATA_DIR", "/data"), "db", "archive.db")
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    # getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
+    # LOG_LEVEL=debug 会取到 logging.debug 函数，basicConfig 直接抛 TypeError
+    level=logging.getLevelNamesMapping().get(LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )

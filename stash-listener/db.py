@@ -10,8 +10,11 @@
 schema 变更走 PRAGMA user_version + MIGRATIONS 有序迁移，
 SCHEMA 常量始终保持目标形态。
 
-stash-listener 和 tdl-sync 两个服务各自拷贝一份这个文件，
-但通过挂载同一个 /data/db 卷，实际操作的是同一个 SQLite 文件。
+这份文件只有 stash-listener 一个主服务在用，`archive.db` 由它独占。
+（历史上还有一个 tdl-sync 服务各拿一份拷贝共享同一个卷，那个服务在
+2026-08-18 并入 tdl_downloader.py 时已经删除 —— 别再按「两份拷贝要同步」
+或「schema 要兼容第二个服务」来约束这里的改动。`scripts/` 下的运维脚本
+靠 PYTHONPATH import 本模块，不是拷贝。）
 """
 
 import logging
@@ -225,6 +228,47 @@ def _migrate_v1(con) -> None:
 MIGRATIONS = [(1, _migrate_v1)]
 
 
+# files / messages 的插入语句与参数装配。三个写入口（record_file / record_message /
+# record_archived）共用同一份 —— 否则「原子写」就成了 SQL 的第二份拷贝，
+# 加一列要改两处、漏一处只在某一条路径上错
+_FILES_INSERT = """INSERT OR IGNORE INTO files
+       (file_unique_id, sha256, size, archived_chat_id, archived_message_id,
+        source, source_channel, first_seen_at, file_name, mime_type, media_kind)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)"""
+
+_MESSAGES_INSERT = """INSERT INTO messages
+       (source_chat_id, source_message_id, source_channel_title, sender, sent_at,
+        caption, file_unique_id, media_group_id, archived_chat_id, archived_message_id,
+        created_at, origin_chat_id, origin_message_id, origin_title, origin_type,
+        file_name, media_kind)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+
+def _as_text(value) -> str | None:
+    """chat_id 一类的列统一存字符串；None 要保持 None，不能变成 'None'。"""
+    return str(value) if value is not None else None
+
+
+def _files_params(*, file_unique_id, sha256, size, archived_chat_id, archived_message_id,
+                  source, source_channel, file_name, mime_type, media_kind) -> tuple:
+    return (
+        file_unique_id, sha256, size, _as_text(archived_chat_id), archived_message_id,
+        source, _as_text(source_channel), _now(), file_name, mime_type, media_kind,
+    )
+
+
+def _messages_params(*, source_chat_id, source_message_id, source_channel_title, sender,
+                     sent_at, caption, file_unique_id, media_group_id, archived_chat_id,
+                     archived_message_id, origin_chat_id, origin_message_id, origin_title,
+                     origin_type, file_name, media_kind) -> tuple:
+    return (
+        _as_text(source_chat_id), source_message_id, source_channel_title, sender, sent_at,
+        caption, file_unique_id, _as_text(media_group_id), _as_text(archived_chat_id),
+        archived_message_id, _now(), _as_text(origin_chat_id), origin_message_id,
+        origin_title, origin_type, file_name, media_kind,
+    )
+
+
 class ArchiveDB:
     def __init__(self, path: str):
         self._path = path
@@ -327,25 +371,12 @@ class ArchiveDB:
         media_kind: str | None = None,
     ):
         with self._connect() as con:
-            con.execute(
-                """INSERT OR IGNORE INTO files
-                   (file_unique_id, sha256, size, archived_chat_id, archived_message_id,
-                    source, source_channel, first_seen_at, file_name, mime_type, media_kind)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    file_unique_id,
-                    sha256,
-                    size,
-                    str(archived_chat_id) if archived_chat_id is not None else None,
-                    archived_message_id,
-                    source,
-                    str(source_channel) if source_channel is not None else None,
-                    _now(),
-                    file_name,
-                    mime_type,
-                    media_kind,
-                ),
-            )
+            con.execute(_FILES_INSERT, _files_params(
+                file_unique_id=file_unique_id, sha256=sha256, size=size,
+                archived_chat_id=archived_chat_id, archived_message_id=archived_message_id,
+                source=source, source_channel=source_channel, file_name=file_name,
+                mime_type=mime_type, media_kind=media_kind,
+            ))
 
     def record_message(
         self,
@@ -367,33 +398,76 @@ class ArchiveDB:
         media_kind=None,
     ):
         with self._connect() as con:
-            con.execute(
-                """INSERT INTO messages
-                   (source_chat_id, source_message_id, source_channel_title, sender, sent_at,
-                    caption, file_unique_id, media_group_id, archived_chat_id, archived_message_id,
-                    created_at, origin_chat_id, origin_message_id, origin_title, origin_type,
-                    file_name, media_kind)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    str(source_chat_id) if source_chat_id is not None else None,
-                    source_message_id,
-                    source_channel_title,
-                    sender,
-                    sent_at,
-                    caption,
-                    file_unique_id,
-                    str(media_group_id) if media_group_id is not None else None,
-                    str(archived_chat_id) if archived_chat_id is not None else None,
-                    archived_message_id,
-                    _now(),
-                    str(origin_chat_id) if origin_chat_id is not None else None,
-                    origin_message_id,
-                    origin_title,
-                    origin_type,
-                    file_name,
-                    media_kind,
-                ),
-            )
+            con.execute(_MESSAGES_INSERT, _messages_params(
+                source_chat_id=source_chat_id, source_message_id=source_message_id,
+                source_channel_title=source_channel_title, sender=sender, sent_at=sent_at,
+                caption=caption, file_unique_id=file_unique_id,
+                media_group_id=media_group_id, archived_chat_id=archived_chat_id,
+                archived_message_id=archived_message_id, origin_chat_id=origin_chat_id,
+                origin_message_id=origin_message_id, origin_title=origin_title,
+                origin_type=origin_type, file_name=file_name, media_kind=media_kind,
+            ))
+
+    def record_archived(
+        self,
+        *,
+        # 文件身份与去重（files）
+        file_unique_id: str,
+        sha256: str,
+        size: int,
+        source: str,
+        source_channel=None,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        media_kind: str | None = None,
+        # 归档落点（两张表都记）
+        archived_chat_id=None,
+        archived_message_id=None,
+        # 入口与来源（messages）
+        source_chat_id=None,
+        source_message_id=None,
+        source_channel_title=None,
+        sender=None,
+        sent_at=None,
+        caption=None,
+        media_group_id=None,
+        origin_chat_id=None,
+        origin_message_id=None,
+        origin_title=None,
+        origin_type=None,
+    ):
+        """
+        files + messages 在同一个事务里写完。归档成功后的唯一写入口。
+
+        分两次调用（两个连接、两个事务）时，第二次失败会留下「files 有行、messages
+        没行」的库：去重说这个文件见过，搜索里它从不存在，而回填脚本按
+        `origin_type IS NULL` 从 messages 选行，救不了没有 messages 行的文件。
+
+        触发路径不是进程被杀（两次调用之间没有 await，窗口只有微秒），而是第二次
+        写本身抛异常 —— 例如另一个写者（回填脚本）占着写锁超过 busy_timeout=30000，
+        `sqlite3.OperationalError` 冒到管道的兜底 except 记一次失败等下轮重试，而下轮
+        `find_by_unique_id` 已经命中那条已提交的 files 行，于是被当成去重跳过、
+        打上 ✅、推进 checkpoint —— 那条 messages 永远不会被写。
+
+        代价：写失败时整笔回滚，下轮重新下载重传，备份频道会多一份副本。这个交换是
+        刻意的 —— 多出来的副本看得见、删得掉，「有文件没记录」既静默又不可修复。
+        """
+        with self._connect() as con:
+            con.execute(_FILES_INSERT, _files_params(
+                file_unique_id=file_unique_id, sha256=sha256, size=size,
+                archived_chat_id=archived_chat_id, archived_message_id=archived_message_id,
+                source=source, source_channel=source_channel, file_name=file_name,
+                mime_type=mime_type, media_kind=media_kind,
+            ))
+            con.execute(_MESSAGES_INSERT, _messages_params(
+                source_chat_id=source_chat_id, source_message_id=source_message_id,
+                source_channel_title=source_channel_title, sender=sender, sent_at=sent_at,
+                caption=caption, file_unique_id=file_unique_id,
+                media_group_id=media_group_id, archived_chat_id=archived_chat_id,
+                archived_message_id=archived_message_id, origin_chat_id=origin_chat_id,
+                origin_message_id=origin_message_id, origin_title=origin_title,
+                origin_type=origin_type, file_name=file_name, media_kind=media_kind,
+            ))
 
     def rows_missing_origin(self, limit: int | None = None):
         """
@@ -528,10 +602,15 @@ class ArchiveDB:
                 (str(source_chat_id), source_message_id),
             )
 
-    def pending_failures(self) -> list[str]:
-        """返回所有仍在重试中的失败消息，格式 'chat:msg'。"""
+    def pending_failures(self) -> set[tuple[str, int]]:
+        """
+        仍在重试中的失败消息，返回 {(入口 chat_id, 入口 message_id)}。
+
+        返回复合键本身而不是 'chat:msg' 字符串：调用方不必再 split 一次，
+        也就不存在「chat_id 里出现分隔符」这种解析问题。
+        """
         with self._connect() as con:
             rows = con.execute(
                 "SELECT source_chat_id, source_message_id FROM archive_failures WHERE status='retrying'"
             ).fetchall()
-            return [f"{r[0]}:{r[1]}" for r in rows]
+            return {(str(r[0]), r[1]) for r in rows}

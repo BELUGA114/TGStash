@@ -10,7 +10,7 @@ import media_ops
 
 
 def test_build_command_has_key_params():
-    cmd = cv.build_compress_command("src.mp4", "dst.mp4", crf=28)
+    cmd = cv.build_compress_command("src.mp4", "dst.mp4", crf=28, threads=4)
     s = " ".join(cmd)
     assert "ffmpeg" in cmd[0]
     assert "-crf" in s and "28" in s
@@ -23,13 +23,13 @@ def test_build_command_has_key_params():
 
 
 def test_build_command_respects_crf_override():
-    cmd = cv.build_compress_command("s.mp4", "d.mp4", crf=30)
+    cmd = cv.build_compress_command("s.mp4", "d.mp4", crf=30, threads=4)
     assert "-crf" in cmd and cmd[cmd.index("-crf") + 1] == "30"
 
 
-def test_build_command_threads_zero_omits_flag(monkeypatch):
-    monkeypatch.setattr(cv, "DEFAULT_THREADS", 0)
-    cmd = cv.build_compress_command("s.mp4", "d.mp4")
+def test_build_command_threads_zero_omits_flag():
+    """threads=0 表示不限制线程数，不传 -threads。参数直传，不再改模块常量"""
+    cmd = cv.build_compress_command("s.mp4", "d.mp4", crf=28, threads=0)
     assert "-threads" not in cmd
 
 
@@ -39,7 +39,7 @@ def test_compress_video_success(tmp_path):
     src.write_bytes(b"fake")
     with patch("compress_video.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 0)
-        assert cv.compress_video(str(src), str(dst)) is True
+        assert cv.compress_video(str(src), str(dst), crf=28, threads=4) is True
         m_run.assert_called_once()
         assert str(src) in m_run.call_args.args[0]  # src 在 dst 之前
         assert str(dst) in m_run.call_args.args[0]
@@ -52,7 +52,7 @@ def test_compress_video_failure_removes_half_product(tmp_path):
     dst.write_bytes(b"partial")  # 模拟 ffmpeg 已写出半成品
     with patch("compress_video.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 1)
-        assert cv.compress_video(str(src), str(dst)) is False
+        assert cv.compress_video(str(src), str(dst), crf=28, threads=4) is False
     assert not dst.exists()  # 半成品被删除
 
 
@@ -61,7 +61,7 @@ def test_compress_video_exception_is_caught(tmp_path):
     dst = tmp_path / "dst.mp4"
     src.write_bytes(b"fake")
     with patch("compress_video.subprocess.run", side_effect=FileNotFoundError("ffmpeg 缺失")):
-        assert cv.compress_video(str(src), str(dst)) is False
+        assert cv.compress_video(str(src), str(dst), crf=28, threads=4) is False
     assert not dst.exists()
 
 
@@ -106,7 +106,7 @@ def _run_single_archive(msg, src_video, fake_compress, monkeypatch, make_pipelin
             find_by_sha256=lambda *a, **k: None,
             find_by_unique_id=lambda *a, **k: None,
             record_file=lambda *a, **k: None,
-            record_message=lambda *a, **k: None,
+            record_archived=lambda *a, **k: None,
         ),
         downloader=SimpleNamespace(download=fake_download),
         video_compress_enabled=compress_enabled,
@@ -127,7 +127,7 @@ def test_single_video_compress_failure_falls_back_to_original(monkeypatch, tmp_p
     src_video = tmp_path / "src.mp4"
     src_video.write_bytes(b"\x00" * 2048)
 
-    def fake_compress(src, dst, crf):
+    def fake_compress(src, dst, crf, threads):
         calls["compress"] += 1
         return False  # 压缩失败 → 回退原始
 
@@ -144,7 +144,7 @@ def test_single_video_compress_smaller_uses_compressed(monkeypatch, tmp_path, ma
     src_video = tmp_path / "src.mp4"
     src_video.write_bytes(b"\x00" * 4096)
 
-    def fake_compress(src, dst, crf):
+    def fake_compress(src, dst, crf, threads):
         # 模拟 ffmpeg 写出更小的压缩产物
         with open(dst, "wb") as f:
             f.write(b"\x00" * 1024)
@@ -163,7 +163,7 @@ def test_single_video_compress_larger_falls_back(monkeypatch, tmp_path, make_pip
     src_video = tmp_path / "src.mp4"
     src_video.write_bytes(b"\x00" * 2048)
 
-    def fake_compress(src, dst, crf):
+    def fake_compress(src, dst, crf, threads):
         with open(dst, "wb") as f:
             f.write(b"\x00" * 4096)  # 比原始大 → 回退
         return True
@@ -181,7 +181,7 @@ def test_compress_video_not_called_below_threshold(monkeypatch, tmp_path, make_p
     src_video.write_bytes(b"\x00" * 2048)
     calls = {"compress": 0}
 
-    def fake_compress(src, dst, crf):
+    def fake_compress(src, dst, crf, threads):
         calls["compress"] += 1
         return False
 
@@ -201,19 +201,19 @@ def test_compress_output_lands_in_source_dir(tmp_path):
     src.write_bytes(b"\x00" * 2048)
     temp_files = []
 
-    def fake_compress(src_path, dst_path, crf):
+    def fake_compress(src_path, dst_path, crf, threads):
         assert os.path.dirname(dst_path) == os.path.dirname(src_path)  # 同目录
         with open(dst_path, "wb") as f:
             f.write(b"\x00" * 1024)
         return True
 
     with patch("compress_video.compress_video", fake_compress):
-        out = cv.maybe_compress_video(str(src), temp_files, True, 0, 28, tag=9001)
+        out = cv.maybe_compress_video(str(src), temp_files, True, 0, 28, tag=9001, threads=4)
     assert out == str(src.parent / "compressed_9001.mp4")
     assert temp_files == [str(src.parent / "compressed_9001.mp4")]
 
 
-def _write_smaller(src_path, dst_path, crf):
+def _write_smaller(src_path, dst_path, crf, threads):
     """假 ffmpeg：产出比源文件小的文件，内容写源文件名以便追溯产物属于谁。"""
     with open(dst_path, "wb") as f:
         f.write(os.path.basename(src_path).encode())
@@ -235,7 +235,8 @@ def test_compress_output_name_is_unique_per_message(tmp_path):
         src.write_bytes(bytes([mid]) * 2048)
         temp_files = []
         with patch("compress_video.compress_video", _write_smaller):
-            outs.append(cv.maybe_compress_video(str(src), temp_files, True, 0, 28, tag=mid))
+            outs.append(cv.maybe_compress_video(
+                str(src), temp_files, True, 0, 28, tag=mid, threads=4))
 
     assert outs[0] != outs[1], "两个视频的压缩产物不能是同一个文件"
     assert os.path.exists(outs[0]) and os.path.exists(outs[1])
@@ -269,10 +270,10 @@ def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path, mak
     captured = {}
     produced = {}
 
-    def recording_compress(src_path, dst_path, crf):
+    def recording_compress(src_path, dst_path, crf, threads):
         """记录「哪个产物由哪个源转码而来」，断言时用它对账。"""
         produced[dst_path] = os.path.basename(src_path)
-        return _write_smaller(src_path, dst_path, crf)
+        return _write_smaller(src_path, dst_path, crf, threads)
 
     async def fake_send_media_group(chat, input_media):
         captured["paths"] = [m.media for m in input_media]
@@ -291,7 +292,7 @@ def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path, mak
             find_by_unique_id=lambda x: None,
             find_by_sha256=lambda x: None,
             record_file=lambda *a, **k: None,
-            record_message=lambda *a, **k: None,
+            record_archived=lambda *a, **k: None,
         ),
         downloader=SimpleNamespace(download=fake_download),
         video_compress_enabled=True,
