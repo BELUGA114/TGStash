@@ -69,8 +69,10 @@ class MediaKindSpec:
     # send_media_group 用的 InputMedia 类；None 表示不能编组，只能单发
     input_media: type | None = None
     # send_* 是否接受 caption。send_video_note 是唯一不接受的 —— Telegram 的圆形视频
-    # 在协议层就没有 caption 字段，不是 Pyrogram 的疏漏。文字仍写进 messages.caption
-    # （进 FTS，搜得到），只是备份频道那条消息上看不到
+    # 在协议层就没有 caption 字段（对比 voice：messageVoiceNote 有 caption，
+    # send_voice 也接受），不是 Pyrogram 的疏漏。源消息因此也不可能带文字：
+    # video_note 走到 _send_media 时 caption 恒为空串。这个开关照样必需 ——
+    # 不被接受的关键字传空串也是 TypeError
     accepts_caption: bool = True
     # 是否走 _prepare_video（压缩 / ffprobe / 缩略图）并按视频形状上传
     # （duration / width / height / thumb）。video_note 今天是 False，于是它拿不到
@@ -436,7 +438,10 @@ class ArchivePipeline:
         if spec.accepts_caption:
             kwargs["caption"] = caption
         elif caption:
-            # 不接受 caption 的类型不能传这个关键字（传了就是 TypeError）
+            # 不接受 caption 的类型不能传这个关键字（空串也不行，传了就是 TypeError）。
+            # 今天不可达：唯一 accepts_caption=False 的 video_note 在协议层就没有
+            # caption 字段，源消息带不了文字。留着只为哪天 Telegram 给圆形视频加上
+            # caption 时有一行日志，而不是静默丢掉
             logger.warning("%s 不支持 caption，文字只留在 DB 里（FTS 仍可搜到）", kind)
         if spec.video_meta:
             kwargs |= {
@@ -702,9 +707,15 @@ class ArchivePipeline:
         if not tasks:
             return {}
         first_msg = tasks[0].item.media
+        chat = first_msg.chat
+        # Kurigram 把 chat 与 chat.id 都声明成 Optional。这里没有配置值可以顶替：
+        # 路径二的媒体来自任意源频道，self._receive_chat 是入口频道而不是它的频道。
+        # 缺 chat 说明消息对象本身不完整，抛出去由 archive_batch 兜成 'process' 失败账
+        # （tdl_downloader 拿到这批消息后同样 assert，这里只是让它提前且带类型）
+        assert chat is not None and chat.id is not None
         batch_dir = os.path.join(
             self._download_dir,
-            f"batch_{abs(first_msg.chat.id)}_{first_msg.id}_{len(tasks)}",
+            f"batch_{abs(chat.id)}_{first_msg.id}_{len(tasks)}",
         )
         os.makedirs(batch_dir, exist_ok=True)
         fallback_paths = {

@@ -27,7 +27,7 @@ def _sent(message_id=555):
     return SimpleNamespace(id=message_id)
 
 
-def _media(file_unique_id="FUID_W", file_name="cat.mp4", mime_type="video/mp4"):
+def _media(file_unique_id="FUID_W", file_name: str | None = "cat.mp4", mime_type="video/mp4"):
     return SimpleNamespace(file_unique_id=file_unique_id, file_name=file_name,
                            mime_type=mime_type)
 

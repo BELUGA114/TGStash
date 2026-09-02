@@ -412,7 +412,11 @@ async def _handle_entry(ctx: ListenerContext, msg: Message, handled_groups: set)
     checkpoint 的推进由 scan_once 一处负责。
     """
     if msg.media_group_id:
-        group = sorted(await ctx.client.get_media_group(msg.chat.id, msg.id),
+        # 入口恒来自接收频道（scan_once 只扫 ctx.receive_chat 一个），组也就在那里，
+        # chat_id 直接取配置值。msg.chat 在 Kurigram 里是 Optional，从消息上取等于
+        # 凭空多一条不可能的分支；拿它当 if 条件更糟 —— 条件不成立时整组会掉进下面的
+        # 单条路径，handled_groups 不登记、组级 checkpoint 那套逻辑全绕开
+        group = sorted(await ctx.client.get_media_group(ctx.receive_chat, msg.id),
                        key=lambda m: m.id)
         handled_groups.add(msg.media_group_id)
         items = [
