@@ -22,6 +22,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,33 @@ def _messages_params(*, source_chat_id, source_message_id, source_channel_title,
     )
 
 
+# delete_message.py 的删除路径。列清单与两条 DELETE/UPDATE 单独成常量：
+# find_messages_by_source_ids / purge_messages 共用，set_checkpoint / delete_failure
+# 与 purge 共用 —— 同一条 SQL 两处内联，改 schema 时就会漏一边
+_MESSAGES_BY_SOURCE_COLUMNS = ("id, source_message_id, file_unique_id, "
+                               "source_chat_id, caption, sender, sent_at")
+_FAILURE_DELETE = "DELETE FROM archive_failures WHERE source_chat_id=? AND source_message_id=?"
+_CHECKPOINT_UPDATE = "UPDATE channels SET last_message_id=?, last_run_at=? WHERE chat_id=?"
+
+
+class PurgeSummary(NamedTuple):
+    """purge_messages 的结果，供调用方打印。"""
+
+    deleted_messages: int
+    deleted_files: list[str]                    # file_unique_id（无其他消息引用才删）
+    cleared_failures: list[tuple[str, int]]     # (入口 chat_id, 入口 message_id)
+    rollback: dict[str, tuple[int, int]]        # chat_id → (旧 checkpoint, 新 checkpoint)
+
+
+def _fetch_messages_by_source(con, source_message_ids: list[int]) -> list[sqlite3.Row]:
+    placeholders = ",".join("?" * len(source_message_ids))
+    return con.execute(
+        f"SELECT {_MESSAGES_BY_SOURCE_COLUMNS} FROM messages "
+        f"WHERE source_message_id IN ({placeholders})",
+        source_message_ids,
+    ).fetchall()
+
+
 class ArchiveDB:
     def __init__(self, path: str):
         self._path = path
@@ -325,10 +353,7 @@ class ArchiveDB:
 
     def set_checkpoint(self, chat_id, message_id: int):
         with self._connect() as con:
-            con.execute(
-                "UPDATE channels SET last_message_id=?, last_run_at=? WHERE chat_id=?",
-                (message_id, _now(), str(chat_id)),
-            )
+            con.execute(_CHECKPOINT_UPDATE, (message_id, _now(), str(chat_id)))
 
     def get_last_run(self, chat_id):
         with self._connect() as con:
@@ -597,10 +622,7 @@ class ArchiveDB:
 
     def delete_failure(self, source_chat_id, source_message_id: int):
         with self._connect() as con:
-            con.execute(
-                "DELETE FROM archive_failures WHERE source_chat_id=? AND source_message_id=?",
-                (str(source_chat_id), source_message_id),
-            )
+            con.execute(_FAILURE_DELETE, (str(source_chat_id), source_message_id))
 
     def pending_failures(self) -> set[tuple[str, int]]:
         """
@@ -614,3 +636,78 @@ class ArchiveDB:
                 "SELECT source_chat_id, source_message_id FROM archive_failures WHERE status='retrying'"
             ).fetchall()
             return {(str(r[0]), r[1]) for r in rows}
+
+    def find_messages_by_source_ids(self, source_message_ids: list[int]) -> list[sqlite3.Row]:
+        """按入口 id 查 messages 行。delete_message.py 的预览与跨度守卫用。"""
+        if not source_message_ids:
+            return []
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            return _fetch_messages_by_source(con, source_message_ids)
+
+    def purge_messages(self, source_message_ids: list[int]) -> PurgeSummary:
+        """
+        一个事务内删掉这些入口的全部痕迹：messages、无其他消息引用的 files、
+        失败账，并把 checkpoint 回退到各 chat 的 min(source_message_id) - 1。
+
+        必须是一个事务，两种拆法都有静默坏窗口：先删行后回退，中间崩掉 =
+        行没了而 checkpoint 没退，那些消息永远不被重扫；先回退后删，中间崩掉 =
+        下轮扫描撞上还活着的 files 行，file_unique_id 命中被当去重跳过，
+        messages 永远补不回来（去重路径不写 messages）。
+
+        checkpoint 只退不进（new >= old 不动），回退规则与 delete_message.py
+        的历史行为一致。FTS 索引由触发器在同一事务里自动清理。
+        """
+        if not source_message_ids:
+            return PurgeSummary(0, [], [], {})
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            rows = _fetch_messages_by_source(con, source_message_ids)
+            if not rows:
+                return PurgeSummary(0, [], [], {})
+
+            ids = [row["id"] for row in rows]
+            cur = con.execute(
+                f"DELETE FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+            deleted_messages = cur.rowcount
+
+            # 无其他消息引用的 file_unique_id 连同 files 行删掉
+            deleted_files = []
+            for fuid in {row["file_unique_id"] for row in rows if row["file_unique_id"]}:
+                refs = con.execute(
+                    "SELECT COUNT(*) FROM messages WHERE file_unique_id=?", (fuid,)
+                ).fetchone()[0]
+                if refs == 0:
+                    cur = con.execute("DELETE FROM files WHERE file_unique_id=?", (fuid,))
+                    if cur.rowcount:
+                        deleted_files.append(fuid)
+
+            cleared_failures = []
+            entry_keys = sorted({(str(row["source_chat_id"]), row["source_message_id"])
+                                 for row in rows if row["source_chat_id"]})
+            for chat_id, msg_id in entry_keys:
+                cur = con.execute(_FAILURE_DELETE, (chat_id, msg_id))
+                if cur.rowcount:
+                    cleared_failures.append((chat_id, msg_id))
+
+            rollback = {}
+            chat_min: dict[str, int] = {}
+            for row in rows:
+                if row["source_chat_id"]:
+                    chat_id = str(row["source_chat_id"])
+                    chat_min[chat_id] = min(chat_min.get(chat_id, row["source_message_id"]),
+                                            row["source_message_id"])
+            for chat_id, min_id in chat_min.items():
+                new_cp = min_id - 1
+                cp_row = con.execute(
+                    "SELECT last_message_id FROM channels WHERE chat_id=?", (chat_id,)
+                ).fetchone()
+                # 频道行不存在 = 从没跑过 ensure_channel，无 checkpoint 可回退
+                if cp_row is None:
+                    continue
+                old_cp = cp_row[0]
+                if new_cp < old_cp:
+                    con.execute(_CHECKPOINT_UPDATE, (new_cp, _now(), chat_id))
+                    rollback[chat_id] = (old_cp, new_cp)
+
+            return PurgeSummary(deleted_messages, deleted_files, cleared_failures, rollback)
