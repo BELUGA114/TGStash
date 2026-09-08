@@ -13,17 +13,10 @@ import os
 import sys
 
 from db import ArchiveDB
+from logging_setup import configure_logging
 
 DB_PATH = os.path.join(os.environ.get("DATA_DIR", "/data"), "db", "archive.db")
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    # getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
-    # LOG_LEVEL=debug 会取到 logging.debug 函数，basicConfig 直接抛 TypeError
-    level=logging.getLevelNamesMapping().get(LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +28,8 @@ def archive_link(chat_id, message_id) -> str:
 
 
 def main():
+    # 日志配置属于进程启动，不属于 import
+    configure_logging()
     if len(sys.argv) < 2:
         logger.info("用法：python search.py 关键词")
         sys.exit(1)

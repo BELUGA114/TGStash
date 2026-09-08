@@ -11,24 +11,16 @@
 import logging
 import os
 
+from logging_setup import configure_logging
 from pyrogram.client import Client
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_DIR = os.path.join(os.environ.get("DATA_DIR", "/data"), "session")
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    # getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
-    # LOG_LEVEL=debug 会取到 logging.debug 函数，basicConfig 直接抛 TypeError
-    level=logging.getLevelNamesMapping().get(LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
-# Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+configure_logging()
 
 os.makedirs(SESSION_DIR, exist_ok=True)
 

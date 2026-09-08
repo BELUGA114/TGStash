@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "stash-listener"))
 
 from db import ArchiveDB
+from logging_setup import configure_logging
 from media_ops import get_media
 from origin import normalize_origin
 
@@ -187,15 +188,7 @@ async def main():
     parser.add_argument("--dry-run", action="store_true", help="只预览，不写库")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        # getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
-        # LOG_LEVEL=debug 会取到 logging.debug 函数，basicConfig 直接抛 TypeError
-        level=logging.getLevelNamesMapping().get(
-            os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logging.getLogger("pyrogram").setLevel(logging.WARNING)
+    configure_logging()
 
     if not os.path.exists(args.db):
         logger.error("数据库文件不存在：%s", args.db)
