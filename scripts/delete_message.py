@@ -11,6 +11,9 @@ source_chat_id 仍是接收频道——拿这种行回退 checkpoint 会把它�
 回填脚本靠 file_unique_id 自证匹配主动跳过了这些行，不会修正它们，所以它们的
 source_message_id 依旧不可信。本脚本对跨度过大的回退会拦下来，要 --force 才执行。
 
+删除本身走 db.purge_messages：messages + 孤儿 files + 失败账 + checkpoint 回退
+在一个事务里，中途失败整笔回滚（两段式各有静默坏窗口，见 db.py 的文档）。
+
 用法：
     # 单个 ID
     python scripts/delete_message.py 12345 --db data/db/archive.db
@@ -19,7 +22,7 @@ source_message_id 依旧不可信。本脚本对跨度过大的回退会拦下�
     # 先预览
     python scripts/delete_message.py 12345 12346 --db data/db/archive.db --dry-run
 
-会删除 / 回退：
+会删除 / 回退（一个事务）：
   - messages 表中匹配 source_message_id 的行（FTS 索引由触发器自动清理）
   - files 表中对应的行（仅当没有其他消息引用同一个 file_unique_id 时）
   - archive_failures 中这些入口的失败账（残留的 attempt_count 会让重来的那次一失败就跳过）
@@ -28,6 +31,7 @@ source_message_id 依旧不可信。本脚本对跨度过大的回退会拦下�
 
 import argparse
 import os
+import sqlite3
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stash-listener"))
@@ -48,6 +52,17 @@ def too_far_back(old_cp: int, new_cp: int, threshold: int = ROLLBACK_WARN_SPAN) 
     return rollback_span(old_cp, new_cp) > threshold
 
 
+def _chat_min_message_id(rows: list[sqlite3.Row]) -> dict[str, int]:
+    """按入口 chat_id 分组，找各频道最小的 message_id（回退预览与跨度守卫用）。"""
+    chat_min: dict[str, int] = {}
+    for row in rows:
+        if row["source_chat_id"]:
+            chat_id = str(row["source_chat_id"])
+            chat_min[chat_id] = min(chat_min.get(chat_id, row["source_message_id"]),
+                                    row["source_message_id"])
+    return chat_min
+
+
 def main():
     parser = argparse.ArgumentParser(description="按 source_message_id 删除数据库记录并回退 checkpoint")
     parser.add_argument("msg_ids", type=int, nargs="+", help="要删除的 source_message_id（可多个）")
@@ -62,48 +77,27 @@ def main():
         sys.exit(1)
 
     db = ArchiveDB(args.db)
-    msg_ids = args.msg_ids
-
-    # 查找所有匹配的消息记录（同时取出 source_chat_id 用于回退 checkpoint）
-    placeholders = ",".join("?" * len(msg_ids))
-    with db._connect() as con:
-        rows = con.execute(
-            f"SELECT id, source_message_id, file_unique_id, source_chat_id, "
-            f"caption, sender, sent_at "
-            f"FROM messages WHERE source_message_id IN ({placeholders})",
-            msg_ids,
-        ).fetchall()
+    rows = db.find_messages_by_source_ids(args.msg_ids)
 
     if not rows:
-        print(f"没找到 source_message_id in {msg_ids} 的记录")
+        print(f"没找到 source_message_id in {args.msg_ids} 的记录")
         return
 
-    found_ids = {row[1] for row in rows}
-    missing = [mid for mid in msg_ids if mid not in found_ids]
+    found_ids = {row["source_message_id"] for row in rows}
+    missing = [mid for mid in args.msg_ids if mid not in found_ids]
     print(f"找到 {len(rows)} 条记录（{len(found_ids)} 个 message_id）")
     if missing:
         print(f"未找到：{missing}")
     for row in rows:
-        caption_preview = (row[4] or "")[:60].replace("\n", " ")
-        print(f"  DB id={row[0]}  msg_id={row[1]}  chat={row[3]}  "
-              f"file_unique_id={row[2]}  sender={row[5]}  sent={row[6]}  "
-              f"caption={caption_preview}")
+        caption_preview = (row["caption"] or "")[:60].replace("\n", " ")
+        print(f"  DB id={row['id']}  msg_id={row['source_message_id']}  "
+              f"chat={row['source_chat_id']}  file_unique_id={row['file_unique_id']}  "
+              f"sender={row['sender']}  sent={row['sent_at']}  caption={caption_preview}")
 
-    # 按 source_chat_id 分组，找出每个频道的最小 message_id，用于回退 checkpoint
-    chat_min_msg: dict[str, int] = {}
-    for row in rows:
-        chat_id = str(row[3]) if row[3] else None
-        msg_id = row[1]
-        if chat_id and chat_id not in chat_min_msg:
-            chat_min_msg[chat_id] = msg_id
-        elif chat_id:
-            chat_min_msg[chat_id] = min(chat_min_msg[chat_id], msg_id)
-
-    # 这些行对应的入口（失败账以入口的复合键为准）
-    entry_keys = sorted({(str(row[3]), row[1]) for row in rows if row[3]})
-    pending_keys = [k for k in entry_keys if db.get_failure(*k) is not None]
-
-    # 先算回退跨度：跨度离谱通常意味着选中了 source_message_id 不可信的历史行
+    # 先算回退跨度：跨度离谱通常意味着选中了 source_message_id 不可信的历史行。
+    # 预览数字可能与实删时有毫秒级出入（主服务在推进 checkpoint），purge 在事务内
+    # 自己算回退值，正确性不受影响
+    chat_min_msg = _chat_min_message_id(rows)
     far_back = []
     for chat_id, min_id in chat_min_msg.items():
         old_cp = db.get_checkpoint(chat_id)
@@ -113,6 +107,9 @@ def main():
 
     if args.dry_run:
         print("\n--dry-run，不执行删除")
+        entry_keys = sorted({(str(row["source_chat_id"]), row["source_message_id"])
+                             for row in rows if row["source_chat_id"]})
+        pending_keys = [k for k in entry_keys if db.get_failure(*k) is not None]
         if pending_keys:
             print(f"将清除 {len(pending_keys)} 条失败账：{pending_keys}")
         if chat_min_msg:
@@ -136,48 +133,19 @@ def main():
         print("先用 --dry-run 核对，确认无误再加 --force。")
         sys.exit(1)
 
-    # 收集所有 file_unique_id
-    file_unique_ids = {row[2] for row in rows if row[2]}
+    summary = db.purge_messages(args.msg_ids)
 
-    with db._connect() as con:
-        # 删除消息（FTS 触发器自动清理 messages_fts）
-        ids_to_delete = [row[0] for row in rows]
-        cur = con.execute(
-            f"DELETE FROM messages WHERE id IN ({','.join('?' * len(ids_to_delete))})",
-            ids_to_delete,
-        )
-        deleted_msgs = cur.rowcount
-        print(f"\n已删除 messages: {deleted_msgs} 条")
-
-        # 对每个 file_unique_id，检查是否还有其他消息引用
-        deleted_files = 0
-        for fuid in file_unique_ids:
-            ref_count = con.execute(
-                "SELECT COUNT(*) FROM messages WHERE file_unique_id = ?", (fuid,)
-            ).fetchone()[0]
-            if ref_count == 0:
-                cur = con.execute("DELETE FROM files WHERE file_unique_id = ?", (fuid,))
-                if cur.rowcount:
-                    deleted_files += 1
-                    print(f"  同时删除 files: {fuid}（无其他消息引用）")
-
-    # 失败账：回退 checkpoint 是为了让这条入口重来一次，而 archive_failures 里残留的
-    # attempt_count（或 status='skipped'）会让重来的那次一失败就直接跳过、不再重试满
-    # N 轮。路径二一个入口对多个条目，部分成功部分失败时既留下 messages 行也留下失败行
-    for chat_id, msg_id in pending_keys:
-        db.delete_failure(chat_id, msg_id)
+    print(f"\n已删除 messages: {summary.deleted_messages} 条")
+    for fuid in summary.deleted_files:
+        print(f"  同时删除 files: {fuid}（无其他消息引用）")
+    for chat_id, msg_id in summary.cleared_failures:
         print(f"  同时清除失败账: chat={chat_id} msg_id={msg_id}")
-
-    # 回退 checkpoint：确保下次扫描会重新处理这些消息
     print()
-    for chat_id, min_id in chat_min_msg.items():
-        old_cp = db.get_checkpoint(chat_id)
-        new_cp = min_id - 1
-        if new_cp < old_cp:
-            db.set_checkpoint(chat_id, new_cp)
-            print(f"checkpoint 回退 chat={chat_id}: {old_cp} → {new_cp}")
+    for chat_id, (old_cp, new_cp) in summary.rollback.items():
+        print(f"checkpoint 回退 chat={chat_id}: {old_cp} → {new_cp}")
 
-    print(f"\n完成：删除 {deleted_msgs} 条消息记录，{deleted_files} 条文件记录")
+    print(f"\n完成：删除 {summary.deleted_messages} 条消息记录，"
+          f"{len(summary.deleted_files)} 条文件记录")
 
 
 if __name__ == "__main__":

@@ -80,3 +80,31 @@ def test_dry_run_keeps_failure_ledger(tmp_path, monkeypatch):
 
     assert db.get_failure("-1001234567890", 300) is not None
     assert db.get_checkpoint("-1001234567890") == 350
+
+
+def test_purge_is_atomic_on_failure(tmp_path, monkeypatch):
+    """
+    purge 中途失败必须整笔回滚。
+
+    曾经是三段独立事务：messages+files 先提交，失败账、checkpoint 各自提交。
+    在第一段之后崩掉会留下「行没了、checkpoint 没退」的静默半程状态 ——
+    那些消息永远不被重扫，记录已经消失。反过来先回退后删也有坏窗口
+    （下轮扫描撞上还活着的 files 行，被 file_unique_id 去重跳过）。
+    """
+    _path, db = _seed(tmp_path)
+
+    import db as db_module
+
+    # _now 在 checkpoint 回退（最后一步）才被调用：patch 它让删除全部生效后事务崩掉
+    def boom():
+        raise RuntimeError("模拟写库中途失败")
+
+    monkeypatch.setattr(db_module, "_now", boom)
+
+    with pytest.raises(RuntimeError):
+        db.purge_messages([300])
+
+    # 整笔回滚：行、失败账、checkpoint 全部原样
+    assert db.find_by_unique_id("FUID_DEL") is not None
+    assert db.get_failure("-1001234567890", 300) is not None
+    assert db.get_checkpoint("-1001234567890") == 350
