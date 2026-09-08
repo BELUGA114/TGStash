@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
 from db import ArchiveDB
+from logging_setup import configure_logging
 from media_ops import get_media
 from pipeline import ArchivePipeline, PipelineConfig
 from pyrogram.client import Client
@@ -65,22 +66,7 @@ SESSION_DIR = os.path.join(DATA_DIR, "session")
 DB_PATH = os.path.join(DATA_DIR, "db", "archive.db")
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "tmp", "listener")
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logger = logging.getLogger(__name__)
-
-
-def _configure_logging() -> None:
-    """日志配置属于进程启动，不属于 import。"""
-    logging.basicConfig(
-        # 走 getLevelNamesMapping 而不是 getattr(logging, LOG_LEVEL)：后者对小写的
-        # LOG_LEVEL=debug 会取到 logging.debug 这个函数，basicConfig 直接抛
-        # TypeError（Level not an integer），服务启动即崩
-        level=logging.getLevelNamesMapping().get(LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
-    logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -527,7 +513,7 @@ async def scan_once(ctx: ListenerContext):
 
 
 async def main():
-    _configure_logging()
+    configure_logging()
     # 启动预检：ffmpeg/ffprobe 缺失时直接退出，让 Docker 重启
     if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
         logger.error("ffmpeg/ffprobe 未安装，退出")
