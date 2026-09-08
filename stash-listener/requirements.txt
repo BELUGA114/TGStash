@@ -1,3 +1,5 @@
 Kurigram==2.2.23
-Pillow>=10.0.0
-TgCrypto>=1.2.5
+# 钉死版本，与 Kurigram / pyright / ruff 同一条理由：镜像构建要可复现，
+# CI 测的版本不能与线上漂移。升级走显式改动这一处
+Pillow==12.3.0
+TgCrypto==1.2.5
