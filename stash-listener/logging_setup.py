@@ -27,7 +27,7 @@ def configure_logging() -> None:
     level = os.environ.get("LOG_LEVEL", "INFO")
     logging.basicConfig(
         level=logging.getLevelNamesMapping().get(level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     # Pyrogram 内部 MTProto 传输日志每个 TCP 包一条，抑制到 WARNING
