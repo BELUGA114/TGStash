@@ -711,3 +711,17 @@ class ArchiveDB:
                     rollback[chat_id] = (old_cp, new_cp)
 
             return PurgeSummary(deleted_messages, deleted_files, cleared_failures, rollback)
+
+    def backup_to(self, dest_path: str) -> None:
+        """
+        用 VACUUM INTO 打一份一致的单文件快照到 dest_path。
+
+        WAL 模式下 VACUUM INTO 安全：产出的是包含全部已提交数据的独立 db 文件，
+        可直接拿去查。VACUUM 不能在事务里跑；本方法只发这一条语句，_connect
+        不会为它开隐式事务（sqlite3 只在 DML 前隐式开事务），所以直接执行即可。
+
+        纯 DB 操作：不读环境变量、不碰 Telegram。调用方（listener）负责计时、
+        保留份数与可选上传，也负责把这个同步阻塞调用放进 asyncio.to_thread。
+        """
+        with self._connect() as con:
+            con.execute("VACUUM INTO ?", (dest_path,))

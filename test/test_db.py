@@ -811,3 +811,30 @@ class TestRecordArchived:
         assert db.find_by_unique_id("FUID_ATOMIC") is None, "files 那条必须跟着回滚"
         assert db.find_by_sha256("a" * 64) is None
         assert db.search("原子写测试内容") == []
+
+
+class TestBackup:
+    def test_backup_creates_consistent_snapshot(self, db: ArchiveDB, tmp_path):
+        """backup_to 产出可独立打开、行数一致的单文件快照。"""
+        db.ensure_channel("-1001234567890", "manual_forward")
+        db.record_archived(
+            file_unique_id="FUID_BK", sha256="b" * 64, size=1024, source="link",
+            source_channel="-1001234567890", archived_chat_id="-1009876543210",
+            archived_message_id=42, source_chat_id="-1001234567890",
+            source_message_id=7, caption="备份测试", media_kind="document",
+            origin_type="link",
+        )
+
+        dest = str(tmp_path / "snap.db")
+        db.backup_to(dest)
+
+        assert os.path.exists(dest)
+        snap = sqlite3.connect(dest)
+        try:
+            assert snap.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+            assert snap.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+            assert snap.execute(
+                "SELECT file_unique_id FROM files"
+            ).fetchone()[0] == "FUID_BK"
+        finally:
+            snap.close()
