@@ -74,6 +74,7 @@ SESSION_DIR = os.path.join(DATA_DIR, "session")
 DB_PATH = os.path.join(DATA_DIR, "db", "archive.db")
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "tmp", "listener")
 BACKUP_DIR = os.path.join(DATA_DIR, "db", "backups")
+HEARTBEAT_PATH = os.path.join(DATA_DIR, "tmp", "heartbeat")
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +589,20 @@ async def _maybe_backup(ctx: ListenerContext, now: float, state: dict) -> None:
         await _run_backup(ctx, now)
     except Exception:
         logger.warning("DB 备份失败，跳过本轮", exc_info=True)
+
+
+def _write_heartbeat(now: float) -> None:
+    """
+    写一行当前 epoch 秒到心跳文件，供 healthcheck 判活。
+
+    每轮循环无条件写（空闲轮也写）：没新消息不等于死，只在有消息时写会误报。
+    写失败只 warning，不影响主循环——心跳是观测手段，不该反过来拖垮被观测的进程。
+    """
+    try:
+        with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+            f.write(str(int(now)))
+    except OSError:
+        logger.warning("写心跳失败：%s", HEARTBEAT_PATH, exc_info=True)
 
 
 async def main():
