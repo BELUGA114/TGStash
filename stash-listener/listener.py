@@ -603,6 +603,8 @@ async def main():
         me = await ctx.client.get_me()
         logger.info("已登录：%s (id=%s)，冷却间隔 %ss", me.first_name, me.id, SCAN_INTERVAL_SECONDS)
         last_processed_at = 0.0
+        # 备份计时独立于扫描：首启动即视为「刚备份过」，避免每次重启都立刻备份
+        backup_state = {"last_backup_at": time.time()}
 
         while True:
             try:
@@ -615,7 +617,11 @@ async def main():
                 n = await scan_once(ctx)
                 if n > 0:
                     last_processed_at = time.time()
-                else:
+
+                # 备份闸门：到点才备份，失败不阻塞。放在 sleep 之前，空闲轮也检查
+                await _maybe_backup(ctx, time.time(), backup_state)
+
+                if n == 0:
                     logger.debug("无新消息，%ss 后再查", SCAN_INTERVAL_SECONDS)
                     await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             except Exception:
