@@ -288,6 +288,13 @@ class PurgeSummary(NamedTuple):
     rollback: dict[str, tuple[int, int]]        # chat_id → (旧 checkpoint, 新 checkpoint)
 
 
+class ResetSummary(NamedTuple):
+    """reset_skipped 的结果，供脚本回退 checkpoint 与打印。"""
+
+    reset_entries: list[tuple[str, int]]   # 被重置的 (入口 chat_id, 入口 message_id)
+    min_message_id: int | None             # 选中行里最小的 source_message_id；无匹配为 None
+
+
 def _fetch_messages_by_source(con, source_message_ids: list[int]) -> list[sqlite3.Row]:
     placeholders = ",".join("?" * len(source_message_ids))
     return con.execute(
@@ -619,6 +626,52 @@ class ArchiveDB:
                    WHERE source_chat_id=? AND source_message_id=?""",
                 (_now(), reason, str(source_chat_id), source_message_id),
             )
+
+    def reset_skipped(self, source_message_ids: list[int] | None = None) -> ResetSummary:
+        """
+        把 status='skipped' 的行重排回重试队列：单事务内置 retrying + 清零 attempts。
+
+        source_message_ids=None 处理全部 skipped；否则只处理传入 id 与 skipped 行的
+        交集（传了 retrying 或不存在的 id 一律忽略）。清零 attempts 是必须的——残留的
+        attempt_count 会让重来的那次一失败就再次跳过，「重排回队列」只兑现一半。
+
+        返回受影响入口键与最小 message_id。checkpoint 回退由脚本按接收频道 id
+        在库外做（archive_failures.source_* 与 checkpoint 同为入口语义，id 空间一致）。
+        无匹配行返回空摘要，脚本据此不动 checkpoint。
+        """
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            if source_message_ids is None:
+                rows = con.execute(
+                    "SELECT source_chat_id, source_message_id FROM archive_failures "
+                    "WHERE status='skipped'"
+                ).fetchall()
+            else:
+                if not source_message_ids:
+                    return ResetSummary([], None)
+                placeholders = ",".join("?" * len(source_message_ids))
+                rows = con.execute(
+                    f"SELECT source_chat_id, source_message_id FROM archive_failures "
+                    f"WHERE status='skipped' AND source_message_id IN ({placeholders})",
+                    source_message_ids,
+                ).fetchall()
+
+            if not rows:
+                return ResetSummary([], None)
+
+            entries = sorted((str(r["source_chat_id"]), r["source_message_id"])
+                             for r in rows)
+            now = _now()
+            for chat_id, msg_id in entries:
+                con.execute(
+                    """UPDATE archive_failures
+                       SET status='retrying', attempt_count=0,
+                           last_failed_at=?, skipped_at=NULL, skipped_reason=NULL
+                       WHERE source_chat_id=? AND source_message_id=?""",
+                    (now, chat_id, msg_id),
+                )
+            min_id = min(mid for _, mid in entries)
+            return ResetSummary(entries, min_id)
 
     def delete_failure(self, source_chat_id, source_message_id: int):
         with self._connect() as con:
