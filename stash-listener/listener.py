@@ -552,6 +552,44 @@ async def scan_once(ctx: ListenerContext):
     return processed
 
 
+async def _run_backup(ctx: ListenerContext, now: float) -> None:
+    """打一份快照 → 保留最近 N 份 → 可选上传。同步 VACUUM 走 to_thread。"""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, _backup_filename(now))
+    await asyncio.to_thread(ctx.db.backup_to, dest)
+    logger.info("DB 备份完成：%s", dest)
+
+    for path in backups_to_delete(_list_backups(BACKUP_DIR), DB_BACKUP_KEEP):
+        try:
+            os.remove(path)
+            logger.info("删除旧备份：%s", path)
+        except OSError:
+            logger.warning("删除旧备份失败：%s", path, exc_info=True)
+
+    if DB_BACKUP_UPLOAD:
+        await ctx.client.send_document(ctx.archive_chat, dest)
+        await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
+        logger.info("备份快照已上传备份频道：%s", os.path.basename(dest))
+
+
+async def _maybe_backup(ctx: ListenerContext, now: float, state: dict) -> None:
+    """
+    备份计时闸门。到点才备份，独立于扫描计时。
+
+    先更新 last_backup_at 再执行：备份失败不应让下一轮立刻重试成紧循环，
+    等满一个间隔再来。任何一步失败只记 warning，绝不阻塞归档主流程。
+    """
+    if DB_BACKUP_INTERVAL_SECONDS <= 0:
+        return
+    if now - state["last_backup_at"] < DB_BACKUP_INTERVAL_SECONDS:
+        return
+    state["last_backup_at"] = now
+    try:
+        await _run_backup(ctx, now)
+    except Exception:
+        logger.warning("DB 备份失败，跳过本轮", exc_info=True)
+
+
 async def main():
     configure_logging()
     # 启动预检：ffmpeg/ffprobe 缺失时直接退出，让 Docker 重启
