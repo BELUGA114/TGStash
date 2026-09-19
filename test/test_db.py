@@ -838,3 +838,53 @@ class TestBackup:
             ).fetchone()[0] == "FUID_BK"
         finally:
             snap.close()
+
+
+class TestResetSkipped:
+    def _seed_mixed(self, db: ArchiveDB, chat="-1001234567890"):
+        """造 skipped / retrying / 正常 混合行。"""
+        db.ensure_channel(chat, "manual_forward")
+        # 两条 skipped
+        db.increment_failure(chat, 100, "download", "代理断")
+        db.mark_failure_skipped(chat, 100, "重试 3 次仍失败: download")
+        db.increment_failure(chat, 105, "upload", "flood")
+        db.mark_failure_skipped(chat, 105, "重试 3 次仍失败: upload")
+        # 一条仍在 retrying
+        db.increment_failure(chat, 110, "verify", "临时")
+        return chat
+
+    def test_reset_all_skipped(self, db: ArchiveDB):
+        chat = self._seed_mixed(db)
+
+        summary = db.reset_skipped()
+
+        assert sorted(mid for _, mid in summary.reset_entries) == [100, 105]
+        assert summary.min_message_id == 100
+        # 两条 skipped 变回 retrying、attempts 清零
+        for mid in (100, 105):
+            row = db.get_failure(chat, mid)
+            assert row["status"] == "retrying"
+            assert row["attempt_count"] == 0
+        # 原本 retrying 的不受影响
+        assert db.get_failure(chat, 110)["status"] == "retrying"
+
+    def test_reset_only_intersection(self, db: ArchiveDB):
+        chat = self._seed_mixed(db)
+
+        # 传的 id 里 105 是 skipped、110 是 retrying（不该动）、999 不存在
+        summary = db.reset_skipped([105, 110, 999])
+
+        assert [mid for _, mid in summary.reset_entries] == [105]
+        assert summary.min_message_id == 105
+        assert db.get_failure(chat, 100)["status"] == "skipped"   # 没传，不动
+        assert db.get_failure(chat, 105)["status"] == "retrying"
+        assert db.get_failure(chat, 110)["attempt_count"] == 1    # retrying 不清零
+
+    def test_reset_none_matches_returns_empty(self, db: ArchiveDB):
+        db.ensure_channel("-1001234567890", "manual_forward")
+        db.increment_failure("-1001234567890", 110, "verify", "临时")  # 只有 retrying
+
+        summary = db.reset_skipped()
+
+        assert summary.reset_entries == []
+        assert summary.min_message_id is None
