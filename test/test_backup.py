@@ -33,3 +33,20 @@ class TestRetention:
             "/b/archive-20260101-000000.db",
             "/b/archive-20260102-000000.db",
         ]
+
+
+from datetime import UTC, datetime
+
+
+class TestSnapshotName:
+    def test_filename_is_utc_timestamped(self):
+        now = datetime(2026, 9, 19, 3, 4, 5, tzinfo=UTC).timestamp()
+        assert listener._backup_filename(now) == "archive-20260919-030405.db"
+
+
+class TestContextHasArchiveChat:
+    def test_context_field_exists(self):
+        """ListenerContext 带 archive_chat 字段，备份上传要用。"""
+        import inspect
+        assert "archive_chat" in inspect.signature(
+            listener.ListenerContext).parameters

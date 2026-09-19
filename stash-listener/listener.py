@@ -27,6 +27,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import NamedTuple
 from urllib.parse import urlparse
 
@@ -59,6 +60,13 @@ VIDEO_COMPRESS_CRF = int(os.environ.get("VIDEO_COMPRESS_CRF", "28"))
 # x264 编码线程上限。它默认按核心数×1.5 开线程，高核数机器上初始化时内存暴增可能被
 # OOM 杀死；0 表示不限制
 VIDEO_COMPRESS_THREADS = int(os.environ.get("VIDEO_COMPRESS_THREADS", "4"))
+# DB 备份：未设 = 默认 24h（升级后不改 .env 也有基本保护）；0 = 显式关闭自动备份，
+# 留给未来 TG 命令手动触发。0 与未设区分明确
+DB_BACKUP_INTERVAL_SECONDS = int(os.environ.get("DB_BACKUP_INTERVAL_SECONDS", "86400"))
+# 本地保留份数，超出删最旧
+DB_BACKUP_KEEP = int(os.environ.get("DB_BACKUP_KEEP", "7"))
+# 是否把新快照也上传到备份频道（异地容灾）
+DB_BACKUP_UPLOAD = os.environ.get("DB_BACKUP_UPLOAD", "false").lower() == "true"
 
 # 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -84,6 +92,7 @@ class ListenerContext:
     db: ArchiveDB
     pipeline: ArchivePipeline
     receive_chat: int
+    archive_chat: int
 
 
 def _build_client(api_id: int, api_hash: str) -> Client:
@@ -111,6 +120,7 @@ def _build_context() -> ListenerContext:
     os.makedirs(SESSION_DIR, exist_ok=True)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
 
     archive_db = ArchiveDB(DB_PATH)
     client = _build_client(api_id, api_hash)
@@ -139,7 +149,7 @@ def _build_context() -> ListenerContext:
         download_dir=DOWNLOAD_DIR,
     )
     return ListenerContext(client=client, db=archive_db, pipeline=pipeline,
-                           receive_chat=receive_chat)
+                           receive_chat=receive_chat, archive_chat=archive_chat)
 
 
 TME_LINK_RE = re.compile(r"https?://t\.me/\S+")
@@ -225,6 +235,11 @@ def _list_backups(backup_dir: str) -> list[str]:
         for name in os.listdir(backup_dir)
         if name.startswith("archive-") and name.endswith(".db")
     ]
+
+
+def _backup_filename(now: float) -> str:
+    """按 UTC 时间戳生成快照文件名。同一秒内重复备份会撞名，24h 间隔下不会发生。"""
+    return datetime.fromtimestamp(now, UTC).strftime("archive-%Y%m%d-%H%M%S.db")
 
 
 def backups_to_delete(paths: list[str], keep: int) -> list[str]:
