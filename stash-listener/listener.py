@@ -630,6 +630,9 @@ async def main():
                     await asyncio.sleep(wait)
 
                 n = await scan_once(ctx)
+                # 心跳：scan_once 返回后无条件写，空闲轮也写。写在这里而不进
+                # scan_once，保持后者只管「扫描 + checkpoint」的职责边界
+                _write_heartbeat(time.time())
                 if n > 0:
                     last_processed_at = time.time()
 
