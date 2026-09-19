@@ -134,13 +134,15 @@ async def _noop_mark(*a, **k):
     return None
 
 
-def _ctx(db=None, *, client=None, pipeline=None, receive_chat=-1001234567890):
+def _ctx(db=None, *, client=None, pipeline=None, receive_chat=-1001234567890,
+         archive_chat=-1009876543210):
     """按需组装 ListenerContext：没传的给空桩，被意外调用会 AttributeError。"""
     return listener.ListenerContext(
         client=client if client is not None else SimpleNamespace(),
         db=db if db is not None else SimpleNamespace(),
         pipeline=pipeline if pipeline is not None else SimpleNamespace(),
         receive_chat=receive_chat,
+        archive_chat=archive_chat,
     )
 
 

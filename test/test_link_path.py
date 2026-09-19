@@ -184,7 +184,8 @@ class FakePipeline:
 def _ctx(client, pipeline):
     """db 给空桩：路径二不碰 DB，碰了就是 AttributeError（正是想要的）。"""
     return listener.ListenerContext(client=client, db=SimpleNamespace(),
-                                   pipeline=pipeline, receive_chat=-1001234567890)
+                                   pipeline=pipeline, receive_chat=-1001234567890,
+                                   archive_chat=-1009876543210)
 
 
 def _run(client, text, pipeline=None):
