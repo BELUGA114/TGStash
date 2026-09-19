@@ -1,8 +1,7 @@
 """设计 C：心跳写入与 healthcheck 判定测试。"""
-import pytest
-
 import healthcheck
 import listener
+import pytest
 
 
 class TestWriteHeartbeat:
