@@ -65,6 +65,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 SESSION_DIR = os.path.join(DATA_DIR, "session")
 DB_PATH = os.path.join(DATA_DIR, "db", "archive.db")
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "tmp", "listener")
+BACKUP_DIR = os.path.join(DATA_DIR, "db", "backups")
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,30 @@ def parse_message_link(link: str) -> tuple[int | str, int]:
     if m:
         return (f"@{m.group(1)}", int(m.group(2)))
     raise ValueError(f"无法解析链接：{link}")
+
+
+def _list_backups(backup_dir: str) -> list[str]:
+    """列出备份目录里的快照文件全路径。目录不存在时返回空。"""
+    if not os.path.isdir(backup_dir):
+        return []
+    return [
+        os.path.join(backup_dir, name)
+        for name in os.listdir(backup_dir)
+        if name.startswith("archive-") and name.endswith(".db")
+    ]
+
+
+def backups_to_delete(paths: list[str], keep: int) -> list[str]:
+    """
+    保留最近 keep 份，返回其余待删路径。
+
+    快照文件名 archive-YYYYMMDD-HHMMSS.db 里时间戳是零填充的，按 basename
+    字典序排序等于按时间排序。入参顺序无关：函数内部自己排。
+    """
+    ordered = sorted(paths, key=os.path.basename)
+    if keep <= 0:
+        return ordered
+    return ordered[:-keep] if len(ordered) > keep else []
 
 
 async def mark_processed(client: Client, message: Message, duplicate: bool):
