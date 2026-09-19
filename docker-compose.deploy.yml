@@ -32,3 +32,9 @@ services:
       - /data/TGStash/tdl-session:/root/.tdl
       - /data/TGStash/db:/data/db
       - /data/TGStash/tmp:/data/tmp
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

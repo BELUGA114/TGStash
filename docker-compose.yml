@@ -12,3 +12,9 @@ services:
       - ./data/tdl-session:/root/.tdl
       - ./data/db:/data/db
       - ./data/tmp:/data/tmp
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
