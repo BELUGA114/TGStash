@@ -77,6 +77,23 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 - **路径二（链接）**：复制消息链接发到接收频道。支持 `t.me/username/123`（公开）和 `t.me/c/数字/123`（私有，账号需已加入），原链接原地编辑添加 `✅ 已归档`
 - **失败处理**：归档失败会在接收频道回复原消息告警（首次失败提示将重试，重试满 `RETRY_MAX_ATTEMPTS` 次后标记跳过并保留原消息），单条失败不阻塞后续归档。
 
+### bot 命令（可选）
+
+在 `.env` 里设 `TG_BOT_TOKEN`（@BotFather 新建 bot 拿 token）与 `BOT_ADMIN_IDS`
+（你自己的 user id，逗号分隔），`docker compose up -d` 后 bot 自动登录（session 落在
+`data/session/`，不需要另跑登录脚本）。**先用你的账号给 bot 发一条消息**，否则 bot
+收不到你的命令；要用在群里就把它拉进群。非白名单用户发什么都静默无响应。
+
+| 命令 | 作用 |
+|---|---|
+| `/stats` | 归档文件总数、类型分布、去重命中数、失败账计数 |
+| `/search 关键词` | 搜索归档内容（FTS5 trigram，每个关键词至少 3 个字符） |
+| `/failures` | 列出失败账：入口消息 id、阶段、重试次数、最近错误 |
+| `/retry [id ...]` | 把 skipped 的条目重排回重试队列并回退 checkpoint；无参 = 全部 |
+| `/backup` | 立刻打一份 `archive.db` 快照 |
+
+写命令（`/retry`、`/backup`）会等当前扫描轮跑完才执行，延迟最多一轮扫描间隔。
+
 ## 配置
 
 | 变量 | 默认值 | 说明 |
@@ -99,6 +116,8 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 | `VIDEO_COMPRESS_CRF` | `28` | H.264 CRF 恒定质量值，越小质量越高体积越大 |
 | `VIDEO_COMPRESS_THREADS` | `4` | x264 编码线程数上限，设为 `0` 则不限制 |
 | `HTTP_PROXY` | — | 代理地址，如 `http://host:port` |
+| `TG_BOT_TOKEN` | — | BotFather 给的 token；不设则 bot 命令功能关闭 |
+| `BOT_ADMIN_IDS` | — | bot 管理员 user id，逗号分隔；留空 = 谁都不授权 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
 
