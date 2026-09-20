@@ -46,6 +46,9 @@ def test_build_context_creates_dirs_and_wires_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(listener, "SESSION_DIR", str(tmp_path / "session"))
     monkeypatch.setattr(listener, "DOWNLOAD_DIR", str(tmp_path / "tmp"))
     monkeypatch.setattr(listener, "DB_PATH", str(tmp_path / "db" / "archive.db"))
+    # BACKUP_DIR 也要改到 tmp：_build_context 会 makedirs 它，漏改就落到默认 /data，
+    # CI 的非 root 用户建不了 /data 直接 PermissionError（本机 Windows 恰好能建才没暴露）
+    monkeypatch.setattr(listener, "BACKUP_DIR", str(tmp_path / "db" / "backups"))
     monkeypatch.setattr(listener, "_build_client", lambda api_id, api_hash: SimpleNamespace())
 
     ctx = listener._build_context()
@@ -53,4 +56,5 @@ def test_build_context_creates_dirs_and_wires_pipeline(tmp_path, monkeypatch):
     assert ctx.receive_chat == -1001234567890
     assert (tmp_path / "session").is_dir() and (tmp_path / "tmp").is_dir()
     assert (tmp_path / "db" / "archive.db").exists()
+    assert (tmp_path / "db" / "backups").is_dir()
     assert ctx.pipeline is not None and ctx.db is not None
