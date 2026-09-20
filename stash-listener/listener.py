@@ -186,7 +186,8 @@ def entry_text(message: Message) -> str:
     return message.text or message.caption or ""
 
 
-# Telegram 单条文本上限 4096（按字符算，与现有截断口径一致），超了整条编辑会被拒
+# Telegram 单条文本上限 4096（按字符算，与现有截断口径一致），超了整条编辑会被拒。
+# bot_commands.TELEGRAM_TEXT_LIMIT 是同一上限的另一份常量（那边 import 本模块会成环）
 TELEGRAM_TEXT_LIMIT = 4096
 LINK_ARCHIVED_MARK = "✅ 已归档"
 
