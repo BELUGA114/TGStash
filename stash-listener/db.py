@@ -288,6 +288,16 @@ class PurgeSummary(NamedTuple):
     rollback: dict[str, tuple[int, int]]        # chat_id → (旧 checkpoint, 新 checkpoint)
 
 
+class Stats(NamedTuple):
+    """归档统计。供 bot `/stats` 回复。"""
+
+    total_files: int              # files 行数 = 登记过的唯一文件数（含去重命中）
+    message_count: int            # messages 行数 = 归档的消息条目数
+    dedup_hits: int               # 命中 SHA-256 去重、只登记文件没上传的条数
+    by_kind: dict[str, int]       # media_kind → 文件数；NULL 归到 'unknown'
+    failures: dict[str, int]      # archive_failures.status → 行数
+
+
 class ResetSummary(NamedTuple):
     """reset_skipped 的结果，供脚本回退 checkpoint 与打印。"""
 
@@ -573,6 +583,32 @@ class ArchiveDB:
                 "UPDATE messages SET origin_type='unknown' WHERE id=? AND origin_type IS NULL",
                 (row_id,),
             )
+
+    def stats(self) -> Stats:
+        """
+        聚合统计。四个数各自一条 SQL，别为了「一次查询」把它们拼成子查询迷宫。
+
+        dedup_hits = files 行数 − messages 行数：归档成功写 1 条 files + 1 条 messages，
+        而 SHA-256 命中的重复只写 files（pipeline._record_dedup_file，没有新消息可记），
+        差值就是「去重命中、没上传」的条数。file_unique_id 快速通道的命中不写任何行，
+        库里数不出来，不在这个口径里。
+        老库可能有 record_archived 之前的写入路径残留（messages 多于 files），
+        差值钳到 0，别回一个负数出去。
+        """
+        with self._connect() as con:
+            total_files = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            message_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            by_kind = {row[0]: row[1] for row in con.execute(
+                "SELECT COALESCE(media_kind, 'unknown'), COUNT(*) FROM files GROUP BY 1")}
+            failures = {row[0]: row[1] for row in con.execute(
+                "SELECT status, COUNT(*) FROM archive_failures GROUP BY 1")}
+        return Stats(
+            total_files=total_files,
+            message_count=message_count,
+            dedup_hits=max(total_files - message_count, 0),
+            by_kind=by_kind,
+            failures=failures,
+        )
 
     def search(self, query: str, limit: int = 20):
         match = build_match_query(query)
