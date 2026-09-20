@@ -298,11 +298,11 @@ class Stats(NamedTuple):
     failures: dict[str, int]      # archive_failures.status → 行数
 
 
-class ResetSummary(NamedTuple):
-    """reset_skipped 的结果，供脚本回退 checkpoint 与打印。"""
+class RetrySummary(NamedTuple):
+    """retry_skipped 的结果，供脚本与 bot 打印。"""
 
-    reset_entries: list[tuple[str, int]]   # 被重置的 (入口 chat_id, 入口 message_id)
-    min_message_id: int | None             # 选中行里最小的 source_message_id；无匹配为 None
+    reset_entries: list[tuple[str, int]]     # 被重置的 (入口 chat_id, 入口 message_id)
+    rollback: dict[str, tuple[int, int]]     # 真回退了 checkpoint 的 chat_id → (旧, 新)
 
 
 def _fetch_messages_by_source(con, source_message_ids: list[int]) -> list[sqlite3.Row]:
@@ -679,17 +679,20 @@ class ArchiveDB:
                 (_now(), reason, str(source_chat_id), source_message_id),
             )
 
-    def reset_skipped(self, source_message_ids: list[int] | None = None) -> ResetSummary:
+    def retry_skipped(self, source_message_ids: list[int] | None = None) -> RetrySummary:
         """
-        把 status='skipped' 的行重排回重试队列：单事务内置 retrying + 清零 attempts。
+        把 status='skipped' 的行重排回重试队列，并把 checkpoint 回退到各入口 chat 的
+        min(source_message_id) - 1 —— 一个事务写完。
 
-        source_message_ids=None 处理全部 skipped；否则只处理传入 id 与 skipped 行的
-        交集（传了 retrying 或不存在的 id 一律忽略）。清零 attempts 是必须的——残留的
-        attempt_count 会让重来的那次一失败就再次跳过，「重排回队列」只兑现一半。
+        必须是一个事务：先重置后回退，中间崩掉 = 行变回 retrying 而 checkpoint 没退，
+        那几条媒体永远不再被重扫，失败账里躺着一堆再也不会被碰的行。
+        回退规则与 purge_messages 一致：只退不进（new >= old 不动）、按入口 chat 分组。
 
-        返回受影响入口键与最小 message_id。checkpoint 回退由脚本按接收频道 id
-        在库外做（archive_failures.source_* 与 checkpoint 同为入口语义，id 空间一致）。
-        无匹配行返回空摘要，脚本据此不动 checkpoint。
+        source_message_ids=None 处理全部 skipped；否则只处理与 skipped 行的交集
+        （传了 retrying 或不存在的 id 一律忽略）。清零 attempt_count 是必须的 ——
+        残留的计数会让重来的那次一失败就再次跳过，「重排回队列」只兑现一半。
+
+        写库走调用方那把 asyncio.Lock（bot `/retry` 与脚本各自持有），本方法只管事务。
         """
         with self._connect() as con:
             con.row_factory = sqlite3.Row
@@ -700,7 +703,7 @@ class ArchiveDB:
                 ).fetchall()
             else:
                 if not source_message_ids:
-                    return ResetSummary([], None)
+                    return RetrySummary([], {})
                 placeholders = ",".join("?" * len(source_message_ids))
                 rows = con.execute(
                     f"SELECT source_chat_id, source_message_id FROM archive_failures "
@@ -709,7 +712,7 @@ class ArchiveDB:
                 ).fetchall()
 
             if not rows:
-                return ResetSummary([], None)
+                return RetrySummary([], {})
 
             entries = sorted((str(r["source_chat_id"]), r["source_message_id"])
                              for r in rows)
@@ -722,8 +725,26 @@ class ArchiveDB:
                        WHERE source_chat_id=? AND source_message_id=?""",
                     (now, chat_id, msg_id),
                 )
-            min_id = min(mid for _, mid in entries)
-            return ResetSummary(entries, min_id)
+
+            chat_min: dict[str, int] = {}
+            for chat_id, msg_id in entries:
+                chat_min[chat_id] = min(chat_min.get(chat_id, msg_id), msg_id)
+
+            rollback: dict[str, tuple[int, int]] = {}
+            for chat_id, min_id in chat_min.items():
+                new_cp = min_id - 1
+                cp_row = con.execute(
+                    "SELECT last_message_id FROM channels WHERE chat_id=?", (chat_id,)
+                ).fetchone()
+                # 频道行不存在 = 从没跑过 ensure_channel，无 checkpoint 可回退
+                if cp_row is None:
+                    continue
+                old_cp = cp_row[0]
+                if new_cp < old_cp:
+                    con.execute(_CHECKPOINT_UPDATE, (new_cp, now, chat_id))
+                    rollback[chat_id] = (old_cp, new_cp)
+
+            return RetrySummary(entries, rollback)
 
     def delete_failure(self, source_chat_id, source_message_id: int):
         with self._connect() as con:
