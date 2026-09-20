@@ -116,10 +116,14 @@ def _build_client(api_id: int, api_hash: str) -> Client:
     return Client("listener", **kwargs)
 
 
-def _build_bot_client() -> Client | None:
+def _build_bot_client(api_id: int, api_hash: str) -> Client | None:
     """
     bot 模式 Client（bot_token 登录，独立 session 名 'bot'）。TG_BOT_TOKEN 未设时
     返回 None —— 整个 bot 功能关闭，main() 只跑 userbot。
+
+    api_id/api_hash 必传：即使用 bot_token 登录，Pyrogram 建立新授权时仍要求
+    API key，缺了会在 load_session 抛「The API key is required for new
+    authorizations」。与 userbot 复用同一对凭证（同一个 app）。
 
     与 _build_client 同样单独拆出来：测试要能替掉它（它会碰 workdir）。
     这里不学 _build_client 攒 kwargs 字典：全部是字符串值时 pyright 推成
@@ -129,9 +133,11 @@ def _build_bot_client() -> Client | None:
     if not TG_BOT_TOKEN:
         return None
     if not HTTP_PROXY:
-        return Client("bot", bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR)
+        return Client("bot", api_id=api_id, api_hash=api_hash,
+                      bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR)
     u = urlparse(HTTP_PROXY)
-    return Client("bot", bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR,
+    return Client("bot", api_id=api_id, api_hash=api_hash,
+                  bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR,
                   proxy={"scheme": u.scheme, "hostname": u.hostname, "port": u.port})
 
 
@@ -709,7 +715,8 @@ async def main():
     # 写命令（bot 的 /retry、/backup）与扫描轮共用这一把锁。不做模块级全局：
     # 与其余依赖一样在这里造、注入给两侧
     db_lock = asyncio.Lock()
-    bot_client = _build_bot_client()
+    # bot Client 与 userbot 复用同一对 API 凭证（同一个 app），bot_token 只是登录方式
+    bot_client = _build_bot_client(int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
 
     async with ctx.client:
         ctx.db.ensure_channel(ctx.receive_chat, "manual_forward")
