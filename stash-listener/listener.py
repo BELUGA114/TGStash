@@ -32,6 +32,12 @@ from typing import NamedTuple
 from urllib.parse import urlparse
 
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
+from bot_commands import (
+    BotContext,
+    parse_admin_ids,
+    register_command_menu,
+    register_handlers,
+)
 from db import ArchiveDB
 from logging_setup import configure_logging
 from media_ops import get_media
@@ -67,6 +73,10 @@ DB_BACKUP_INTERVAL_SECONDS = int(os.environ.get("DB_BACKUP_INTERVAL_SECONDS", "8
 DB_BACKUP_KEEP = int(os.environ.get("DB_BACKUP_KEEP", "7"))
 # 是否把新快照也上传到备份频道（异地容灾）
 DB_BACKUP_UPLOAD = os.environ.get("DB_BACKUP_UPLOAD", "false").lower() == "true"
+# TG bot 命令：未设 token = 整个 bot 功能关闭，main() 只跑 userbot，行为与加 bot 之前一致
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+# bot admin 白名单，逗号分隔的 user id；未设/空 = 谁都不授权
+BOT_ADMIN_IDS = parse_admin_ids(os.environ.get("BOT_ADMIN_IDS", ""))
 
 # 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -104,6 +114,25 @@ def _build_client(api_id: int, api_hash: str) -> Client:
         u = urlparse(HTTP_PROXY)
         kwargs["proxy"] = {"scheme": u.scheme, "hostname": u.hostname, "port": u.port}
     return Client("listener", **kwargs)
+
+
+def _build_bot_client() -> Client | None:
+    """
+    bot 模式 Client（bot_token 登录，独立 session 名 'bot'）。TG_BOT_TOKEN 未设时
+    返回 None —— 整个 bot 功能关闭，main() 只跑 userbot。
+
+    与 _build_client 同样单独拆出来：测试要能替掉它（它会碰 workdir）。
+    这里不学 _build_client 攒 kwargs 字典：全部是字符串值时 pyright 推成
+    dict[str, str]，再往里塞 proxy 字典会报类型错（_build_client 里混了个 int，
+    正好躲过这一条，那不是可以照抄的理由）。
+    """
+    if not TG_BOT_TOKEN:
+        return None
+    if not HTTP_PROXY:
+        return Client("bot", bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR)
+    u = urlparse(HTTP_PROXY)
+    return Client("bot", bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR,
+                  proxy={"scheme": u.scheme, "hostname": u.hostname, "port": u.port})
 
 
 def _build_context() -> ListenerContext:
@@ -554,8 +583,9 @@ async def scan_once(ctx: ListenerContext):
     return processed
 
 
-async def _run_backup(ctx: ListenerContext, now: float) -> None:
-    """打一份快照 → 保留最近 N 份 → 可选上传。同步 VACUUM 走 to_thread。"""
+async def _run_backup(ctx: ListenerContext, now: float) -> str:
+    """打一份快照 → 保留最近 N 份 → 可选上传。同步 VACUUM 走 to_thread。
+    返回快照路径：bot 的 /backup 要把它回给 admin。"""
     os.makedirs(BACKUP_DIR, exist_ok=True)
     dest = os.path.join(BACKUP_DIR, _backup_filename(now))
     await asyncio.to_thread(ctx.db.backup_to, dest)
@@ -572,6 +602,8 @@ async def _run_backup(ctx: ListenerContext, now: float) -> None:
         await ctx.client.send_document(ctx.archive_chat, dest)
         await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
         logger.info("备份快照已上传备份频道：%s", os.path.basename(dest))
+
+    return dest
 
 
 async def _maybe_backup(ctx: ListenerContext, now: float, state: dict) -> None:
@@ -606,6 +638,66 @@ def _write_heartbeat(now: float) -> None:
         logger.warning("写心跳失败：%s", HEARTBEAT_PATH, exc_info=True)
 
 
+async def scan_loop(ctx: ListenerContext, lock: asyncio.Lock) -> None:
+    """
+    扫描主循环：每轮在 lock 内跑 scan_once 与备份闸门。
+
+    bot 的写命令（/retry、/backup）拿同一把锁，于是它们等当前扫描轮跑完才动手，
+    扫描也不会中途撞上被 /retry 改掉的 checkpoint。读命令不加锁：WAL 下读不阻塞写，
+    它们也不改状态。
+    """
+    last_processed_at = 0.0
+    # 备份计时独立于扫描：首启动即视为「刚备份过」，避免每次重启都立刻备份
+    backup_state = {"last_backup_at": time.time()}
+
+    while True:
+        try:
+            elapsed = time.time() - last_processed_at
+            if elapsed < SCAN_INTERVAL_SECONDS:
+                wait = SCAN_INTERVAL_SECONDS - elapsed
+                logger.debug("冷却中，%.0fs 后扫描", wait)
+                await asyncio.sleep(wait)
+
+            async with lock:
+                n = await scan_once(ctx)
+                # 备份闸门也放进锁内：它与 bot 的 /backup 共用 BACKUP_DIR 与快照命名，
+                # 两个 VACUUM INTO 没必要同时跑。代价是备份上传期间 bot 写命令要等它，
+                # 而下一轮扫描本来就在等（同一个 task）
+                await _maybe_backup(ctx, time.time(), backup_state)
+
+            # 心跳：scan_once 返回后无条件写，空闲轮也写。写在这里而不进
+            # scan_once，保持后者只管「扫描 + checkpoint」的职责边界
+            _write_heartbeat(time.time())
+            if n > 0:
+                last_processed_at = time.time()
+
+            if n == 0:
+                logger.debug("无新消息，%ss 后再查", SCAN_INTERVAL_SECONDS)
+                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        except Exception:
+            logger.exception("本轮扫描出错")
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
+async def _serve_bot(bot: Client, ctx: ListenerContext, lock: asyncio.Lock) -> None:
+    """
+    bot Client 与扫描循环并存：bot 的 dispatcher 由 Kurigram 自己起后台 task 驱动，
+    扫描协程充当进程存活锚点。两者同一个事件循环、共用同一个 ArchiveDB。
+    """
+    async with bot:
+        # handler 在 client.start() 之后再挂：dispatcher 那时才在跑
+        register_handlers(bot, BotContext(
+            db=ctx.db,
+            lock=lock,
+            admin_ids=BOT_ADMIN_IDS,
+            run_backup=lambda: _run_backup(ctx, time.time()),
+        ))
+        await register_command_menu(bot)
+        logger.info("bot 命令已启用，admin 白名单：%s",
+                    ", ".join(str(i) for i in sorted(BOT_ADMIN_IDS)) or "（空——谁都不授权）")
+        await scan_loop(ctx, lock)
+
+
 async def main():
     configure_logging()
     # 启动预检：ffmpeg/ffprobe 缺失时直接退出，让 Docker 重启
@@ -614,38 +706,23 @@ async def main():
         sys.exit(1)
 
     ctx = _build_context()
+    # 写命令（bot 的 /retry、/backup）与扫描轮共用这一把锁。不做模块级全局：
+    # 与其余依赖一样在这里造、注入给两侧
+    db_lock = asyncio.Lock()
+    bot_client = _build_bot_client()
+
     async with ctx.client:
         ctx.db.ensure_channel(ctx.receive_chat, "manual_forward")
         me = await ctx.client.get_me()
         logger.info("已登录：%s (id=%s)，冷却间隔 %ss", me.first_name, me.id, SCAN_INTERVAL_SECONDS)
-        last_processed_at = 0.0
-        # 备份计时独立于扫描：首启动即视为「刚备份过」，避免每次重启都立刻备份
-        backup_state = {"last_backup_at": time.time()}
 
-        while True:
-            try:
-                elapsed = time.time() - last_processed_at
-                if elapsed < SCAN_INTERVAL_SECONDS:
-                    wait = SCAN_INTERVAL_SECONDS - elapsed
-                    logger.debug("冷却中，%.0fs 后扫描", wait)
-                    await asyncio.sleep(wait)
+        # 未设 TG_BOT_TOKEN：形态与加 bot 之前完全一致，只有扫描循环
+        if bot_client is None:
+            logger.info("未设 TG_BOT_TOKEN，bot 命令关闭")
+            await scan_loop(ctx, db_lock)
+            return
 
-                n = await scan_once(ctx)
-                # 心跳：scan_once 返回后无条件写，空闲轮也写。写在这里而不进
-                # scan_once，保持后者只管「扫描 + checkpoint」的职责边界
-                _write_heartbeat(time.time())
-                if n > 0:
-                    last_processed_at = time.time()
-
-                # 备份闸门：到点才备份，失败不阻塞。放在 sleep 之前，空闲轮也检查
-                await _maybe_backup(ctx, time.time(), backup_state)
-
-                if n == 0:
-                    logger.debug("无新消息，%ss 后再查", SCAN_INTERVAL_SECONDS)
-                    await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-            except Exception:
-                logger.exception("本轮扫描出错")
-                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        await _serve_bot(bot_client, ctx, db_lock)
 
 
 if __name__ == "__main__":
