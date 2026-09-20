@@ -368,3 +368,47 @@ class TestBackupCommand:
 
         assert "命令执行失败" in msg.sent[0]
         assert "disk full" in msg.sent[0]
+
+
+class TestRegisterHandlers:
+    def test_hooks_dispatcher_and_dispatches(self):
+        """注册进去的回调真的走到 handle_message —— 光断言「挂上了」会漏掉闭包接错。"""
+        registered = []
+
+        def on_message():
+            def deco(fn):
+                registered.append(fn)
+                return fn
+            return deco
+
+        ctx = _ctx(db=SimpleNamespace(stats=_stats))
+
+        bot_commands.register_handlers(SimpleNamespace(on_message=on_message), ctx)
+
+        assert len(registered) == 1
+        msg = _FakeMessage("/stats")
+        asyncio.run(registered[0](SimpleNamespace(), msg))
+        assert "文件总数：3" in msg.sent[0]
+
+
+class TestCommandMenu:
+    def test_registers_all_commands_in_order(self):
+        sent = []
+
+        async def set_bot_commands(commands):
+            sent.extend(commands)
+            return True
+
+        asyncio.run(bot_commands.register_command_menu(
+            SimpleNamespace(set_bot_commands=set_bot_commands)))
+
+        assert [c.command for c in sent] == ["stats", "search", "failures", "retry", "backup"]
+        assert all(c.description for c in sent)
+
+    def test_menu_failure_is_not_fatal(self):
+        """菜单注册失败（如 flood）只 warning，命令本身照常可用。"""
+        async def boom(commands):
+            raise OSError("flood")
+
+        asyncio.run(bot_commands.register_command_menu(
+            SimpleNamespace(set_bot_commands=boom)))

@@ -19,7 +19,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from db import ArchiveDB, RetrySummary, Stats
-from pyrogram.types import Message
+from pyrogram.client import Client
+from pyrogram.types import BotCommand, Message
 from search import format_result
 
 logger = logging.getLogger(__name__)
@@ -243,3 +244,31 @@ async def handle_message(ctx: BotContext, message: Message) -> None:
         # 记全栈，并把错误原文回给 admin
         logger.exception("bot 命令 /%s 执行失败", name)
         await message.reply_text(f"命令执行失败：{e}")
+
+
+def register_handlers(bot: Client, ctx: BotContext) -> None:
+    """
+    把命令 handler 挂到 bot Client 上。依赖全在 ctx 里，由闭包捕获。
+
+    必须在 client.start() 之后调用（dispatcher 那时才在跑，add_handler 会把新
+    handler 排进处理队列）。
+    """
+
+    @bot.on_message()
+    async def _on_message(_client: Client, message: Message) -> None:
+        await handle_message(ctx, message)
+
+
+async def register_command_menu(bot: Client) -> None:
+    """
+    注册 BotFather 侧的原生命令菜单（输入框里的补全）。菜单项来自 COMMANDS 表，
+    与 handler 共用一处真相。
+
+    失败只记 warning：菜单是锦上添花，命令本身照常可用，不该因为一次 flood 就起不来。
+    """
+    try:
+        await bot.set_bot_commands([
+            BotCommand(name, desc) for name, (_, desc) in COMMANDS.items()
+        ])
+    except Exception:
+        logger.warning("注册 bot 命令菜单失败（命令仍可用）", exc_info=True)
