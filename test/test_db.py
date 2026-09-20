@@ -840,10 +840,11 @@ class TestBackup:
             snap.close()
 
 
-class TestResetSkipped:
-    def _seed_mixed(self, db: ArchiveDB, chat="-1001234567890"):
-        """造 skipped / retrying / 正常 混合行。"""
+class TestRetrySkipped:
+    def _seed_mixed(self, db: ArchiveDB, chat="-1001234567890", checkpoint=200):
+        """造 skipped / retrying 混合行，checkpoint 推到 200。"""
         db.ensure_channel(chat, "manual_forward")
+        db.set_checkpoint(chat, checkpoint)
         # 两条 skipped
         db.increment_failure(chat, 100, "download", "代理断")
         db.mark_failure_skipped(chat, 100, "重试 3 次仍失败: download")
@@ -853,14 +854,15 @@ class TestResetSkipped:
         db.increment_failure(chat, 110, "verify", "临时")
         return chat
 
-    def test_reset_all_skipped(self, db: ArchiveDB):
+    def test_reset_all_skipped_and_rolls_back(self, db: ArchiveDB):
         chat = self._seed_mixed(db)
 
-        summary = db.reset_skipped()
+        summary = db.retry_skipped()
 
         assert sorted(mid for _, mid in summary.reset_entries) == [100, 105]
-        assert summary.min_message_id == 100
-        # 两条 skipped 变回 retrying、attempts 清零
+        # 回退到 min(100,105) - 1
+        assert summary.rollback == {chat: (200, 99)}
+        assert db.get_checkpoint(chat) == 99
         for mid in (100, 105):
             row = db.get_failure(chat, mid)
             assert row["status"] == "retrying"
@@ -872,22 +874,49 @@ class TestResetSkipped:
         chat = self._seed_mixed(db)
 
         # 传的 id 里 105 是 skipped、110 是 retrying（不该动）、999 不存在
-        summary = db.reset_skipped([105, 110, 999])
+        summary = db.retry_skipped([105, 110, 999])
 
         assert [mid for _, mid in summary.reset_entries] == [105]
-        assert summary.min_message_id == 105
+        assert summary.rollback == {chat: (200, 104)}
+        assert db.get_checkpoint(chat) == 104
         assert db.get_failure(chat, 100)["status"] == "skipped"   # 没传，不动
         assert db.get_failure(chat, 105)["status"] == "retrying"
         assert db.get_failure(chat, 110)["attempt_count"] == 1    # retrying 不清零
 
-    def test_reset_none_matches_returns_empty(self, db: ArchiveDB):
-        db.ensure_channel("-1001234567890", "manual_forward")
-        db.increment_failure("-1001234567890", 110, "verify", "临时")  # 只有 retrying
+    def test_no_match_returns_empty_and_leaves_checkpoint(self, db: ArchiveDB):
+        chat = self._seed_mixed(db)
 
-        summary = db.reset_skipped()
+        summary = db.retry_skipped([999])
 
         assert summary.reset_entries == []
-        assert summary.min_message_id is None
+        assert summary.rollback == {}
+        assert db.get_checkpoint(chat) == 200
+        assert db.get_failure(chat, 110)["status"] == "retrying"   # 没传它，不动
+
+    def test_checkpoint_only_moves_back(self, db: ArchiveDB):
+        """min_id - 1 不小于当前 checkpoint 就不动（只退不进）。"""
+        chat = self._seed_mixed(db, checkpoint=50)
+
+        summary = db.retry_skipped()
+
+        assert summary.rollback == {}
+        assert db.get_checkpoint(chat) == 50
+        # 但行仍被重置回 retrying
+        assert db.get_failure(chat, 100)["status"] == "retrying"
+
+    def test_multiple_entry_chats_roll_back_separately(self, db: ArchiveDB):
+        """回退按入口 chat 分组，各退到该组最小 id - 1。"""
+        db.ensure_channel("-1001234567890", "manual_forward")
+        db.set_checkpoint("-1001234567890", 200)
+        db.ensure_channel("-1009999999999", "manual_forward")
+        db.set_checkpoint("-1009999999999", 300)
+        for chat, mid in (("-1001234567890", 100), ("-1009999999999", 250)):
+            db.increment_failure(chat, mid, "download", "x")
+            db.mark_failure_skipped(chat, mid, "skip")
+
+        summary = db.retry_skipped()
+
+        assert summary.rollback == {"-1001234567890": (200, 99), "-1009999999999": (300, 249)}
 
 
 class TestStats:

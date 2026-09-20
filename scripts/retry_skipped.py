@@ -54,7 +54,7 @@ def main():
         _preview(db, targets)
         return
 
-    summary = db.reset_skipped(targets)
+    summary = db.retry_skipped(targets)
     if not summary.reset_entries:
         print("没有匹配的 skipped 行，checkpoint 未改动")
         return
@@ -63,26 +63,19 @@ def main():
     for chat_id, msg_id in summary.reset_entries:
         print(f"  chat={chat_id} msg_id={msg_id}")
 
-    # 回退 checkpoint：按入口 chat 分组，各退到该组最小 id - 1；只退不进
-    assert summary.min_message_id is not None
-    chat_min: dict[str, int] = {}
-    for chat_id, msg_id in summary.reset_entries:
-        chat_min[chat_id] = min(chat_min.get(chat_id, msg_id), msg_id)
-    for chat_id, min_id in chat_min.items():
-        new_cp = min_id - 1
-        old_cp = db.get_checkpoint(chat_id)
-        if new_cp < old_cp:
-            db.set_checkpoint(chat_id, new_cp)
+    if summary.rollback:
+        for chat_id, (old_cp, new_cp) in summary.rollback.items():
             print(f"checkpoint 回退 chat={chat_id}: {old_cp} → {new_cp}")
-        else:
-            print(f"checkpoint chat={chat_id} 不回退（{new_cp} >= 当前 {old_cp}）")
+    else:
+        print("checkpoint 未回退（目标不小于当前值，或频道行不存在）")
 
     print("\n完成。请 docker compose up -d 让下轮扫描重扫。")
 
 
 def _preview(db: ArchiveDB, targets):
     """--dry-run：打印将重置哪些行、checkpoint 将回退到哪，不写库。"""
-    # reset_skipped 是唯一的选择逻辑真相，但它会写库。预览这里复刻它的 SELECT 语义：
+    # retry_skipped 是唯一的选择逻辑真相，但它会写库（重置行 + 回退 checkpoint）。
+    # 预览这里复刻它的 SELECT 语义：
     # 直接查库里的 skipped 行，避免选择逻辑出现第二份实现。
     import sqlite3
 
