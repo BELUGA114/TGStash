@@ -17,7 +17,7 @@ class TestBuildBotClient:
         """未设 TG_BOT_TOKEN：不构造 bot Client，main 只跑扫描循环（零回归）。"""
         monkeypatch.setattr(listener, "TG_BOT_TOKEN", "")
 
-        assert listener._build_bot_client() is None
+        assert listener._build_bot_client(12345, "hash") is None
 
     def test_builds_bot_session_with_token(self, monkeypatch, tmp_path):
         made = {}
@@ -32,12 +32,16 @@ class TestBuildBotClient:
         monkeypatch.setattr(listener, "HTTP_PROXY", "")
         monkeypatch.setattr(listener, "Client", fake_client)
 
-        client = listener._build_bot_client()
+        client = listener._build_bot_client(12345, "hash")
 
         assert client is not None
         assert made["name"] == "bot"                 # session 文件与 userbot 的 listener 分开
         assert made["bot_token"] == "123:abc"
         assert made["workdir"] == str(tmp_path)
+        # API key 必传：bot_token 登录建立新授权时 Pyrogram 仍要求它，缺了会在
+        # load_session 抛 AttributeError（构造期不报，只在 start 时炸）
+        assert made["api_id"] == 12345
+        assert made["api_hash"] == "hash"
 
 
 class TestScanLoopLock:
