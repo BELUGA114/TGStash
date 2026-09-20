@@ -888,3 +888,50 @@ class TestResetSkipped:
 
         assert summary.reset_entries == []
         assert summary.min_message_id is None
+
+
+class TestStats:
+    def _seed(self, db: ArchiveDB, chat="-1001234567890"):
+        """两条真归档（document + video）+ 一条 SHA-256 去重命中（只写 files）+ 一条失败账。"""
+        db.ensure_channel(chat, "manual_forward")
+        db.record_archived(
+            file_unique_id="F1", sha256="a" * 64, size=10, source="manual_forward",
+            source_chat_id=chat, source_message_id=1, media_kind="document")
+        db.record_archived(
+            file_unique_id="F2", sha256="b" * 64, size=20, source="manual_forward",
+            source_chat_id=chat, source_message_id=2, media_kind="video")
+        # 内容重复：只补 files 记录，没有新的 messages 行（pipeline._record_dedup_file 的形状）
+        db.record_file(file_unique_id="F3", sha256="a" * 64, size=10,
+                       archived_chat_id=None, archived_message_id=None,
+                       source="manual_forward", source_channel=None, media_kind="document")
+        db.increment_failure(chat, 3, "download", "代理断")
+        db.increment_failure(chat, 4, "upload", "flood")
+        db.mark_failure_skipped(chat, 4, "重试 3 次仍失败: upload")
+
+    def test_counts(self, db: ArchiveDB):
+        self._seed(db)
+
+        stats = db.stats()
+
+        assert stats.total_files == 3          # files 三行
+        assert stats.message_count == 2        # messages 两行
+        assert stats.dedup_hits == 1           # files - messages = 去重只登记的那条
+        assert stats.by_kind == {"document": 2, "video": 1}
+        assert stats.failures == {"retrying": 1, "skipped": 1}
+
+    def test_empty_db(self, db: ArchiveDB):
+        stats = db.stats()
+
+        assert stats.total_files == 0
+        assert stats.message_count == 0
+        assert stats.dedup_hits == 0
+        assert stats.by_kind == {}
+        assert stats.failures == {}
+
+    def test_media_kind_null_goes_to_unknown(self, db: ArchiveDB):
+        """老库或没有 media_kind 的行归到 unknown，不要漏掉、也不要造出 None 键。"""
+        db.record_file(file_unique_id="F9", sha256="c" * 64, size=1,
+                       archived_chat_id=None, archived_message_id=None,
+                       source="manual_forward", source_channel=None)
+
+        assert db.stats().by_kind == {"unknown": 1}
