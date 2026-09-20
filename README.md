@@ -57,7 +57,7 @@ docker compose restart stash-listener
 
 ### 3. 服务器部署
 
-使用 `docker-compose.deploy.yml`，镜像从 GitHub Container Registry 拉取或本地构建，首次需在本地运行 
+使用 `docker-compose.deploy.yml`，镜像从 GitHub Container Registry 拉取或本地构建，首次需在本地运行
 
 ```bash
 # Kurigram 登录
@@ -79,46 +79,44 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 
 ### bot 命令（可选）
 
-在 `.env` 里设 `TG_BOT_TOKEN`（@BotFather 新建 bot 拿 token）与 `BOT_ADMIN_IDS`
-（你自己的 user id，逗号分隔），`docker compose up -d` 后 bot 自动登录（session 落在
-`data/session/`，不需要另跑登录脚本）。**先用你的账号给 bot 发一条消息**，否则 bot
-收不到你的命令；要用在群里就把它拉进群。非白名单用户发什么都静默无响应。
+设置 `TG_BOT_TOKEN`（使用 @BotFather）与 `BOT_ADMIN_IDS`（user id 白名单，逗号分隔），`docker compose up -d` 后 bot 自动登录（session 落在`data/session/`）
 
-| 命令 | 作用 |
-|---|---|
-| `/stats` | 归档文件总数、类型分布、去重命中数、失败账计数 |
-| `/search 关键词` | 搜索归档内容（FTS5 trigram，每个关键词至少 3 个字符） |
-| `/failures` | 列出失败账：入口消息 id、阶段、重试次数、最近错误 |
+| 命令              | 作用                                                          |
+| ----------------- | ------------------------------------------------------------- |
+| `/stats`          | 归档文件总数、类型分布、去重命中数、失败计数                  |
+| `/search 关键词`  | 搜索归档内容                                                  |
+| `/failures`       | 列出失败的归档：入口消息 id、阶段、重试次数、最近错误         |
 | `/retry [id ...]` | 把 skipped 的条目重排回重试队列并回退 checkpoint；无参 = 全部 |
-| `/backup` | 立刻打一份 `archive.db` 快照 |
+| `/backup`         | 进行一次 `archive.db` 备份                                    |
 
-写命令（`/retry`、`/backup`）会等当前扫描轮跑完才执行，延迟最多一轮扫描间隔。
+侵入性命令（`/retry`、`/backup`）会等当前扫描轮跑完才执行，延迟最多一轮扫描间隔
 
 ## 配置
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `TG_API_ID` | — | 必填 |
-| `TG_API_HASH` | — | 必填 |
-| `RECEIVE_CHAT_ID` | — | 必填，`-100` 前缀 |
-| `ARCHIVE_CHAT_ID` | — | 必填，`-100` 前缀 |
-| `SCAN_INTERVAL_SECONDS` | `300` | 扫描间隔（秒） |
-| `BATCH_SIZE` | `10` | 每轮最多处理消息数 |
-| `UPLOAD_COOLDOWN_SECONDS` | `5` | 每次上传后等待（秒） |
-| `RETRY_MAX_ATTEMPTS` | `3` | 同一条消息归档失败 N 次后跳过/剔除（记录 + 接收频道回复告警，原消息保留） |
-| `TDL_NAMESPACE` | `archiver` | tdl session 命名空间 |
-| `TDL_THREADS` | `4` | tdl 单文件分块下载线程数上限 |
-| `TDL_LIMIT` | `2` | tdl 同时下载的任务数 |
-| `TDL_DELAY_SECONDS` | `1` | tdl 每个下载任务之间的间隔（秒） |
-| `TDL_TIMEOUT_SECONDS` | `0` | tdl 进程超时，0 表示不超时 |
-| `VIDEO_COMPRESS_ENABLED` | `false` | 是否启用视频压缩（H.264 CRF 恒定质量转码） |
-| `VIDEO_COMPRESS_MIN_SIZE_MB` | `100` | 超过此体积(MB)的视频才触发压缩 |
-| `VIDEO_COMPRESS_CRF` | `28` | H.264 CRF 恒定质量值，越小质量越高体积越大 |
-| `VIDEO_COMPRESS_THREADS` | `4` | x264 编码线程数上限，设为 `0` 则不限制 |
-| `HTTP_PROXY` | — | 代理地址，如 `http://host:port` |
-| `TG_BOT_TOKEN` | — | BotFather 给的 token；不设则 bot 命令功能关闭 |
-| `BOT_ADMIN_IDS` | — | bot 管理员 user id，逗号分隔；留空 = 谁都不授权 |
-| `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
+| 变量                         | 默认值     | 说明                                                                      |
+| ---------------------------- | ---------- | ------------------------------------------------------------------------- |
+| `TG_API_ID`                  | —          | 必填                                                                      |
+| `TG_API_HASH`                | —          | 必填                                                                      |
+| `RECEIVE_CHAT_ID`            | —          | 必填，`-100` 前缀                                                         |
+| `ARCHIVE_CHAT_ID`            | —          | 必填，`-100` 前缀                                                         |
+| `SCAN_INTERVAL_SECONDS`      | `300`      | 扫描间隔（秒）                                                            |
+| `BATCH_SIZE`                 | `10`       | 每轮最多处理消息数                                                        |
+| `UPLOAD_COOLDOWN_SECONDS`    | `5`        | 每次上传后等待（秒）                                                      |
+| `RETRY_MAX_ATTEMPTS`         | `3`        | 同一条消息归档失败 N 次后跳过/剔除（记录 + 接收频道回复告警，原消息保留） |
+| `TDL_NAMESPACE`              | `archiver` | tdl session 命名空间                                                      |
+| `TDL_THREADS`                | `4`        | tdl 单文件分块下载线程数上限                                              |
+| `TDL_LIMIT`                  | `2`        | tdl 同时下载的任务数                                                      |
+| `TDL_DELAY_SECONDS`          | `1`        | tdl 每个下载任务之间的间隔（秒）                                          |
+| `TDL_TIMEOUT_SECONDS`        | `0`        | tdl 进程超时，0 表示不超时                                                |
+| `VIDEO_COMPRESS_ENABLED`     | `false`    | 是否启用视频压缩（H.264 CRF 恒定质量转码）                                |
+| `VIDEO_COMPRESS_MIN_SIZE_MB` | `100`      | 超过此体积(MB)的视频才触发压缩                                            |
+| `VIDEO_COMPRESS_CRF`         | `28`       | H.264 CRF 恒定质量值，越小质量越高体积越大                                |
+| `VIDEO_COMPRESS_THREADS`     | `4`        | x264 编码线程数上限，设为 `0` 则不限制                                    |
+| `HTTP_PROXY`                 | —          | 代理地址，如 `http://host:port`                                           |
+| `TG_BOT_TOKEN`               | —          | BotFather 给的 token；不设则 bot 命令功能关闭                             |
+| `BOT_ADMIN_IDS`              | —          | bot 管理员 user id，逗号分隔；留空 = 谁都不授权                           |
+| `LOG_LEVEL`                  | `INFO`     | 日志级别：DEBUG/INFO/WARNING/ERROR                                        |
+
 > 容器内 `127.0.0.1` 指向容器自身，代理在本机用 `host.docker.internal` 或宿主机 IP
 
 ## 搜索
@@ -127,12 +125,7 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 docker compose exec stash-listener python search.py 关键词
 ```
 
-FTS5 + trigram 分词器，每个关键词至少 3 个字符。2 字及更短的词不产生 token：
-单独搜返回空（搜「猫咪」得不到结果），和 ≥3 字的词一起用时它不起任何约束作用
-（搜「猫咪 橘猫在」等同于只搜「橘猫在」）。多个关键词之间是 AND。
-trigram 本身就是子串匹配，不要在词尾加 `*`——那个星号会被当成字面字符，反而搜不到。
-输出包含时间、媒体类型、真实来源、发送者、caption、原始文件名，
-以及可点击的备份频道链接。
+FTS5 + trigram 分词器，每个关键词至少 3 个字符。2 字及更短的词不产生 token，多个关键词之间是 AND。输出包含时间、媒体类型、真实来源、发送者、caption、原始文件名，以及可点击的备份频道链接
 
 ## 调试工具
 
@@ -155,7 +148,9 @@ docker compose run --rm stash-listener python scripts/retry_skipped.py --dry-run
 
 ## 本地开发
 
-测试使用 pytest，用例都在 `test/`（`pyproject.toml` 里 `testpaths = ["test"]`，被测模块靠 `pythonpath` 指向 `stash-listener/` 与 `scripts/`），覆盖 `db.py`（schema/迁移/checkpoint/去重/FTS5/并发场景）、`origin.py`（forward_origin 五变体归一化）、归档管道 `pipeline.py`（注入假 client/db/downloader，覆盖媒体组拆组上传、`PhotoExtInvalid` 回退整组 document、视频元数据三层回退、临时产物命名）、`media_ops.py`（格式修正与 ffprobe/ffmpeg 失败回退）、入口/来源写入路径、失败重试与 checkpoint 推进、回填决策逻辑，以及 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
+测试使用 pytest，用例都在 `test/`（`pyproject.toml` 里 `testpaths = ["test"]`，被测模块靠 `pythonpath` 指向 `stash-listener/` 与 `scripts/`）
+
+覆盖 `db.py`（schema/迁移/checkpoint/去重/FTS5/并发场景）、`origin.py`（forward_origin 五变体归一化）、归档管道 `pipeline.py`（注入假 client/db/downloader，覆盖媒体组拆组上传、`PhotoExtInvalid` 回退整组 document、视频元数据三层回退、临时产物命名）、`media_ops.py`（格式修正与 ffprobe/ffmpeg 失败回退）、入口/来源写入路径、失败重试与 checkpoint 推进、回填决策逻辑，以及 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -177,9 +172,9 @@ python -m pytest
 
 本项目整体以 [AGPL-3.0](LICENSE) 发布。第三方组件保留各自许可证：
 
-| 组件 | 许可证 |
-|---|---|
-| Kurigram | LGPL-3.0-or-later |
-| tdl | AGPL-3.0 |
-| Pillow | MIT-CMU |
+| 组件             | 许可证               |
+| ---------------- | -------------------- |
+| Kurigram         | LGPL-3.0-or-later    |
+| tdl              | AGPL-3.0             |
+| Pillow           | MIT-CMU              |
 | ffmpeg / ffprobe | GPL（BtbN 静态构建） |
