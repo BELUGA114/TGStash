@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import bot_commands
 import pytest
 from bot_commands import BotContext, handle_message, parse_admin_ids, parse_command
-from db import Stats
+from db import RetrySummary, Stats
 
 ADMIN = 111
 
@@ -260,3 +260,111 @@ class TestSearchCommand:
 
         assert len(msg.sent[0]) <= bot_commands.TELEGRAM_TEXT_LIMIT
         assert msg.sent[0].endswith("…")
+
+
+class TestRetryCommand:
+    def test_takes_lock_and_reports_rollback(self):
+        lock = _RecordingLock()
+        seen = {}
+
+        def retry_skipped(ids):
+            seen["ids"] = ids
+            return RetrySummary([("-1001234567890", 100)],
+                                {"-1001234567890": (200, 99)})
+
+        msg = _FakeMessage("/retry 100")
+
+        asyncio.run(handle_message(
+            _ctx(db=SimpleNamespace(retry_skipped=retry_skipped), lock=lock), msg))
+
+        assert (lock.entries, lock.exits) == (1, 1)
+        assert seen["ids"] == [100]
+        assert "已重置 1 条" in msg.sent[0]
+        assert "checkpoint 回退 chat=-1001234567890: 200 → 99" in msg.sent[0]
+
+    def test_lock_is_actually_held_while_writing(self):
+        """真锁：断言写库那一刻锁是拿住的，而不只是「顺手进出了一把假锁」。"""
+        lock = asyncio.Lock()
+        held = []
+
+        def retry_skipped(ids):
+            held.append(lock.locked())
+            return RetrySummary([], {})
+
+        asyncio.run(handle_message(
+            _ctx(db=SimpleNamespace(retry_skipped=retry_skipped), lock=lock),
+            _FakeMessage("/retry")))
+
+        assert held == [True]
+
+    def test_no_args_means_all_skipped(self):
+        seen = {}
+
+        def retry_skipped(ids):
+            seen["ids"] = ids
+            return RetrySummary([("-1001234567890", 100)], {})
+
+        asyncio.run(handle_message(
+            _ctx(db=SimpleNamespace(retry_skipped=retry_skipped)), _FakeMessage("/retry")))
+
+        assert seen["ids"] is None
+
+    def test_non_integer_arg_replies_usage_without_touching_db(self):
+        msg = _FakeMessage("/retry abc")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            retry_skipped=lambda ids: pytest.fail("参数不合法不该动库"))), msg))
+
+        assert "用法" in msg.sent[0]
+
+    def test_nothing_matched(self):
+        msg = _FakeMessage("/retry")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            retry_skipped=lambda ids: RetrySummary([], {}))), msg))
+
+        assert msg.sent == ["没有匹配的 skipped 行，checkpoint 未改动"]
+
+    def test_no_rollback_is_stated_explicitly(self):
+        msg = _FakeMessage("/retry")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            retry_skipped=lambda ids: RetrySummary([("-1001234567890", 100)], {}))), msg))
+
+        assert "checkpoint 未回退" in msg.sent[0]
+
+    def test_long_list_is_capped_with_a_count(self):
+        entries = [("-1001234567890", 100 + i) for i in range(50)]
+        msg = _FakeMessage("/retry")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            retry_skipped=lambda ids: RetrySummary(entries, {}))), msg))
+
+        assert "…还有 30 条" in msg.sent[0]
+        assert "下轮扫描重扫这些消息" in msg.sent[0]
+
+
+class TestBackupCommand:
+    def test_takes_lock_and_reports_snapshot(self):
+        lock = _RecordingLock()
+
+        async def run_backup():
+            return "/data/db/backups/archive-20260920-030405.db"
+
+        msg = _FakeMessage("/backup")
+
+        asyncio.run(handle_message(_ctx(lock=lock, run_backup=run_backup), msg))
+
+        assert (lock.entries, lock.exits) == (1, 1)
+        assert msg.sent == ["备份完成：archive-20260920-030405.db"]
+
+    def test_failure_is_reported_to_admin(self):
+        async def boom():
+            raise OSError("disk full")
+
+        msg = _FakeMessage("/backup")
+
+        asyncio.run(handle_message(_ctx(run_backup=boom), msg))
+
+        assert "命令执行失败" in msg.sent[0]
+        assert "disk full" in msg.sent[0]

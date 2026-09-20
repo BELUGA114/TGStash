@@ -14,10 +14,11 @@ import 本模块不读环境变量、不开库、不构造 Client。环境变量
 
 import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from db import ArchiveDB, Stats
+from db import ArchiveDB, RetrySummary, Stats
 from pyrogram.types import Message
 from search import format_result
 
@@ -150,6 +151,42 @@ async def _cmd_failures(ctx: BotContext, message: Message, args: list[str]) -> N
     await message.reply_text(truncate(format_failures(rows)))
 
 
+def format_retry(summary: RetrySummary) -> str:
+    if not summary.reset_entries:
+        return "没有匹配的 skipped 行，checkpoint 未改动"
+    lines = [f"已重置 {len(summary.reset_entries)} 条 skipped 行为 retrying（attempts 清零）"]
+    if summary.rollback:
+        for chat_id, (old_cp, new_cp) in summary.rollback.items():
+            lines.append(f"checkpoint 回退 chat={chat_id}: {old_cp} → {new_cp}")
+    else:
+        lines.append("checkpoint 未回退（目标不小于当前值）")
+    lines += listed([f"msg={msg_id}" for _, msg_id in summary.reset_entries])
+    lines.append("下轮扫描重扫这些消息")
+    return "\n".join(lines)
+
+
+async def _cmd_retry(ctx: BotContext, message: Message, args: list[str]) -> None:
+    ids: list[int] = []
+    for arg in args:
+        try:
+            ids.append(int(arg))
+        except ValueError:
+            await message.reply_text(f"用法：/retry [消息 id ...]（{arg} 不是整数）")
+            return
+    # 写命令与扫描轮共用一把锁：等当前扫描轮跑完再改失败账与 checkpoint，
+    # 扫描也不会中途撞上被改掉的起点。空参数 = 全部 skipped
+    async with ctx.lock:
+        summary = ctx.db.retry_skipped(ids or None)
+    await message.reply_text(truncate(format_retry(summary)))
+
+
+async def _cmd_backup(ctx: BotContext, message: Message, args: list[str]) -> None:
+    # 同样拿锁：备份编排要写 BACKUP_DIR，且与扫描轮抢同一个 db 连接池
+    async with ctx.lock:
+        dest = await ctx.run_backup()
+    await message.reply_text(f"备份完成：{os.path.basename(dest)}")
+
+
 async def _cmd_search(ctx: BotContext, message: Message, args: list[str]) -> None:
     query = " ".join(args)
     if not query:
@@ -171,6 +208,8 @@ COMMANDS: dict[str, tuple[CommandHandler, str]] = {
     "stats": (_cmd_stats, "归档统计"),
     "search": (_cmd_search, "搜索归档：/search 关键词"),
     "failures": (_cmd_failures, "列出失败账"),
+    "retry": (_cmd_retry, "重试失败的条目：/retry [消息 id ...]"),
+    "backup": (_cmd_backup, "立即备份数据库"),
 }
 
 
