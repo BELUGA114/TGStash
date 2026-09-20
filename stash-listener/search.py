@@ -27,6 +27,23 @@ def archive_link(chat_id, message_id) -> str:
     return f"https://t.me/c/{bare}/{message_id}"
 
 
+def format_result(row) -> str:
+    """
+    把一条搜索结果排成单行文本。命令行与 bot `/search` 共用这一份格式。
+
+    展示真实来源（origin_*）而不是入口频道 —— 入口对所有行恒定，没有信息量。
+    """
+    origin = row["origin_title"] or row["origin_chat_id"] or "?"
+    sender = row["sender"] or ""
+    kind = row["media_kind"] or "?"
+    caption = (row["caption"] or "").replace("\n", " ")[:80]
+    name = f" [{row['file_name']}]" if row["file_name"] else ""
+    archived = ""
+    if row["archived_chat_id"] and row["archived_message_id"]:
+        archived = f"  -> {archive_link(row['archived_chat_id'], row['archived_message_id'])}"
+    return f"[{row['sent_at'] or '?'}] ({kind}) {origin} {sender}: {caption}{name}{archived}"
+
+
 def main():
     # 日志配置属于进程启动，不属于 import
     configure_logging()
@@ -43,17 +60,7 @@ def main():
         return
 
     for r in rows:
-        # 展示真实来源而不是入口频道——入口对所有行恒定，没有信息量
-        origin = r["origin_title"] or r["origin_chat_id"] or "?"
-        sender = r["sender"] or ""
-        kind = r["media_kind"] or "?"
-        caption = (r["caption"] or "").replace("\n", " ")[:80]
-        name = f" [{r['file_name']}]" if r["file_name"] else ""
-        archived = ""
-        if r["archived_chat_id"] and r["archived_message_id"]:
-            archived = f"  -> {archive_link(r['archived_chat_id'], r['archived_message_id'])}"
-        logger.info("[%s] (%s) %s %s: %s%s%s",
-                    r["sent_at"] or "?", kind, origin, sender, caption, name, archived)
+        logger.info("%s", format_result(r))
 
 
 if __name__ == "__main__":
