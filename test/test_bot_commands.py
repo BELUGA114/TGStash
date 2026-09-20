@@ -2,6 +2,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import bot_commands
 import pytest
 from bot_commands import BotContext, handle_message, parse_admin_ids, parse_command
 from db import Stats
@@ -165,3 +166,97 @@ class TestUnknownCommand:
         asyncio.run(handle_message(_ctx(), msg))
 
         assert msg.sent == []
+
+
+def _failure_row(mid=100, status="skipped", stage="download", attempts=3, err="代理断"):
+    return {"source_chat_id": "-1001234567890", "source_message_id": mid,
+            "failure_stage": stage, "last_error": err, "attempt_count": attempts,
+            "status": status, "last_failed_at": "2026-09-19 10:00:00"}
+
+
+class TestFailuresCommand:
+    def test_lists_rows(self):
+        rows = [_failure_row(100), _failure_row(105, status="retrying", stage="upload",
+                                                attempts=1, err="flood")]
+        msg = _FakeMessage("/failures")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(list_failures=lambda: rows)), msg))
+
+        body = msg.sent[0]
+        assert "失败账共 2 条" in body
+        assert "msg=100" in body and "skipped" in body and "代理断" in body
+        assert "msg=105" in body and "retrying" in body
+
+    def test_empty_replies_plainly(self):
+        msg = _FakeMessage("/failures")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(list_failures=list)), msg))
+
+        assert msg.sent == ["失败账为空"]
+
+    def test_long_list_is_capped_with_a_count(self):
+        rows = [_failure_row(mid=100 + i) for i in range(50)]
+        msg = _FakeMessage("/failures")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(list_failures=lambda: rows)), msg))
+
+        body = msg.sent[0]
+        assert "…还有 30 条" in body
+        assert "msg=119" in body          # 第 20 条（MAX_LISTED_ITEMS）还在
+        assert "msg=120" not in body      # 第 21 条起不列
+
+
+class TestSearchCommand:
+    def _row(self, **over):
+        row = {"sent_at": "2026-09-01", "media_kind": "document", "origin_title": "某频道",
+               "origin_chat_id": "-1001234", "sender": "张三", "caption": "报告",
+               "file_name": "a.pdf", "archived_chat_id": "-1009876543210",
+               "archived_message_id": 7}
+        row.update(over)
+        return row
+
+    def test_uses_db_search_and_cli_format(self):
+        calls = []
+
+        def search(query, limit):
+            calls.append((query, limit))
+            return [self._row()]
+
+        msg = _FakeMessage("/search 报告 2026")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(search=search)), msg))
+
+        assert calls == [("报告 2026", bot_commands.SEARCH_LIMIT)]
+        body = msg.sent[0]
+        assert "某频道" in body
+        assert "https://t.me/c/9876543210/7" in body
+
+    def test_no_keyword_replies_usage(self):
+        msg = _FakeMessage("/search")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            search=lambda q, limit: pytest.fail("没关键词不该查库"))), msg))
+
+        assert "用法" in msg.sent[0]
+
+    def test_no_match_explains_trigram_limit(self):
+        msg = _FakeMessage("/search 猫咪")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            search=lambda q, limit: [])), msg))
+
+        assert "没搜到" in msg.sent[0]
+        assert "3 个字符" in msg.sent[0]
+
+    def test_long_result_is_truncated_to_telegram_limit(self):
+        # caption 在 format_result 里截到 80 字符，撑不满 4096；file_name 不截，用它把
+        # 单行撑长，20 行叠起来才真正越过上限、逼出 truncate 的省略号
+        rows = [self._row(caption="长" * 200, file_name="长" * 200)
+                for _ in range(bot_commands.SEARCH_LIMIT)]
+        msg = _FakeMessage("/search 长")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            search=lambda q, limit: rows)), msg))
+
+        assert len(msg.sent[0]) <= bot_commands.TELEGRAM_TEXT_LIMIT
+        assert msg.sent[0].endswith("…")

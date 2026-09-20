@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from db import ArchiveDB, Stats
 from pyrogram.types import Message
+from search import format_result
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +133,44 @@ async def _cmd_stats(ctx: BotContext, message: Message, args: list[str]) -> None
     await message.reply_text(truncate(format_stats(ctx.db.stats())))
 
 
+def format_failures(rows) -> str:
+    lines = [
+        f"[{r['status']}] msg={r['source_message_id']} 阶段={r['failure_stage']} "
+        f"次数={r['attempt_count']} {one_line(r['last_error'])}"
+        for r in rows
+    ]
+    return "\n".join([f"失败账共 {len(rows)} 条", *listed(lines)])
+
+
+async def _cmd_failures(ctx: BotContext, message: Message, args: list[str]) -> None:
+    rows = ctx.db.list_failures()
+    if not rows:
+        await message.reply_text("失败账为空")
+        return
+    await message.reply_text(truncate(format_failures(rows)))
+
+
+async def _cmd_search(ctx: BotContext, message: Message, args: list[str]) -> None:
+    query = " ".join(args)
+    if not query:
+        await message.reply_text("用法：/search 关键词（每个关键词至少 3 个字符）")
+        return
+    rows = ctx.db.search(query, limit=SEARCH_LIMIT)
+    if not rows:
+        await message.reply_text(
+            f"没搜到跟「{query}」相关的内容（提示：每个关键词至少要 3 个字符）")
+        return
+    # 格式与命令行 search.py 共用 format_result，两处不会各排各的
+    body = "\n".join(format_result(r) for r in rows)
+    await message.reply_text(truncate(f"搜索「{query}」：\n{body}"))
+
+
 # 命令表：名字 → (实现, 菜单说明)。这一张表同时驱动分发、BotFather 菜单与未知命令的
 # 用法提示，加命令只改这里一处
 COMMANDS: dict[str, tuple[CommandHandler, str]] = {
     "stats": (_cmd_stats, "归档统计"),
+    "search": (_cmd_search, "搜索归档：/search 关键词"),
+    "failures": (_cmd_failures, "列出失败账"),
 }
 
 
