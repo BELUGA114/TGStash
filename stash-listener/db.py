@@ -610,6 +610,22 @@ class ArchiveDB:
             failures=failures,
         )
 
+    def list_failures(self, status: str | None = None):
+        """
+        列失败账行（可按 status 过滤），按入口 message id 排序 —— 运维看的是
+        「哪几条还没救回来」，与 checkpoint 的 id 空间一致才好对照。
+
+        只读，不加锁：WAL 下读不阻塞写，bot 的 /failures 与扫描轮可以并行。
+        """
+        sql = ("SELECT source_chat_id, source_message_id, failure_stage, last_error, "
+               "attempt_count, status, last_failed_at FROM archive_failures")
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            if status is None:
+                return con.execute(sql + " ORDER BY source_message_id").fetchall()
+            return con.execute(
+                sql + " WHERE status=? ORDER BY source_message_id", (status,)).fetchall()
+
     def search(self, query: str, limit: int = 20):
         match = build_match_query(query)
         if match is None:

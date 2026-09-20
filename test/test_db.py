@@ -935,3 +935,33 @@ class TestStats:
                        source="manual_forward", source_channel=None)
 
         assert db.stats().by_kind == {"unknown": 1}
+
+
+class TestListFailures:
+    def _seed(self, db: ArchiveDB, chat="-1001234567890"):
+        db.ensure_channel(chat, "manual_forward")
+        db.increment_failure(chat, 105, "upload", "flood")
+        db.increment_failure(chat, 100, "download", "代理断")
+        db.mark_failure_skipped(chat, 105, "重试 3 次仍失败: upload")
+
+    def test_lists_all_ordered_by_message_id(self, db: ArchiveDB):
+        self._seed(db)
+
+        rows = db.list_failures()
+
+        assert [r["source_message_id"] for r in rows] == [100, 105]
+        assert rows[0]["status"] == "retrying"
+        assert rows[0]["failure_stage"] == "download"
+        assert rows[0]["last_error"] == "代理断"
+        assert rows[1]["status"] == "skipped"
+        assert rows[1]["source_chat_id"] == "-1001234567890"
+
+    def test_filters_by_status(self, db: ArchiveDB):
+        self._seed(db)
+
+        skipped = db.list_failures(status="skipped")
+
+        assert [r["source_message_id"] for r in skipped] == [105]
+
+    def test_empty(self, db: ArchiveDB):
+        assert db.list_failures() == []
