@@ -178,4 +178,4 @@ python -m pytest
 | Kurigram         | LGPL-3.0-or-later    |
 | tdl              | AGPL-3.0             |
 | Pillow           | MIT-CMU              |
-| ffmpeg / ffprobe | GPL（BtbN 静态构建） |
+| ffmpeg / ffprobe | GPL（mwader/static-ffmpeg 静态构建） |
