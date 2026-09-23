@@ -93,6 +93,7 @@ class BotContext:
     lock: asyncio.Lock                             # 与扫描循环共用：写命令与扫描轮互斥
     admin_ids: frozenset[int]                      # 空白名单 = 谁都不授权
     run_backup: Callable[[], Awaitable[str]]       # 打快照 + 保留 + 可选上传，返回快照路径
+    pending: PendingStore[PendingDelete]           # /delete 待确认暂存，构造时注入
 
 
 # 命令实现签名：依赖全在 ctx 里，回复走 message.reply_text，不需要 Client 参数

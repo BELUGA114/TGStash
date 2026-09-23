@@ -48,7 +48,7 @@ class _RecordingLock:
         return False
 
 
-def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None):
+def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None, pending=None):
     async def default_backup():
         return "/data/db/backups/archive-20260920-030405.db"
 
@@ -57,6 +57,7 @@ def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None):
         lock=lock if lock is not None else _RecordingLock(),
         admin_ids=admin_ids,
         run_backup=run_backup or default_backup,
+        pending=pending if pending is not None else PendingStore(),
     )
 
 
