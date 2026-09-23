@@ -11,6 +11,7 @@ from bot_commands import (
     PendingStore,
     format_delete_preview,
     format_purge,
+    handle_callback,
     handle_message,
     parse_admin_ids,
     parse_callback,
@@ -40,6 +41,28 @@ class _FakeMessage:
         self._next_id += 1
         self.reply_ids.append(self._next_id)
         return SimpleNamespace(id=self._next_id)
+
+
+class _FakeCbMessage:
+    def __init__(self, mid):
+        self.id = mid
+        self.edited = []
+
+    async def edit_text(self, text, **kwargs):
+        self.edited.append(text)
+
+
+class _FakeCallbackQuery:
+    """假 callback：记录 answer 文本与被编辑的消息文本。message=None 模拟消息不可用。"""
+
+    def __init__(self, data, message_id, user_id=ADMIN):
+        self.data = data
+        self.from_user = None if user_id is None else SimpleNamespace(id=user_id)
+        self.message = _FakeCbMessage(message_id) if message_id is not None else None
+        self.answers = []
+
+    async def answer(self, text="", **kwargs):
+        self.answers.append(text)
 
 
 class _RecordingLock:
@@ -392,22 +415,30 @@ class TestBackupCommand:
 
 class TestRegisterHandlers:
     def test_hooks_dispatcher_and_dispatches(self):
-        """注册进去的回调真的走到 handle_message —— 光断言「挂上了」会漏掉闭包接错。"""
-        registered = []
+        """注册进去的回调真的走到 handle_message；callback handler 也挂上。"""
+        registered_msg = []
+        registered_cb = []
 
         def on_message():
             def deco(fn):
-                registered.append(fn)
+                registered_msg.append(fn)
+                return fn
+            return deco
+
+        def on_callback_query():
+            def deco(fn):
+                registered_cb.append(fn)
                 return fn
             return deco
 
         ctx = _ctx(db=SimpleNamespace(stats=_stats))
 
-        bot_commands.register_handlers(SimpleNamespace(on_message=on_message), ctx)
+        bot_commands.register_handlers(
+            SimpleNamespace(on_message=on_message, on_callback_query=on_callback_query), ctx)
 
-        assert len(registered) == 1
+        assert len(registered_msg) == 1 and len(registered_cb) == 1
         msg = _FakeMessage("/stats")
-        asyncio.run(registered[0](SimpleNamespace(), msg))
+        asyncio.run(registered_msg[0](SimpleNamespace(), msg))
         assert "文件总数：3" in msg.sent[0]
 
 
@@ -601,3 +632,64 @@ class TestDeleteCommand:
             find_messages_by_source_ids=lambda ids: pytest.fail("参数非法不该查库"))), msg))
 
         assert "用法" in msg.sent[0]
+
+
+class TestDeleteCallback:
+    def _pending_with(self, message_id, payload, requester=ADMIN):
+        store: PendingStore[PendingDelete] = PendingStore()
+        store.put(message_id, payload, requester)
+        return store
+
+    def test_confirm_takes_lock_and_purges(self):
+        calls = []
+        db = SimpleNamespace(purge_messages=lambda ids, rollback:
+                             (calls.append((ids, rollback)), PurgeSummary(1, ["F"], [], {}))[1])
+        lock = _RecordingLock()
+        pending = self._pending_with(500, PendingDelete(ids=(300,), rollback=True))
+        cq = _FakeCallbackQuery("del:ok", message_id=500)
+
+        asyncio.run(handle_callback(_ctx(db=db, lock=lock, pending=pending), cq))
+
+        assert calls == [([300], True)]                  # 走了 purge，带对的 rollback
+        assert (lock.entries, lock.exits) == (1, 1)      # 真删走锁
+        assert cq.message is not None
+        assert "已删除 1 条" in cq.message.edited[0]
+        assert cq.answers
+        assert pending.take(500, ADMIN) is None          # pop-once 已消费
+
+    def test_cancel_edits_and_skips_purge(self):
+        db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("取消不该删"))
+        pending = self._pending_with(500, PendingDelete(ids=(300,), rollback=False))
+        cq = _FakeCallbackQuery("del:no", message_id=500)
+
+        asyncio.run(handle_callback(_ctx(db=db, pending=pending), cq))
+
+        assert cq.message is not None
+        assert "已取消" in cq.message.edited[0]
+        assert pending.take(500, ADMIN) is None
+
+    def test_expired_confirm_answers_invalid(self):
+        db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("失效不该删"))
+        cq = _FakeCallbackQuery("del:ok", message_id=500)      # pending 为空
+
+        asyncio.run(handle_callback(_ctx(db=db, pending=PendingStore()), cq))
+
+        assert any("失效" in a for a in cq.answers)
+
+    def test_non_admin_callback_is_rejected(self):
+        db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("非白名单不该删"))
+        pending = self._pending_with(500, PendingDelete(ids=(300,), rollback=False))
+        cq = _FakeCallbackQuery("del:ok", message_id=500, user_id=999)
+
+        asyncio.run(handle_callback(_ctx(db=db, pending=pending), cq))
+
+        # 未删，pending 仍在（没被别人的点击消费）
+        assert pending.take(500, ADMIN) == PendingDelete(ids=(300,), rollback=False)
+
+    def test_unknown_action_answered_not_purged(self):
+        db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("未知 action 不该删"))
+        cq = _FakeCallbackQuery("nope:x", message_id=500)
+
+        asyncio.run(handle_callback(_ctx(db=db, pending=PendingStore()), cq))
+
+        assert cq.answers                                     # 答了以清客户端转圈
