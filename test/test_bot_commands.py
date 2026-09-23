@@ -24,16 +24,22 @@ ADMIN = 111
 
 
 class _FakeMessage:
-    """假消息：reply_text 把回复记进 sent。user_id=None 模拟频道匿名（from_user 为空）。"""
+    """假消息：reply_text 记回复与按钮，返回带自增 .id 的对象。user_id=None 模拟频道匿名。"""
 
     def __init__(self, text, user_id=ADMIN):
         self.text = text
         self.from_user = None if user_id is None else SimpleNamespace(id=user_id)
         self.sent = []
+        self.markups = []
+        self.reply_ids = []
+        self._next_id = 1000
 
-    async def reply_text(self, text, **kwargs):
+    async def reply_text(self, text, reply_markup=None, **kwargs):
         self.sent.append(text)
-        return SimpleNamespace(id=1)
+        self.markups.append(reply_markup)
+        self._next_id += 1
+        self.reply_ids.append(self._next_id)
+        return SimpleNamespace(id=self._next_id)
 
 
 class _RecordingLock:
@@ -416,7 +422,8 @@ class TestCommandMenu:
         asyncio.run(bot_commands.register_command_menu(
             SimpleNamespace(set_bot_commands=set_bot_commands)))
 
-        assert [c.command for c in sent] == ["stats", "search", "failures", "retry", "backup"]
+        assert [c.command for c in sent] == [
+            "stats", "search", "failures", "retry", "backup", "delete"]
         assert all(c.description for c in sent)
 
     def test_menu_failure_is_not_fatal(self):
@@ -549,3 +556,48 @@ class TestFormatPurge:
         summary = PurgeSummary(1, [], [], {})
         body = format_purge(summary, PendingDelete(ids=(300,), rollback=True))
         assert "目标不小于当前值" in body
+
+
+class TestDeleteCommand:
+    def _db(self, rows, *, failures=(), checkpoint=350):
+        return SimpleNamespace(
+            find_messages_by_source_ids=lambda ids: [r for r in rows
+                                                     if r["source_message_id"] in ids],
+            get_failure=lambda c, m: object() if (c, m) in failures else None,
+            get_checkpoint=lambda c: checkpoint,
+        )
+
+    def test_preview_attaches_buttons_and_registers_pending(self):
+        pending: PendingStore[PendingDelete] = PendingStore()
+        msg = _FakeMessage("/delete 300")
+
+        asyncio.run(handle_message(_ctx(db=self._db([_msg_row(300)]), pending=pending), msg))
+
+        assert msg.markups[0] is not None                 # 挂了按钮
+        assert "将删除 1 条" in msg.sent[0]
+        payload = pending.take(msg.reply_ids[0], ADMIN)
+        assert payload == PendingDelete(ids=(300,), rollback=False)
+
+    def test_rollback_flag_recorded_in_pending(self):
+        pending: PendingStore[PendingDelete] = PendingStore()
+        msg = _FakeMessage("/delete 300 rollback")
+
+        asyncio.run(handle_message(_ctx(db=self._db([_msg_row(300)]), pending=pending), msg))
+
+        assert pending.take(msg.reply_ids[0], ADMIN) == PendingDelete(ids=(300,), rollback=True)
+
+    def test_no_match_replies_plainly_without_buttons(self):
+        msg = _FakeMessage("/delete 999")
+
+        asyncio.run(handle_message(_ctx(db=self._db([_msg_row(300)])), msg))
+
+        assert "没找到" in msg.sent[0]
+        assert msg.markups[0] is None
+
+    def test_bad_args_reply_usage_without_touching_db(self):
+        msg = _FakeMessage("/delete abc")
+
+        asyncio.run(handle_message(_ctx(db=SimpleNamespace(
+            find_messages_by_source_ids=lambda ids: pytest.fail("参数非法不该查库"))), msg))
+
+        assert "用法" in msg.sent[0]
