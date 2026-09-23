@@ -18,8 +18,9 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
-from db import ArchiveDB, RetrySummary, Stats
+from db import ArchiveDB, PurgeSummary, RetrySummary, Stats
 from pyrogram.client import Client
 from pyrogram.types import BotCommand, Message
 from search import format_result
@@ -40,6 +41,11 @@ SEARCH_LIMIT = 20
 
 # 待确认删除的暂存过期时间（秒）。按钮点下去若超过它就当失效，防止没点的确认无限堆积
 PENDING_TTL_SECONDS = 600
+
+# checkpoint 回退跨度超过它就在预览里高亮警告，提示可能选中了 source_message_id 不可信的
+# 历史行。镜像 scripts/delete_message.py 的 ROLLBACK_WARN_SPAN；bot 侧靠人点按钮确认，
+# 不设 --force 等价物
+ROLLBACK_WARN_SPAN = 100
 
 
 @dataclass(frozen=True)
@@ -174,6 +180,87 @@ def listed(items: list[str]) -> list[str]:
 def one_line(text: str | None, limit: int = 120) -> str:
     """把可能多行的字段压成一行，过长截断（回复里一行一条才读得下去）。"""
     return (text or "").replace("\n", " ")[:limit]
+
+
+class DeletePreview(NamedTuple):
+    """/delete 预览所需的、已从库里取好的数据。格式化纯函数只吃它，不再碰 IO。"""
+
+    rows: list                                   # messages 行（sqlite3.Row 或 dict）
+    missing: list[int]                           # 请求了但没找到的入口 id
+    rollback: bool
+    cp_changes: list[tuple[str, int, int]]       # (chat, old_cp, new_cp)，仅 rollback 时非空
+    cleared_failures: list[tuple[str, int]]      # (chat, msg_id)，将被清的失败账
+
+
+def parse_delete_args(args: list[str]) -> tuple[list[int], bool]:
+    """
+    解析 /delete 参数：整数是入口 id，标志词 rollback/keep 决定是否回退 checkpoint。
+    默认不回退。非法输入 / 冲突标志 / 无 id 时抛 ValueError（消息即用法文本）。
+    """
+    usage = "用法：/delete <消息id ...> [rollback|keep]（默认不回退 checkpoint）"
+    ids: list[int] = []
+    rollback: bool | None = None
+    for a in args:
+        low = a.lower()
+        if low == "rollback":
+            if rollback is False:
+                raise ValueError("keep 和 rollback 只能给一个")
+            rollback = True
+        elif low == "keep":
+            if rollback is True:
+                raise ValueError("keep 和 rollback 只能给一个")
+            rollback = False
+        else:
+            try:
+                ids.append(int(a))
+            except ValueError:
+                raise ValueError(f"{usage}（{a} 不是整数或已知标志）")
+    if not ids:
+        raise ValueError(usage)
+    return ids, bool(rollback)
+
+
+def format_delete_preview(preview: DeletePreview) -> str:
+    head = f"将删除 {len(preview.rows)} 条记录，确认后不可恢复："
+    lines = [
+        f"  msg={r['source_message_id']} chat={r['source_chat_id']} "
+        f"fuid={r['file_unique_id']} sender={one_line(r['sender'], 30)} "
+        f"caption={one_line(r['caption'], 40)}"
+        for r in preview.rows
+    ]
+    body = [head, *listed(lines)]
+    if preview.missing:
+        body.append(f"未找到：{preview.missing}")
+    if preview.cleared_failures:
+        body.append(f"将清除失败账 {len(preview.cleared_failures)} 条")
+    if not preview.rollback:
+        body.append("checkpoint 不变（keep，不重扫）")
+    elif not preview.cp_changes:
+        body.append("checkpoint 不变（目标不小于当前值）")
+    else:
+        body.append("checkpoint 将回退（下轮扫描重抓）：")
+        for chat_id, old_cp, new_cp in preview.cp_changes:
+            span = old_cp - new_cp
+            warn = f"  ⚠ 回退 {span} 条 > {ROLLBACK_WARN_SPAN}，请确认没选错行" \
+                if span > ROLLBACK_WARN_SPAN else ""
+            body.append(f"  chat={chat_id}: {old_cp} → {new_cp}（回退 {span} 条）{warn}")
+    body.append("点「确认删除」执行，「取消」放弃。")
+    return "\n".join(body)
+
+
+def format_purge(summary: PurgeSummary, payload: PendingDelete) -> str:
+    lines = [(f"已删除 {summary.deleted_messages} 条消息记录，"
+              f"{len(summary.deleted_files)} 条文件记录")]
+    if summary.cleared_failures:
+        lines.append(f"清除失败账 {len(summary.cleared_failures)} 条")
+    if not payload.rollback:
+        lines.append("checkpoint 未回退（按 keep 保留）")
+    elif summary.rollback:
+        for chat_id, (old_cp, new_cp) in summary.rollback.items():
+            lines.append(f"checkpoint 回退 chat={chat_id}: {old_cp} → {new_cp}")
+    else:
+        lines.append("checkpoint 未回退（目标不小于当前值）")
+    return "\n".join(lines)
 
 
 def format_stats(stats: Stats) -> str:
