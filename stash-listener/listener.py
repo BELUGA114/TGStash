@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
 from bot_commands import (
     BotContext,
+    PendingStore,
     parse_admin_ids,
     register_command_menu,
     register_handlers,
@@ -697,6 +698,7 @@ async def _serve_bot(bot: Client, ctx: ListenerContext, lock: asyncio.Lock) -> N
             lock=lock,
             admin_ids=BOT_ADMIN_IDS,
             run_backup=lambda: _run_backup(ctx, time.time()),
+            pending=PendingStore(),
         ))
         await register_command_menu(bot)
         logger.info("bot 命令已启用，admin 白名单：%s",
