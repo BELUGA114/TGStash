@@ -994,3 +994,35 @@ class TestListFailures:
 
     def test_empty(self, db: ArchiveDB):
         assert db.list_failures() == []
+
+
+class TestPurgeRollbackToggle:
+    def test_purge_without_rollback_keeps_checkpoint(self, db: ArchiveDB):
+        chat = "-1001234567890"
+        db.ensure_channel(chat, "manual_forward")
+        db.set_checkpoint(chat, 350)
+        db.record_archived(
+            file_unique_id="FUID_K", sha256="a" * 64, size=100, source="manual_forward",
+            source_chat_id=chat, source_message_id=300, media_kind="document")
+        db.increment_failure(chat, 300, "upload", "x")
+
+        summary = db.purge_messages([300], rollback=False)
+
+        assert summary.deleted_messages == 1
+        assert summary.rollback == {}                     # 没回退
+        assert db.get_checkpoint(chat) == 350             # checkpoint 不动
+        assert db.find_by_unique_id("FUID_K") is None     # 记录仍删
+        assert db.get_failure(chat, 300) is None          # 失败账仍清
+
+    def test_purge_default_still_rolls_back(self, db: ArchiveDB):
+        chat = "-1001234567890"
+        db.ensure_channel(chat, "manual_forward")
+        db.set_checkpoint(chat, 350)
+        db.record_archived(
+            file_unique_id="FUID_R", sha256="b" * 64, size=100, source="manual_forward",
+            source_chat_id=chat, source_message_id=300, media_kind="document")
+
+        summary = db.purge_messages([300])
+
+        assert summary.rollback == {chat: (350, 299)}
+        assert db.get_checkpoint(chat) == 299

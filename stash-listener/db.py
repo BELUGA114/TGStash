@@ -771,10 +771,12 @@ class ArchiveDB:
             con.row_factory = sqlite3.Row
             return _fetch_messages_by_source(con, source_message_ids)
 
-    def purge_messages(self, source_message_ids: list[int]) -> PurgeSummary:
+    def purge_messages(self, source_message_ids: list[int], *, rollback: bool = True) -> PurgeSummary:
         """
         一个事务内删掉这些入口的全部痕迹：messages、无其他消息引用的 files、
-        失败账，并把 checkpoint 回退到各 chat 的 min(source_message_id) - 1。
+        失败账，并（当 rollback=True 时）把 checkpoint 回退到各 chat 的
+        min(source_message_id) - 1。rollback=False 时跳过 checkpoint 回退，其余照删
+        —— 用于「只删库不重扫」的纯删除。
 
         必须是一个事务，两种拆法都有静默坏窗口：先删行后回退，中间崩掉 =
         行没了而 checkpoint 没退，那些消息永远不被重扫；先回退后删，中间崩掉 =
@@ -816,27 +818,28 @@ class ArchiveDB:
                 if cur.rowcount:
                     cleared_failures.append((chat_id, msg_id))
 
-            rollback = {}
-            chat_min: dict[str, int] = {}
-            for row in rows:
-                if row["source_chat_id"]:
-                    chat_id = str(row["source_chat_id"])
-                    chat_min[chat_id] = min(chat_min.get(chat_id, row["source_message_id"]),
-                                            row["source_message_id"])
-            for chat_id, min_id in chat_min.items():
-                new_cp = min_id - 1
-                cp_row = con.execute(
-                    "SELECT last_message_id FROM channels WHERE chat_id=?", (chat_id,)
-                ).fetchone()
-                # 频道行不存在 = 从没跑过 ensure_channel，无 checkpoint 可回退
-                if cp_row is None:
-                    continue
-                old_cp = cp_row[0]
-                if new_cp < old_cp:
-                    con.execute(_CHECKPOINT_UPDATE, (new_cp, _now(), chat_id))
-                    rollback[chat_id] = (old_cp, new_cp)
+            rolled_back: dict[str, tuple[int, int]] = {}
+            if rollback:
+                chat_min: dict[str, int] = {}
+                for row in rows:
+                    if row["source_chat_id"]:
+                        chat_id = str(row["source_chat_id"])
+                        chat_min[chat_id] = min(chat_min.get(chat_id, row["source_message_id"]),
+                                                row["source_message_id"])
+                for chat_id, min_id in chat_min.items():
+                    new_cp = min_id - 1
+                    cp_row = con.execute(
+                        "SELECT last_message_id FROM channels WHERE chat_id=?", (chat_id,)
+                    ).fetchone()
+                    # 频道行不存在 = 从没跑过 ensure_channel，无 checkpoint 可回退
+                    if cp_row is None:
+                        continue
+                    old_cp = cp_row[0]
+                    if new_cp < old_cp:
+                        con.execute(_CHECKPOINT_UPDATE, (new_cp, _now(), chat_id))
+                        rolled_back[chat_id] = (old_cp, new_cp)
 
-            return PurgeSummary(deleted_messages, deleted_files, cleared_failures, rollback)
+            return PurgeSummary(deleted_messages, deleted_files, cleared_failures, rolled_back)
 
     def backup_to(self, dest_path: str) -> None:
         """
