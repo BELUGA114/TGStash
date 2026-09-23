@@ -22,7 +22,12 @@ from typing import NamedTuple
 
 from db import ArchiveDB, PurgeSummary, RetrySummary, Stats
 from pyrogram.client import Client
-from pyrogram.types import BotCommand, Message
+from pyrogram.types import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from search import format_result
 
 logger = logging.getLogger(__name__)
@@ -352,6 +357,52 @@ async def _cmd_search(ctx: BotContext, message: Message, args: list[str]) -> Non
     await message.reply_text(truncate(f"搜索「{query}」：\n{body}"))
 
 
+def _gather_delete_preview(db: ArchiveDB, ids: list[int], rollback: bool) -> DeletePreview:
+    """预览所需数据的 IO 汇集：查行、算缺失、算将清失败账，rollback 时算 checkpoint 回退。"""
+    rows = db.find_messages_by_source_ids(ids)
+    found = {r["source_message_id"] for r in rows}
+    missing = [i for i in ids if i not in found]
+    entry_keys = sorted({(str(r["source_chat_id"]), r["source_message_id"])
+                         for r in rows if r["source_chat_id"]})
+    cleared = [(c, m) for c, m in entry_keys if db.get_failure(c, m) is not None]
+    cp_changes: list[tuple[str, int, int]] = []
+    if rollback:
+        chat_min: dict[str, int] = {}
+        for r in rows:
+            if r["source_chat_id"]:
+                c = str(r["source_chat_id"])
+                chat_min[c] = min(chat_min.get(c, r["source_message_id"]),
+                                  r["source_message_id"])
+        for c, min_id in chat_min.items():
+            old_cp = db.get_checkpoint(c)
+            new_cp = min_id - 1
+            if new_cp < old_cp:
+                cp_changes.append((c, old_cp, new_cp))
+    return DeletePreview(rows, missing, rollback, cp_changes, cleared)
+
+
+async def _cmd_delete(ctx: BotContext, message: Message, args: list[str]) -> None:
+    try:
+        ids, rollback = parse_delete_args(args)
+    except ValueError as e:
+        await message.reply_text(str(e))
+        return
+    user = message.from_user
+    if user is None:            # is_allowed 已保证非空；就地收窄给 pyright
+        return
+    preview = _gather_delete_preview(ctx.db, ids, rollback)
+    if not preview.rows:
+        await message.reply_text(f"没找到 source_message_id in {ids} 的记录")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("确认删除", callback_data="del:ok"),
+        InlineKeyboardButton("取消", callback_data="del:no"),
+    ]])
+    sent = await message.reply_text(
+        truncate(format_delete_preview(preview)), reply_markup=keyboard)
+    ctx.pending.put(sent.id, PendingDelete(tuple(ids), rollback), user.id)
+
+
 # 命令表：名字 → (实现, 菜单说明)。这一张表同时驱动分发、BotFather 菜单与未知命令的
 # 用法提示，加命令只改这里一处
 COMMANDS: dict[str, tuple[CommandHandler, str]] = {
@@ -360,6 +411,7 @@ COMMANDS: dict[str, tuple[CommandHandler, str]] = {
     "failures": (_cmd_failures, "列出失败账"),
     "retry": (_cmd_retry, "重试失败的条目：/retry [消息 id ...]"),
     "backup": (_cmd_backup, "立即备份数据库"),
+    "delete": (_cmd_delete, "删除条目并可选回退：/delete <id...> [rollback]"),
 }
 
 
