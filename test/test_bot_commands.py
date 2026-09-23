@@ -6,15 +6,19 @@ import bot_commands
 import pytest
 from bot_commands import (
     BotContext,
+    DeletePreview,
     PendingDelete,
     PendingStore,
+    format_delete_preview,
+    format_purge,
     handle_message,
     parse_admin_ids,
     parse_callback,
     parse_command,
+    parse_delete_args,
     user_allowed,
 )
-from db import RetrySummary, Stats
+from db import PurgeSummary, RetrySummary, Stats
 
 ADMIN = 111
 
@@ -471,3 +475,77 @@ class TestPendingStore:
         clock[0] = 1011.0                                # 超过 ttl
 
         assert store.take(7, by_user=111) is None
+
+
+def _msg_row(mid=100, chat="-1001234567890", fuid="FUID1", sender="张三", caption="报告"):
+    return {"id": 1, "source_message_id": mid, "source_chat_id": chat,
+            "file_unique_id": fuid, "sender": sender, "caption": caption,
+            "sent_at": "2026-09-01"}
+
+
+class TestParseDeleteArgs:
+    def test_ids_only_defaults_no_rollback(self):
+        assert parse_delete_args(["100", "105"]) == ([100, 105], False)
+
+    def test_rollback_flag(self):
+        assert parse_delete_args(["100", "rollback"]) == ([100], True)
+
+    def test_keep_flag_is_explicit_no_rollback(self):
+        assert parse_delete_args(["100", "KEEP"]) == ([100], False)
+
+    def test_conflicting_flags_raise(self):
+        with pytest.raises(ValueError):
+            parse_delete_args(["100", "keep", "rollback"])
+
+    def test_non_integer_raises(self):
+        with pytest.raises(ValueError):
+            parse_delete_args(["abc"])
+
+    def test_no_ids_raises(self):
+        with pytest.raises(ValueError):
+            parse_delete_args(["rollback"])
+
+
+class TestFormatDeletePreview:
+    def test_no_rollback_says_checkpoint_unchanged(self):
+        preview = DeletePreview(rows=[_msg_row(100)], missing=[], rollback=False,
+                                cp_changes=[], cleared_failures=[])
+        body = format_delete_preview(preview)
+        assert "将删除 1 条" in body and "msg=100" in body
+        assert "checkpoint 不变" in body
+
+    def test_rollback_lists_change(self):
+        preview = DeletePreview(rows=[_msg_row(300)], missing=[], rollback=True,
+                                cp_changes=[("-1001234567890", 350, 299)], cleared_failures=[])
+        body = format_delete_preview(preview)
+        assert "checkpoint 将回退" in body
+        assert "-1001234567890: 350 → 299" in body
+
+    def test_large_rollback_is_flagged(self):
+        preview = DeletePreview(rows=[_msg_row(41)], missing=[], rollback=True,
+                                cp_changes=[("-1001234567890", 15000, 40)], cleared_failures=[])
+        assert "⚠" in format_delete_preview(preview)
+
+    def test_missing_and_failures_shown(self):
+        preview = DeletePreview(rows=[_msg_row(100)], missing=[999], rollback=False,
+                                cp_changes=[], cleared_failures=[("-1001234567890", 100)])
+        body = format_delete_preview(preview)
+        assert "未找到" in body and "999" in body
+        assert "将清除失败账 1 条" in body
+
+
+class TestFormatPurge:
+    def test_rollback_reports_change(self):
+        summary = PurgeSummary(1, ["FUID1"], [], {"-1001234567890": (350, 299)})
+        body = format_purge(summary, PendingDelete(ids=(300,), rollback=True))
+        assert "checkpoint 回退" in body and "350 → 299" in body
+
+    def test_keep_states_not_rolled_back(self):
+        summary = PurgeSummary(1, ["FUID1"], [], {})
+        body = format_purge(summary, PendingDelete(ids=(300,), rollback=False))
+        assert "按 keep 保留" in body
+
+    def test_rollback_requested_but_none_moved(self):
+        summary = PurgeSummary(1, [], [], {})
+        body = format_purge(summary, PendingDelete(ids=(300,), rollback=True))
+        assert "目标不小于当前值" in body
