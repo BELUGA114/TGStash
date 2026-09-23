@@ -4,7 +4,16 @@ from types import SimpleNamespace
 
 import bot_commands
 import pytest
-from bot_commands import BotContext, handle_message, parse_admin_ids, parse_command
+from bot_commands import (
+    BotContext,
+    PendingDelete,
+    PendingStore,
+    handle_message,
+    parse_admin_ids,
+    parse_callback,
+    parse_command,
+    user_allowed,
+)
 from db import RetrySummary, Stats
 
 ADMIN = 111
@@ -412,3 +421,52 @@ class TestCommandMenu:
 
         asyncio.run(bot_commands.register_command_menu(
             SimpleNamespace(set_bot_commands=boom)))
+
+
+class TestParseCallback:
+    def test_action_and_arg(self):
+        assert parse_callback("del:ok") == ("del", "ok")
+
+    def test_action_without_arg(self):
+        assert parse_callback("del") == ("del", "")
+
+    def test_empty_or_none(self):
+        assert parse_callback("") is None
+        assert parse_callback(None) is None
+
+    def test_bare_colon_has_no_action(self):
+        assert parse_callback(":ok") is None
+
+
+class TestUserAllowed:
+    def test_admin_passes(self):
+        assert user_allowed(SimpleNamespace(id=111), frozenset({111})) is True
+
+    def test_non_admin_and_none_rejected(self):
+        assert user_allowed(SimpleNamespace(id=999), frozenset({111})) is False
+        assert user_allowed(None, frozenset({111})) is False
+
+
+class TestPendingStore:
+    def test_put_then_take_pops_once(self):
+        store: PendingStore[PendingDelete] = PendingStore()
+        payload = PendingDelete(ids=(100,), rollback=False)
+        store.put(7, payload, requester_id=111)
+
+        assert store.take(7, by_user=111) == payload
+        assert store.take(7, by_user=111) is None      # pop-once
+
+    def test_take_rejects_other_user(self):
+        store: PendingStore[PendingDelete] = PendingStore()
+        store.put(7, PendingDelete(ids=(100,), rollback=False), requester_id=111)
+
+        assert store.take(7, by_user=222) is None
+
+    def test_take_none_when_expired(self, monkeypatch):
+        store: PendingStore[PendingDelete] = PendingStore(ttl_seconds=10)
+        clock = [1000.0]
+        monkeypatch.setattr("bot_commands.time.monotonic", lambda: clock[0])
+        store.put(7, PendingDelete(ids=(100,), rollback=False), requester_id=111)
+        clock[0] = 1011.0                                # 超过 ttl
+
+        assert store.take(7, by_user=111) is None

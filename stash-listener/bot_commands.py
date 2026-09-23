@@ -15,6 +15,7 @@ import 本模块不读环境变量、不开库、不构造 Client。环境变量
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -36,6 +37,52 @@ MAX_LISTED_ITEMS = 20
 
 # 搜索返回条数。30 条 × 每行最长 ~150 字符会顶到 4096，取 20 留余量
 SEARCH_LIMIT = 20
+
+# 待确认删除的暂存过期时间（秒）。按钮点下去若超过它就当失效，防止没点的确认无限堆积
+PENDING_TTL_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class PendingDelete:
+    """一次 /delete 待确认的载荷。ids 用 tuple 保持不可变。"""
+
+    ids: tuple[int, ...]
+    rollback: bool
+
+
+class PendingStore[T]:
+    """
+    confirm-then-act 的通用待确认暂存：以预览消息的 message_id 为 key，存待执行载荷。
+
+    横切关注点集中在这里，业务数据（载荷）不进来：pop-once 防连点重放、TTL 过期防泄漏、
+    发起人绑定（只有发起者本人能确认）。进程重启丢暂存 —— 点旧按钮会 take 落空当失效，可接受。
+    只被 bot dispatcher 上的协程读写，不与扫描轮共享。
+    """
+
+    def __init__(self, ttl_seconds: int = PENDING_TTL_SECONDS) -> None:
+        self._ttl = ttl_seconds
+        self._items: dict[int, tuple[T, int, float]] = {}   # message_id -> (载荷, 发起人, 存入时刻)
+
+    def _prune(self, now: float) -> None:
+        expired = [k for k, (_, _, ts) in self._items.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._items[k]
+
+    def put(self, message_id: int, payload: T, requester_id: int) -> None:
+        now = time.monotonic()
+        self._prune(now)
+        self._items[message_id] = (payload, requester_id, now)
+
+    def take(self, message_id: int, by_user: int) -> T | None:
+        now = time.monotonic()
+        entry = self._items.get(message_id)
+        if entry is None:
+            return None
+        payload, requester_id, ts = entry
+        if by_user != requester_id or now - ts > self._ttl:
+            return None
+        del self._items[message_id]     # pop-once：命中即移除
+        return payload
 
 
 @dataclass(frozen=True)
@@ -89,10 +136,24 @@ def parse_command(text: str | None) -> tuple[str, list[str]] | None:
     return name, parts[1:]
 
 
-def is_allowed(message: Message, admin_ids: frozenset[int]) -> bool:
-    """白名单判定。from_user 为空（频道匿名、sender_chat 发帖）一律拒。"""
-    user = message.from_user
+def parse_callback(data: str | None) -> tuple[str, str] | None:
+    """'del:ok' → ('del', 'ok')；'del' → ('del', '')；无 data / 无 action 返回 None。"""
+    if not data:
+        return None
+    action, _, arg = data.partition(":")
+    if not action:
+        return None
+    return action, arg
+
+
+def user_allowed(user, admin_ids: frozenset[int]) -> bool:
+    """白名单判定。user 为空（频道匿名、sender_chat 发帖）一律拒。命令与 callback 两处共用。"""
     return user is not None and user.id in admin_ids
+
+
+def is_allowed(message: Message, admin_ids: frozenset[int]) -> bool:
+    """白名单判定（消息入口）。委托 user_allowed，与 callback 入口共用同一判定。"""
+    return user_allowed(message.from_user, admin_ids)
 
 
 def truncate(text: str) -> str:
