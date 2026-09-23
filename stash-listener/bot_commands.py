@@ -24,6 +24,7 @@ from db import ArchiveDB, PurgeSummary, RetrySummary, Stats
 from pyrogram.client import Client
 from pyrogram.types import (
     BotCommand,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -109,6 +110,9 @@ class BotContext:
 
 # 命令实现签名：依赖全在 ctx 里，回复走 message.reply_text，不需要 Client 参数
 CommandHandler = Callable[[BotContext, Message, list[str]], Awaitable[None]]
+
+# callback 实现签名：arg 是 callback_data 冒号后那段
+CallbackHandler = Callable[[BotContext, CallbackQuery, str], Awaitable[None]]
 
 
 def parse_admin_ids(raw: str) -> frozenset[int]:
@@ -403,6 +407,36 @@ async def _cmd_delete(ctx: BotContext, message: Message, args: list[str]) -> Non
     ctx.pending.put(sent.id, PendingDelete(tuple(ids), rollback), user.id)
 
 
+async def _cb_delete(ctx: BotContext, cq: CallbackQuery, arg: str) -> None:
+    if arg not in ("ok", "no"):
+        await cq.answer("未知操作")
+        return
+    msg = cq.message
+    user = cq.from_user
+    if msg is None or user is None:          # 老消息/inline 场景 message 可能为空
+        await cq.answer("该确认已失效，请重新 /delete", show_alert=True)
+        return
+    payload = ctx.pending.take(msg.id, user.id)
+    if payload is None:                      # 过期 / 已处理 / 非本人
+        await cq.answer("该确认已失效或不属于你，请重新 /delete", show_alert=True)
+        return
+    if arg == "no":
+        await msg.edit_text("已取消删除")
+        await cq.answer("已取消")
+        return
+    # 真删走共享锁：等当前扫描轮跑完再改库，扫描也不撞上被改的 checkpoint
+    async with ctx.lock:
+        summary = ctx.db.purge_messages(list(payload.ids), rollback=payload.rollback)
+    await msg.edit_text(format_purge(summary, payload))   # edit 不带 keyboard，顺带抹掉按钮
+    await cq.answer("已删除")
+
+
+# callback 路由表：action → 实现。加按钮功能只在这里加一项（对称 COMMANDS）
+CALLBACKS: dict[str, CallbackHandler] = {
+    "del": _cb_delete,
+}
+
+
 # 命令表：名字 → (实现, 菜单说明)。这一张表同时驱动分发、BotFather 菜单与未知命令的
 # 用法提示，加命令只改这里一处
 COMMANDS: dict[str, tuple[CommandHandler, str]] = {
@@ -447,6 +481,31 @@ async def handle_message(ctx: BotContext, message: Message) -> None:
         await message.reply_text(f"命令执行失败：{e}")
 
 
+async def handle_callback(ctx: BotContext, cq: CallbackQuery) -> None:
+    """
+    callback 入口。按钮在聊天记录里长期存在，非白名单也可能点到 —— 一律先鉴权。
+    每条 callback 都要 answer 一次以清掉客户端转圈；异常兜底记全栈并 answer。
+    """
+    if not user_allowed(cq.from_user, ctx.admin_ids):
+        await cq.answer()                    # 静默清转圈，不泄露 bot 存在
+        return
+    data = cq.data.decode() if isinstance(cq.data, bytes) else cq.data
+    parsed = parse_callback(data)
+    if parsed is None:
+        await cq.answer()
+        return
+    action, arg = parsed
+    handler = CALLBACKS.get(action)
+    if handler is None:
+        await cq.answer("按钮已失效")
+        return
+    try:
+        await handler(ctx, cq, arg)
+    except Exception as e:
+        logger.exception("bot callback %s 执行失败", action)
+        await cq.answer(f"执行失败：{e}", show_alert=True)
+
+
 def register_handlers(bot: Client, ctx: BotContext) -> None:
     """
     把命令 handler 挂到 bot Client 上。依赖全在 ctx 里，由闭包捕获。
@@ -458,6 +517,10 @@ def register_handlers(bot: Client, ctx: BotContext) -> None:
     @bot.on_message()
     async def _on_message(_client: Client, message: Message) -> None:
         await handle_message(ctx, message)
+
+    @bot.on_callback_query()
+    async def _on_callback(_client: Client, cq: CallbackQuery) -> None:
+        await handle_callback(ctx, cq)
 
 
 async def register_command_menu(bot: Client) -> None:
