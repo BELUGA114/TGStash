@@ -493,7 +493,7 @@ class TestUserAllowed:
 class TestPendingStore:
     def test_put_then_take_pops_once(self):
         store: PendingStore[PendingDelete] = PendingStore()
-        payload = PendingDelete(ids=(100,), rollback=False)
+        payload = PendingDelete(found_ids=(100,), rollback=False)
         store.put(7, payload, requester_id=111)
 
         assert store.take(7, by_user=111) == payload
@@ -501,7 +501,7 @@ class TestPendingStore:
 
     def test_take_rejects_other_user(self):
         store: PendingStore[PendingDelete] = PendingStore()
-        store.put(7, PendingDelete(ids=(100,), rollback=False), requester_id=111)
+        store.put(7, PendingDelete(found_ids=(100,), rollback=False), requester_id=111)
 
         assert store.take(7, by_user=222) is None
 
@@ -509,7 +509,7 @@ class TestPendingStore:
         store: PendingStore[PendingDelete] = PendingStore(ttl_seconds=10)
         clock = [1000.0]
         monkeypatch.setattr("bot_commands.time.monotonic", lambda: clock[0])
-        store.put(7, PendingDelete(ids=(100,), rollback=False), requester_id=111)
+        store.put(7, PendingDelete(found_ids=(100,), rollback=False), requester_id=111)
         clock[0] = 1011.0                                # 超过 ttl
 
         assert store.take(7, by_user=111) is None
@@ -575,17 +575,17 @@ class TestFormatDeletePreview:
 class TestFormatPurge:
     def test_rollback_reports_change(self):
         summary = PurgeSummary(1, ["FUID1"], [], {"-1001234567890": (350, 299)})
-        body = format_purge(summary, PendingDelete(ids=(300,), rollback=True))
+        body = format_purge(summary, PendingDelete(found_ids=(300,), rollback=True))
         assert "checkpoint 回退" in body and "350 → 299" in body
 
     def test_keep_states_not_rolled_back(self):
         summary = PurgeSummary(1, ["FUID1"], [], {})
-        body = format_purge(summary, PendingDelete(ids=(300,), rollback=False))
+        body = format_purge(summary, PendingDelete(found_ids=(300,), rollback=False))
         assert "按 keep 保留" in body
 
     def test_rollback_requested_but_none_moved(self):
         summary = PurgeSummary(1, [], [], {})
-        body = format_purge(summary, PendingDelete(ids=(300,), rollback=True))
+        body = format_purge(summary, PendingDelete(found_ids=(300,), rollback=True))
         assert "目标不小于当前值" in body
 
 
@@ -607,7 +607,7 @@ class TestDeleteCommand:
         assert msg.markups[0] is not None                 # 挂了按钮
         assert "将删除 1 条" in msg.sent[0]
         payload = pending.take(msg.reply_ids[0], ADMIN)
-        assert payload == PendingDelete(ids=(300,), rollback=False)
+        assert payload == PendingDelete(found_ids=(300,), rollback=False)
 
     def test_rollback_flag_recorded_in_pending(self):
         pending: PendingStore[PendingDelete] = PendingStore()
@@ -615,7 +615,8 @@ class TestDeleteCommand:
 
         asyncio.run(handle_message(_ctx(db=self._db([_msg_row(300)]), pending=pending), msg))
 
-        assert pending.take(msg.reply_ids[0], ADMIN) == PendingDelete(ids=(300,), rollback=True)
+        assert pending.take(msg.reply_ids[0], ADMIN) == PendingDelete(
+            found_ids=(300,), rollback=True, cp_changes=(("-1001234567890", 350, 299),))
 
     def test_no_match_replies_plainly_without_buttons(self):
         msg = _FakeMessage("/delete 999")
@@ -645,7 +646,7 @@ class TestDeleteCallback:
         db = SimpleNamespace(purge_messages=lambda ids, rollback:
                              (calls.append((ids, rollback)), PurgeSummary(1, ["F"], [], {}))[1])
         lock = _RecordingLock()
-        pending = self._pending_with(500, PendingDelete(ids=(300,), rollback=True))
+        pending = self._pending_with(500, PendingDelete(found_ids=(300,), rollback=True))
         cq = _FakeCallbackQuery("del:ok", message_id=500)
 
         asyncio.run(handle_callback(_ctx(db=db, lock=lock, pending=pending), cq))
@@ -659,7 +660,7 @@ class TestDeleteCallback:
 
     def test_cancel_edits_and_skips_purge(self):
         db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("取消不该删"))
-        pending = self._pending_with(500, PendingDelete(ids=(300,), rollback=False))
+        pending = self._pending_with(500, PendingDelete(found_ids=(300,), rollback=False))
         cq = _FakeCallbackQuery("del:no", message_id=500)
 
         asyncio.run(handle_callback(_ctx(db=db, pending=pending), cq))
@@ -678,13 +679,13 @@ class TestDeleteCallback:
 
     def test_non_admin_callback_is_rejected(self):
         db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("非白名单不该删"))
-        pending = self._pending_with(500, PendingDelete(ids=(300,), rollback=False))
+        pending = self._pending_with(500, PendingDelete(found_ids=(300,), rollback=False))
         cq = _FakeCallbackQuery("del:ok", message_id=500, user_id=999)
 
         asyncio.run(handle_callback(_ctx(db=db, pending=pending), cq))
 
         # 未删，pending 仍在（没被别人的点击消费）
-        assert pending.take(500, ADMIN) == PendingDelete(ids=(300,), rollback=False)
+        assert pending.take(500, ADMIN) == PendingDelete(found_ids=(300,), rollback=False)
 
     def test_unknown_action_answered_not_purged(self):
         db = SimpleNamespace(purge_messages=lambda *a, **k: pytest.fail("未知 action 不该删"))
@@ -693,3 +694,68 @@ class TestDeleteCallback:
         asyncio.run(handle_callback(_ctx(db=db, pending=PendingStore()), cq))
 
         assert cq.answers                                     # 答了以清客户端转圈
+
+    def _preview_db(self, rows, *, checkpoint):
+        """带完整预览方法的假库；checkpoint 用可变容器以便确认前改动。"""
+        return SimpleNamespace(
+            find_messages_by_source_ids=lambda ids: [r for r in rows
+                                                     if r["source_message_id"] in ids],
+            get_failure=lambda c, m: None,
+            get_checkpoint=lambda c: checkpoint[0],
+        )
+
+    def test_confirm_only_purges_previewed_ids_not_late_archived(self):
+        """#3：预览时「未找到」的 id 即便确认前被归档，确认也只删预览命中过的，不碰它。"""
+        purged = []
+        db = self._preview_db([_msg_row(300)], checkpoint=[350])
+        db.purge_messages = lambda ids, rollback: (purged.append(ids),
+                                                   PurgeSummary(1, [], [], {}))[1]
+        pending: PendingStore[PendingDelete] = PendingStore()
+        ctx = _ctx(db=db, pending=pending)
+        msg = _FakeMessage("/delete 300 999")            # 300 命中、999 未找到
+
+        asyncio.run(handle_message(ctx, msg))
+        assert "未找到" in msg.sent[0] and "999" in msg.sent[0]
+
+        cq = _FakeCallbackQuery("del:ok", message_id=msg.reply_ids[0])
+        asyncio.run(handle_callback(ctx, cq))
+
+        assert purged == [[300]]                         # 只删 300，未找到的 999 不进 purge
+
+    def test_confirm_refuses_when_rollback_span_grew_past_threshold(self):
+        """#2：预览时跨度未越警戒线（无警告），确认前扫描推进 checkpoint 使跨度越线 → 拒绝。"""
+        checkpoint = [350]                               # 删 300 → 预览跨度 51 < 100，不警告
+        purged = []
+        db = self._preview_db([_msg_row(300)], checkpoint=checkpoint)
+        db.purge_messages = lambda ids, rollback: (purged.append(ids),
+                                                   PurgeSummary(1, [], [], {}))[1]
+        pending: PendingStore[PendingDelete] = PendingStore()
+        ctx = _ctx(db=db, pending=pending)
+        msg = _FakeMessage("/delete 300 rollback")
+
+        asyncio.run(handle_message(ctx, msg))
+        assert "⚠" not in msg.sent[0]                    # 预览确实没警告
+
+        checkpoint[0] = 500                              # 确认前又扫一轮：跨度变 500-299=201 > 100
+        cq = _FakeCallbackQuery("del:ok", message_id=msg.reply_ids[0])
+        asyncio.run(handle_callback(ctx, cq))
+
+        assert purged == []                              # 拒绝，没删
+        assert cq.message is not None
+        assert "已取消" in cq.message.edited[0] and "重新 /delete" in cq.message.edited[0]
+
+    def test_confirm_proceeds_when_span_stays_within_threshold(self):
+        """#2 反面：checkpoint 没漂到越线，确认照常执行，不误拦。"""
+        purged = []
+        db = SimpleNamespace(
+            get_checkpoint=lambda c: 350,                # 与预览一致，跨度不变
+            purge_messages=lambda ids, rollback: (purged.append((ids, rollback)),
+                                                  PurgeSummary(1, [], [], {}))[1])
+        pending = self._pending_with(
+            500, PendingDelete(found_ids=(300,), rollback=True,
+                               cp_changes=(("-1001234567890", 350, 299),)))
+        cq = _FakeCallbackQuery("del:ok", message_id=500)
+
+        asyncio.run(handle_callback(_ctx(db=db, pending=pending), cq))
+
+        assert purged == [([300], True)]

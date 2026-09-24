@@ -56,10 +56,13 @@ ROLLBACK_WARN_SPAN = 100
 
 @dataclass(frozen=True)
 class PendingDelete:
-    """一次 /delete 待确认的载荷。ids 用 tuple 保持不可变。"""
+    """一次 /delete 待确认的载荷：只带预览时真正命中的入口 id 与当时算出的 checkpoint
+    回退计划。确认时据此复核——删的只认预览列过的 id（TTL 内新归档的不会被顺带删），
+    回退跨度越过警戒线而预览没警告过就拒（预览→确认之间可能又扫描一轮把跨度撑大）。"""
 
-    ids: tuple[int, ...]
+    found_ids: tuple[int, ...]                          # 预览命中的 source_message_id，确认只删这些
     rollback: bool
+    cp_changes: tuple[tuple[str, int, int], ...] = ()   # 预览时算出的 (chat, old_cp, new_cp)，供确认复核
 
 
 class PendingStore[T]:
@@ -404,7 +407,24 @@ async def _cmd_delete(ctx: BotContext, message: Message, args: list[str]) -> Non
     ]])
     sent = await message.reply_text(
         truncate(format_delete_preview(preview)), reply_markup=keyboard)
-    ctx.pending.put(sent.id, PendingDelete(tuple(ids), rollback), user.id)
+    # 只暂存预览真正命中的 id：确认时 purge 就不会碰到 TTL 内新归档、预览里没出现过的条目
+    found_ids = sorted({r["source_message_id"] for r in preview.rows})
+    ctx.pending.put(
+        sent.id, PendingDelete(tuple(found_ids), rollback, tuple(preview.cp_changes)), user.id)
+
+
+def _rollback_drift(db: ArchiveDB,
+                    shown: tuple[tuple[str, int, int], ...]) -> str | None:
+    """确认前锁内复核回退跨度。预览→确认之间可能又跑了一轮扫描（TTL 600s > 扫描间隔
+    300s），checkpoint 只增、回退目标 new_cp 由命中的 id 定死不动，所以只需重读当前
+    checkpoint 重算跨度。某 chat 现在越过 ROLLBACK_WARN_SPAN、而预览时没越过（没给过
+    警告），返回漂移描述让上层拒绝并要求重看；否则 None。"""
+    for chat_id, old_cp, new_cp in shown:
+        now_span = db.get_checkpoint(chat_id) - new_cp
+        was_span = old_cp - new_cp
+        if now_span > ROLLBACK_WARN_SPAN >= was_span:
+            return f"chat={chat_id} 回退 {was_span}→{now_span} 条"
+    return None
 
 
 async def _cb_delete(ctx: BotContext, cq: CallbackQuery, arg: str) -> None:
@@ -426,7 +446,15 @@ async def _cb_delete(ctx: BotContext, cq: CallbackQuery, arg: str) -> None:
         return
     # 真删走共享锁：等当前扫描轮跑完再改库，扫描也不撞上被改的 checkpoint
     async with ctx.lock:
-        summary = ctx.db.purge_messages(list(payload.ids), rollback=payload.rollback)
+        # 预览是快照；确认前可能又扫描了一轮。跨度越过警戒线而预览没警告过就拒，逼用户重看
+        drift = _rollback_drift(ctx.db, payload.cp_changes)
+        if drift is not None:
+            await msg.edit_text(
+                f"频道在你确认前又收了新消息，回退跨度变大越过警戒线（{drift}），"
+                "已取消以防误伤。请重新 /delete 查看最新预览。")
+            await cq.answer("已取消（状态已变化）", show_alert=True)
+            return
+        summary = ctx.db.purge_messages(list(payload.found_ids), rollback=payload.rollback)
     await msg.edit_text(format_purge(summary, payload))   # edit 不带 keyboard，顺带抹掉按钮
     await cq.answer("已删除")
 
