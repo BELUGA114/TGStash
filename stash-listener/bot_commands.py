@@ -413,17 +413,18 @@ async def _cmd_delete(ctx: BotContext, message: Message, args: list[str]) -> Non
         sent.id, PendingDelete(tuple(found_ids), rollback, tuple(preview.cp_changes)), user.id)
 
 
-def _rollback_drift(db: ArchiveDB,
-                    shown: tuple[tuple[str, int, int], ...]) -> str | None:
-    """确认前锁内复核回退跨度。预览→确认之间可能又跑了一轮扫描（TTL 600s > 扫描间隔
-    300s），checkpoint 只增、回退目标 new_cp 由命中的 id 定死不动，所以只需重读当前
-    checkpoint 重算跨度。某 chat 现在越过 ROLLBACK_WARN_SPAN、而预览时没越过（没给过
-    警告），返回漂移描述让上层拒绝并要求重看；否则 None。"""
-    for chat_id, old_cp, new_cp in shown:
-        now_span = db.get_checkpoint(chat_id) - new_cp
-        was_span = old_cp - new_cp
-        if now_span > ROLLBACK_WARN_SPAN >= was_span:
-            return f"chat={chat_id} 回退 {was_span}→{now_span} 条"
+def _rollback_drift(shown: tuple[tuple[str, int, int], ...],
+                    actual: list[tuple[str, int, int]]) -> str | None:
+    """以确认时「真正要发生的回退」actual 为准，对比预览警告过的 chat。预览→确认之间可能
+    又扫描一轮（TTL 600s > 扫描间隔 300s）把 checkpoint 推高——甚至预览时判「目标不小于当前
+    值」不回退、确认时却要回退，所以不能只看预览列出的 shown。某 chat 现在越过
+    ROLLBACK_WARN_SPAN、而预览没就它警告过（span 未越线，含预览压根没打算回退它），返回
+    漂移描述让上层拒绝并要求重看；否则 None。"""
+    warned = {c for c, old, new in shown if old - new > ROLLBACK_WARN_SPAN}
+    for c, old, new in actual:
+        span = old - new
+        if span > ROLLBACK_WARN_SPAN and c not in warned:
+            return f"chat={c} 回退 {span} 条越过警戒线（预览未警告）"
     return None
 
 
@@ -446,11 +447,13 @@ async def _cb_delete(ctx: BotContext, cq: CallbackQuery, arg: str) -> None:
         return
     # 真删走共享锁：等当前扫描轮跑完再改库，扫描也不撞上被改的 checkpoint
     async with ctx.lock:
-        # 预览是快照；确认前可能又扫描了一轮。跨度越过警戒线而预览没警告过就拒，逼用户重看
-        drift = _rollback_drift(ctx.db, payload.cp_changes)
+        # 预览是快照；确认前可能又扫了一轮把 checkpoint 推高。锁内按「确认时真正要发生的回退」
+        # 复核（含预览时不打算回退、现在却要回退的 chat）：越过警戒线而预览没警告过就拒，逼重看
+        fresh = _gather_delete_preview(ctx.db, list(payload.found_ids), payload.rollback)
+        drift = _rollback_drift(payload.cp_changes, fresh.cp_changes)
         if drift is not None:
             await msg.edit_text(
-                f"频道在你确认前又收了新消息，回退跨度变大越过警戒线（{drift}），"
+                f"频道在你确认前又收了新消息，回退跨度越过警戒线（{drift}），"
                 "已取消以防误伤。请重新 /delete 查看最新预览。")
             await cq.answer("已取消（状态已变化）", show_alert=True)
             return

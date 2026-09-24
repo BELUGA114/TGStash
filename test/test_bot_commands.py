@@ -643,10 +643,13 @@ class TestDeleteCallback:
 
     def test_confirm_takes_lock_and_purges(self):
         calls = []
-        db = SimpleNamespace(purge_messages=lambda ids, rollback:
-                             (calls.append((ids, rollback)), PurgeSummary(1, ["F"], [], {}))[1])
+        db = self._preview_db([_msg_row(300)], checkpoint=[350])   # 确认时重算预览，需完整库
+        db.purge_messages = lambda ids, rollback: (calls.append((ids, rollback)),
+                                                   PurgeSummary(1, ["F"], [], {}))[1]
         lock = _RecordingLock()
-        pending = self._pending_with(500, PendingDelete(found_ids=(300,), rollback=True))
+        pending = self._pending_with(
+            500, PendingDelete(found_ids=(300,), rollback=True,
+                               cp_changes=(("-1001234567890", 350, 299),)))
         cq = _FakeCallbackQuery("del:ok", message_id=500)
 
         asyncio.run(handle_callback(_ctx(db=db, lock=lock, pending=pending), cq))
@@ -744,18 +747,64 @@ class TestDeleteCallback:
         assert cq.message is not None
         assert "已取消" in cq.message.edited[0] and "重新 /delete" in cq.message.edited[0]
 
-    def test_confirm_proceeds_when_span_stays_within_threshold(self):
-        """#2 反面：checkpoint 没漂到越线，确认照常执行，不误拦。"""
+    def test_confirm_proceeds_when_preview_already_warned(self):
+        """#2 反面：预览就大跨度回退警告过（知情选择），确认即便跨度更大也照常执行，不误拦。"""
         purged = []
-        db = SimpleNamespace(
-            get_checkpoint=lambda c: 350,                # 与预览一致，跨度不变
-            purge_messages=lambda ids, rollback: (purged.append((ids, rollback)),
-                                                  PurgeSummary(1, [], [], {}))[1])
-        pending = self._pending_with(
-            500, PendingDelete(found_ids=(300,), rollback=True,
-                               cp_changes=(("-1001234567890", 350, 299),)))
-        cq = _FakeCallbackQuery("del:ok", message_id=500)
+        db = self._preview_db([_msg_row(40)], checkpoint=[15000])
+        db.purge_messages = lambda ids, rollback: (purged.append((ids, rollback)),
+                                                   PurgeSummary(1, [], [], {}))[1]
+        pending: PendingStore[PendingDelete] = PendingStore()
+        ctx = _ctx(db=db, pending=pending)
+        msg = _FakeMessage("/delete 40 rollback")
 
-        asyncio.run(handle_callback(_ctx(db=db, pending=pending), cq))
+        asyncio.run(handle_message(ctx, msg))
+        assert "⚠" in msg.sent[0]                        # 预览就警告过大跨度
 
-        assert purged == [([300], True)]
+        cq = _FakeCallbackQuery("del:ok", message_id=msg.reply_ids[0])
+        asyncio.run(handle_callback(ctx, cq))
+
+        assert purged == [([40], True)]                  # 知情选择，照常删
+
+    def test_confirm_refuses_when_preview_planned_no_rollback_but_checkpoint_climbed(self):
+        """#2 补漏：预览时 checkpoint 低于目标（显示「目标不小于当前值」、无警告），确认前
+        checkpoint 被扫描推高，purge 实际会大跨度回退 —— 确认必须拦下。"""
+        checkpoint = [254]                               # 低于要删的 261：预览判「不回退」
+        purged = []
+        db = self._preview_db([_msg_row(261)], checkpoint=checkpoint)
+        db.purge_messages = lambda ids, rollback: (purged.append(ids),
+                                                   PurgeSummary(1, [], [], {}))[1]
+        pending: PendingStore[PendingDelete] = PendingStore()
+        ctx = _ctx(db=db, pending=pending)
+        msg = _FakeMessage("/delete 261 rollback")
+
+        asyncio.run(handle_message(ctx, msg))
+        assert "⚠" not in msg.sent[0]                    # 预览没警告（判定不回退）
+
+        checkpoint[0] = 400                              # 确认前扫描把 checkpoint 推到 400
+        cq = _FakeCallbackQuery("del:ok", message_id=msg.reply_ids[0])
+        asyncio.run(handle_callback(ctx, cq))
+
+        assert purged == []                              # 实际会回退 400→260（跨度 140>100），拦下
+        assert cq.message is not None
+        assert "已取消" in cq.message.edited[0] and "重新 /delete" in cq.message.edited[0]
+
+
+class TestRollbackDrift:
+    """确认时回退跨度漂移判定：以确认时实际回退计划为准，对比预览警告过的 chat。"""
+
+    def test_actual_crosses_and_preview_did_not_warn_refuses(self):
+        assert bot_commands._rollback_drift((), [("c", 101, 0)]) is not None
+
+    def test_boundary_preview_100_not_warned_then_confirm_101_refuses(self):
+        # 预览 span=100（未越线、没警告），确认 span=101 → 拦
+        assert bot_commands._rollback_drift((("c", 100, 0),), [("c", 101, 0)]) is not None
+
+    def test_preview_already_warned_proceeds(self):
+        # 预览 span=200（已警告），确认 span=300 更大 → 放行（知情选择）
+        assert bot_commands._rollback_drift((("c", 200, 0),), [("c", 300, 0)]) is None
+
+    def test_actual_within_threshold_proceeds(self):
+        assert bot_commands._rollback_drift((), [("c", 100, 0)]) is None
+
+    def test_no_actual_rollback_proceeds(self):
+        assert bot_commands._rollback_drift((), []) is None
