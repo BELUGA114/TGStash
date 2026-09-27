@@ -85,12 +85,12 @@ docker compose run --rm stash-listener tdl -n archiver login -T code    # 验证
 | ----------------- | ------------------------------------------------------------- |
 | `/stats`          | 归档文件总数、类型分布、去重命中数、失败计数                  |
 | `/search 关键词`  | 搜索归档内容                                                  |
-| `/failures`       | 列出失败的归档：入口消息 id、阶段、重试次数、最近错误         |
+| `/failures [clear [id...]]` | 列出失败账（入口消息 id、阶段、重试次数、最近错误）；`clear` 清失败账：无 id = 清全部（预览 + 按钮二次确认），给 id 按 `source_message_id` 立即清。只删失败记录，不重试、不动 checkpoint |
 | `/retry [id ...]` | 把 skipped 的条目重排回重试队列并回退 checkpoint；无参 = 全部 |
 | `/backup`         | 进行一次 `archive.db` 备份                                    |
 | `/delete <id...> [rollback]` | 删除某条归档条目（预览 + 按钮二次确认）；默认只删库不重扫，加 `rollback` 才回退 checkpoint 让下轮重抓 |
 
-侵入性命令（`/retry`、`/backup`、`/delete`）会等当前扫描轮跑完才执行，延迟最多一轮扫描间隔
+侵入性命令（`/retry`、`/backup`、`/delete`、`/failures clear`）会等当前扫描轮跑完才执行，延迟最多一轮扫描间隔
 
 ## 配置
 

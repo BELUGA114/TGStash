@@ -7,6 +7,7 @@ import pytest
 from bot_commands import (
     BotContext,
     DeletePreview,
+    PendingClearAll,
     PendingDelete,
     PendingStore,
     format_delete_preview,
@@ -19,7 +20,7 @@ from bot_commands import (
     parse_delete_args,
     user_allowed,
 )
-from db import PurgeSummary, RetrySummary, Stats
+from db import ClearSummary, PurgeSummary, RetrySummary, Stats
 
 ADMIN = 111
 
@@ -81,7 +82,8 @@ class _RecordingLock:
         return False
 
 
-def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None, pending=None):
+def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None,
+         pending=None, pending_clear=None):
     async def default_backup():
         return "/data/db/backups/archive-20260920-030405.db"
 
@@ -91,6 +93,7 @@ def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None, p
         admin_ids=admin_ids,
         run_backup=run_backup or default_backup,
         pending=pending if pending is not None else PendingStore(),
+        pending_clear=pending_clear if pending_clear is not None else PendingStore(),
     )
 
 
@@ -247,6 +250,124 @@ class TestFailuresCommand:
         assert "…还有 30 条" in body
         assert "msg=119" in body          # 第 20 条（MAX_LISTED_ITEMS）还在
         assert "msg=120" not in body      # 第 21 条起不列
+
+
+class TestFailuresClearCommand:
+    def test_clear_specific_ids_locks_and_reports(self):
+        calls = []
+
+        def clear(ids):
+            calls.append(ids)
+            return ClearSummary(2, [100, 105])
+
+        lock = _RecordingLock()
+        msg = _FakeMessage("/failures clear 100 105")
+
+        asyncio.run(handle_message(
+            _ctx(db=SimpleNamespace(clear_failures=clear), lock=lock), msg))
+
+        assert calls == [[100, 105]]
+        assert (lock.entries, lock.exits) == (1, 1)      # 写命令走锁
+        assert "已清除 2 条" in msg.sent[0]
+        assert msg.markups[0] is None                    # 指定 id 立即执行，不挂按钮
+
+    def test_clear_specific_reports_missing_ids(self):
+        db = SimpleNamespace(clear_failures=lambda ids: ClearSummary(1, [100]))
+        msg = _FakeMessage("/failures clear 100 999")
+
+        asyncio.run(handle_message(_ctx(db=db), msg))
+
+        assert "未找到" in msg.sent[0] and "999" in msg.sent[0]
+
+    def test_clear_bad_int_replies_usage_without_touching_db(self):
+        db = SimpleNamespace(clear_failures=lambda ids: pytest.fail("参数非法不该清库"))
+        msg = _FakeMessage("/failures clear abc")
+
+        asyncio.run(handle_message(_ctx(db=db), msg))
+
+        assert "用法" in msg.sent[0]
+
+    def test_clear_all_previews_with_buttons_and_registers_pending(self):
+        pending_clear: PendingStore[PendingClearAll] = PendingStore()
+        rows = [_failure_row(100), _failure_row(105)]
+        db = SimpleNamespace(list_failures=lambda: rows,
+                             clear_failures=lambda ids=None: pytest.fail("预览不该清"))
+        msg = _FakeMessage("/failures clear")
+
+        asyncio.run(handle_message(_ctx(db=db, pending_clear=pending_clear), msg))
+
+        assert msg.markups[0] is not None                # 挂了按钮
+        assert "全部" in msg.sent[0] and "2" in msg.sent[0]
+        assert pending_clear.take(msg.reply_ids[0], ADMIN) == PendingClearAll(2)
+
+    def test_clear_all_empty_replies_plainly_without_buttons(self):
+        pending_clear: PendingStore[PendingClearAll] = PendingStore()
+        db = SimpleNamespace(list_failures=list,
+                             clear_failures=lambda ids=None: pytest.fail("空账不该清"))
+        msg = _FakeMessage("/failures clear")
+
+        asyncio.run(handle_message(_ctx(db=db, pending_clear=pending_clear), msg))
+
+        assert "失败账为空" in msg.sent[0]
+        assert msg.markups[0] is None
+        assert pending_clear.take(msg.reply_ids[0], ADMIN) is None
+
+
+class TestFailuresClearCallback:
+    def _pending_with(self, message_id, payload, requester=ADMIN):
+        store: PendingStore[PendingClearAll] = PendingStore()
+        store.put(message_id, payload, requester)
+        return store
+
+    def test_confirm_clears_all_and_locks(self):
+        calls = []
+
+        def clear(ids=None):
+            calls.append(ids)
+            return ClearSummary(3, [])
+
+        lock = _RecordingLock()
+        pending_clear = self._pending_with(500, PendingClearAll(3))
+        cq = _FakeCallbackQuery("fclr:ok", message_id=500)
+
+        asyncio.run(handle_callback(
+            _ctx(db=SimpleNamespace(clear_failures=clear), lock=lock,
+                 pending_clear=pending_clear), cq))
+
+        assert calls == [None]                           # 清全部
+        assert (lock.entries, lock.exits) == (1, 1)      # 真清走锁
+        assert cq.message is not None
+        assert "已清空" in cq.message.edited[0] and "3" in cq.message.edited[0]
+        assert cq.answers
+        assert pending_clear.take(500, ADMIN) is None    # pop-once 已消费
+
+    def test_cancel_edits_and_skips_clear(self):
+        db = SimpleNamespace(clear_failures=lambda *a, **k: pytest.fail("取消不该清"))
+        pending_clear = self._pending_with(500, PendingClearAll(3))
+        cq = _FakeCallbackQuery("fclr:no", message_id=500)
+
+        asyncio.run(handle_callback(_ctx(db=db, pending_clear=pending_clear), cq))
+
+        assert cq.message is not None
+        assert "已取消" in cq.message.edited[0]
+        assert pending_clear.take(500, ADMIN) is None
+
+    def test_expired_confirm_answers_invalid(self):
+        db = SimpleNamespace(clear_failures=lambda *a, **k: pytest.fail("失效不该清"))
+        cq = _FakeCallbackQuery("fclr:ok", message_id=500)      # pending 为空
+
+        asyncio.run(handle_callback(_ctx(db=db, pending_clear=PendingStore()), cq))
+
+        assert any("失效" in a for a in cq.answers)
+
+    def test_non_admin_callback_is_rejected(self):
+        db = SimpleNamespace(clear_failures=lambda *a, **k: pytest.fail("非白名单不该清"))
+        pending_clear = self._pending_with(500, PendingClearAll(3))
+        cq = _FakeCallbackQuery("fclr:ok", message_id=500, user_id=999)
+
+        asyncio.run(handle_callback(_ctx(db=db, pending_clear=pending_clear), cq))
+
+        assert pending_clear.take(500, ADMIN) == PendingClearAll(3)   # 未消费
 
 
 class TestSearchCommand:

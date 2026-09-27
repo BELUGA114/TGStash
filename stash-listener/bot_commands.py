@@ -65,6 +65,14 @@ class PendingDelete:
     cp_changes: tuple[tuple[str, int, int], ...] = ()   # 预览时算出的 (chat, old_cp, new_cp)，供确认复核
 
 
+@dataclass(frozen=True)
+class PendingClearAll:
+    """一次 /failures clear（清全部）待确认的载荷。清全部无参数可存，只带预览时的行数
+    供确认文案参考；确认时以库里实删条数为准。"""
+
+    count: int                                          # 预览时的失败账行数，仅用于文案
+
+
 class PendingStore[T]:
     """
     confirm-then-act 的通用待确认暂存：以预览消息的 message_id 为 key，存待执行载荷。
@@ -109,6 +117,7 @@ class BotContext:
     admin_ids: frozenset[int]                      # 空白名单 = 谁都不授权
     run_backup: Callable[[], Awaitable[str]]       # 打快照 + 保留 + 可选上传，返回快照路径
     pending: PendingStore[PendingDelete]           # /delete 待确认暂存，构造时注入
+    pending_clear: PendingStore[PendingClearAll]   # /failures clear（清全部）待确认暂存
 
 
 # 命令实现签名：依赖全在 ctx 里，回复走 message.reply_text，不需要 Client 参数
@@ -306,11 +315,57 @@ def format_failures(rows) -> str:
 
 
 async def _cmd_failures(ctx: BotContext, message: Message, args: list[str]) -> None:
+    if args and args[0].lower() == "clear":
+        await _failures_clear(ctx, message, args[1:])
+        return
     rows = ctx.db.list_failures()
     if not rows:
         await message.reply_text("失败账为空")
         return
     await message.reply_text(truncate(format_failures(rows)))
+
+
+async def _failures_clear(ctx: BotContext, message: Message, args: list[str]) -> None:
+    """
+    /failures clear [id ...]。清失败账只删 archive_failures 行 —— 不重试、不动 checkpoint、
+    不碰 messages/files。给了 id 就按 source_message_id 立即清（与 /retry 一样走锁直接执行）；
+    没给 id = 清全部，破坏面大且会连 skipped 行的线索一起抹掉，改走确认按钮防误触。
+    """
+    if not args:
+        count = len(ctx.db.list_failures())
+        if count == 0:
+            await message.reply_text("失败账为空，无需清除")
+            return
+        user = message.from_user
+        if user is None:            # is_allowed 已保证非空；就地收窄给 pyright
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("确认清空", callback_data="fclr:ok"),
+            InlineKeyboardButton("取消", callback_data="fclr:no"),
+        ]])
+        sent = await message.reply_text(
+            f"将清空全部失败账 {count} 条，确认后不可恢复。\n"
+            "清除只是忘掉失败记录：不重试、不动 checkpoint。skipped 行清掉后无法再 /retry。\n"
+            "点「确认清空」执行，「取消」放弃。",
+            reply_markup=keyboard)
+        ctx.pending_clear.put(sent.id, PendingClearAll(count), user.id)
+        return
+    ids: list[int] = []
+    for a in args:
+        try:
+            ids.append(int(a))
+        except ValueError:
+            await message.reply_text(f"用法：/failures clear [消息 id ...]（{a} 不是整数）")
+            return
+    # 写命令与扫描轮共用一把锁：等当前扫描轮跑完再改失败账，扫描也不撞上被改的行
+    async with ctx.lock:
+        summary = ctx.db.clear_failures(ids)
+    lines = [f"已清除 {summary.deleted} 条失败账"]
+    matched = set(summary.matched_ids)
+    missing = [i for i in dict.fromkeys(ids) if i not in matched]
+    if missing:
+        lines.append(f"未找到：{missing}")
+    await message.reply_text(truncate("\n".join(lines)))
 
 
 def format_retry(summary: RetrySummary) -> str:
@@ -462,9 +517,34 @@ async def _cb_delete(ctx: BotContext, cq: CallbackQuery, arg: str) -> None:
     await cq.answer("已删除")
 
 
+async def _cb_clear_failures(ctx: BotContext, cq: CallbackQuery, arg: str) -> None:
+    if arg not in ("ok", "no"):
+        await cq.answer("未知操作")
+        return
+    msg = cq.message
+    user = cq.from_user
+    if msg is None or user is None:          # 老消息/inline 场景 message 可能为空
+        await cq.answer("该确认已失效，请重新 /failures clear", show_alert=True)
+        return
+    payload = ctx.pending_clear.take(msg.id, user.id)
+    if payload is None:                      # 过期 / 已处理 / 非本人
+        await cq.answer("该确认已失效或不属于你，请重新 /failures clear", show_alert=True)
+        return
+    if arg == "no":
+        await msg.edit_text("已取消清空")
+        await cq.answer("已取消")
+        return
+    # 真清走共享锁：等当前扫描轮跑完再改库，条数以库里实删为准（预览→确认间可能又记了新失败）
+    async with ctx.lock:
+        summary = ctx.db.clear_failures(None)
+    await msg.edit_text(f"已清空全部失败账，删除 {summary.deleted} 条")
+    await cq.answer("已清空")
+
+
 # callback 路由表：action → 实现。加按钮功能只在这里加一项（对称 COMMANDS）
 CALLBACKS: dict[str, CallbackHandler] = {
     "del": _cb_delete,
+    "fclr": _cb_clear_failures,
 }
 
 
@@ -473,7 +553,7 @@ CALLBACKS: dict[str, CallbackHandler] = {
 COMMANDS: dict[str, tuple[CommandHandler, str]] = {
     "stats": (_cmd_stats, "归档统计"),
     "search": (_cmd_search, "搜索归档：/search 关键词"),
-    "failures": (_cmd_failures, "列出失败账"),
+    "failures": (_cmd_failures, "列出/清除失败账：/failures [clear [id...]]"),
     "retry": (_cmd_retry, "重试失败的条目：/retry [消息 id ...]"),
     "backup": (_cmd_backup, "立即备份数据库"),
     "delete": (_cmd_delete, "删除条目并可选回退：/delete <id...> [rollback]"),

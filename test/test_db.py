@@ -996,6 +996,50 @@ class TestListFailures:
         assert db.list_failures() == []
 
 
+class TestClearFailures:
+    def _seed(self, db: ArchiveDB, chat="-1001234567890"):
+        db.ensure_channel(chat, "manual_forward")
+        db.increment_failure(chat, 100, "download", "代理断")
+        db.increment_failure(chat, 105, "upload", "flood")
+        db.increment_failure(chat, 110, "verify", "临时")
+        db.mark_failure_skipped(chat, 105, "重试 3 次仍失败: upload")
+
+    def test_clear_all_removes_every_row(self, db: ArchiveDB):
+        self._seed(db)
+
+        summary = db.clear_failures()
+
+        assert summary.deleted == 3
+        assert summary.matched_ids == []
+        assert db.list_failures() == []
+
+    def test_clear_specific_removes_only_those(self, db: ArchiveDB):
+        self._seed(db)
+
+        summary = db.clear_failures([100, 110])
+
+        assert summary.deleted == 2
+        assert sorted(summary.matched_ids) == [100, 110]
+        assert [r["source_message_id"] for r in db.list_failures()] == [105]
+
+    def test_clear_specific_reports_only_matched_ids(self, db: ArchiveDB):
+        self._seed(db)
+
+        summary = db.clear_failures([100, 999])
+
+        assert summary.deleted == 1
+        assert summary.matched_ids == [100]      # 999 不在账里，调用方据此报「未找到」
+
+    def test_clear_empty_list_is_noop_not_clear_all(self, db: ArchiveDB):
+        self._seed(db)
+
+        summary = db.clear_failures([])
+
+        assert summary.deleted == 0
+        assert summary.matched_ids == []
+        assert len(db.list_failures()) == 3      # 空列表绝不能被当成「清全部」
+
+
 class TestPurgeRollbackToggle:
     def test_purge_without_rollback_keeps_checkpoint(self, db: ArchiveDB):
         chat = "-1001234567890"

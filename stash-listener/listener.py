@@ -699,6 +699,7 @@ async def _serve_bot(bot: Client, ctx: ListenerContext, lock: asyncio.Lock) -> N
             admin_ids=BOT_ADMIN_IDS,
             run_backup=lambda: _run_backup(ctx, time.time()),
             pending=PendingStore(),
+            pending_clear=PendingStore(),
         ))
         await register_command_menu(bot)
         logger.info("bot 命令已启用，admin 白名单：%s",

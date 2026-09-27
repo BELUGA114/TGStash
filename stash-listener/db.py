@@ -305,6 +305,13 @@ class RetrySummary(NamedTuple):
     rollback: dict[str, tuple[int, int]]     # 真回退了 checkpoint 的 chat_id → (旧, 新)
 
 
+class ClearSummary(NamedTuple):
+    """clear_failures 的结果，供 bot 打印。"""
+
+    deleted: int                 # 实删行数（同一 source_message_id 跨多个 chat 会 > 命中 id 数）
+    matched_ids: list[int]       # 指定 id 时实际命中的 source_message_id；清全部时为空，调用方据此报「未找到」
+
+
 def _fetch_messages_by_source(con, source_message_ids: list[int]) -> list[sqlite3.Row]:
     placeholders = ",".join("?" * len(source_message_ids))
     return con.execute(
@@ -749,6 +756,31 @@ class ArchiveDB:
     def delete_failure(self, source_chat_id, source_message_id: int):
         with self._connect() as con:
             con.execute(_FAILURE_DELETE, (str(source_chat_id), source_message_id))
+
+    def clear_failures(self, source_message_ids: list[int] | None = None) -> ClearSummary:
+        """
+        清失败账。None = 清全部；给了 id 列表则按 source_message_id 清（跨 chat 匹配，
+        与 /retry、/delete 的 id 语义一致）。**空列表是空操作，绝不当成「清全部」** ——
+        否则 /failures clear 后面跟一串被过滤光的参数会误删整张表。
+
+        只删 archive_failures 行：不重试、不动 checkpoint、不碰 messages/files。清 skipped
+        行 = 永久丢掉那条唯一的失败线索。单连接即单事务，与其余写方法一致。
+        """
+        with self._connect() as con:
+            if source_message_ids is None:
+                cur = con.execute("DELETE FROM archive_failures")
+                return ClearSummary(cur.rowcount, [])
+            if not source_message_ids:
+                return ClearSummary(0, [])
+            placeholders = ",".join("?" * len(source_message_ids))
+            matched = [r[0] for r in con.execute(
+                f"SELECT DISTINCT source_message_id FROM archive_failures "
+                f"WHERE source_message_id IN ({placeholders})",
+                source_message_ids).fetchall()]
+            cur = con.execute(
+                f"DELETE FROM archive_failures WHERE source_message_id IN ({placeholders})",
+                source_message_ids)
+            return ClearSummary(cur.rowcount, matched)
 
     def pending_failures(self) -> set[tuple[str, int]]:
         """
