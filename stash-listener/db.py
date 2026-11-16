@@ -1,20 +1,10 @@
 """
-共享数据层：SQLite + FTS5
+SQLite + FTS5 数据层，供 stash-listener 主服务与离线运维脚本共用。
 
-四张表：
-  channels          — 每个来源（接收频道 / 各个 tdl 批量频道）各自的 checkpoint
-  files             — 去重表，file_unique_id 或 sha256 命中即视为重复
-  messages          — 原始消息元数据（入口/来源/发送者/时间/caption），供全文搜索
-  archive_failures  — 归档失败账，控制重试与跳过
-
-schema 变更走 PRAGMA user_version + MIGRATIONS 有序迁移，
-SCHEMA 常量始终保持目标形态。
-
-这份文件只有 stash-listener 一个主服务在用，`archive.db` 由它独占。
-（历史上还有一个 tdl-sync 服务各拿一份拷贝共享同一个卷，那个服务在
-2026-08-18 并入 tdl_downloader.py 时已经删除 —— 别再按「两份拷贝要同步」
-或「schema 要兼容第二个服务」来约束这里的改动。`scripts/` 下的运维脚本
-靠 PYTHONPATH import 本模块，不是拷贝。）
+messages.source_* 与 archive_failures.source_* 存入口，origin_* 存真实来源；
+files.source 存归档路径，channels 按频道保存 checkpoint，不能混用这些语义。
+SCHEMA 保持目标形态，旧库通过 user_version + MIGRATIONS 有序迁移。
+关键约束见 docs/db-invariants.md。
 """
 
 import logging
@@ -28,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# 建表部分。FTS 单独拆出去，因为迁移时要 DROP 重建，定义只能有一份
+# FTS 需在迁移时重建，因此与表定义分开。
 TABLES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
     chat_id TEXT PRIMARY KEY,
@@ -100,14 +90,9 @@ CREATE INDEX IF NOT EXISTS idx_archive_failures_status
     ON archive_failures(status);
 """
 
-# tokenize='trigram'：SQLite 默认的 unicode61 分词器几乎无法处理中文（没有空格分隔，
-# 整段中文常被当成一个 token，导致搜不到子串）。trigram 按每 3 个字符切一次，
-# 对中文更实用，但代价是搜索词必须 >= 3 个字符，2 字词搜不到。
-# 索引 origin_title 而不是 source_channel_title：后者是接收频道标题，
-# 所有行同一个值，在索引里纯属噪音。
-#
-# 拆成单条语句的列表而不是一整段脚本：迁移要在显式事务里重建 FTS，
-# 而 executescript 会先隐式 COMMIT，把事务拆散。con.execute 逐条执行才能留在事务内。
+# trigram 支持中文子串搜索，代价是搜索词至少 3 个字符。
+# 索引真实来源标题，避免入口频道的固定标题污染搜索。
+# 逐条 execute 保住迁移事务；executescript 会隐式提交。
 FTS_CREATE_STATEMENTS = [
     """CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     caption, origin_title, sender, file_name,
@@ -130,8 +115,7 @@ END""",
 END""",
 ]
 
-# 迁移时先把旧定义整套拆掉，再按 FTS_CREATE_STATEMENTS 重建。
-# 触发器体里写死了列名，必须跟着 DROP，否则触发器会往不存在的列写
+# 触发器写死索引列名，FTS 换列时必须一并重建。
 FTS_DROP_STATEMENTS = [
     "DROP TRIGGER IF EXISTS messages_ai",
     "DROP TRIGGER IF EXISTS messages_ad",
@@ -139,12 +123,12 @@ FTS_DROP_STATEMENTS = [
     "DROP TABLE IF EXISTS messages_fts",
 ]
 
-# 供 __init__ 的 executescript 使用；定义的唯一来源仍是上面那个列表
+# 初始化与迁移共用同一份 FTS 定义。
 FTS_SCHEMA = ";\n".join(FTS_CREATE_STATEMENTS) + ";\n"
 
 SCHEMA = TABLES_SCHEMA + FTS_SCHEMA
 
-# 迁移要补的列。SCHEMA 里已经写全，这份表只服务于「已有数据的旧库」
+# 旧库需补列；新库的目标形态已在 SCHEMA 中定义。
 MIGRATION_COLUMNS = {
     "files": [("file_name", "TEXT"), ("mime_type", "TEXT"), ("media_kind", "TEXT")],
     "messages": [
@@ -155,9 +139,7 @@ MIGRATION_COLUMNS = {
 }
 
 
-# journal_mode 是数据库的持久属性，建库时设一次就够。每次连接都无条件重设会踩坑：
-# 切换 journal_mode 需要独占锁，而且不吃 busy_timeout——另一个连接正持有写事务时
-# 会直接抛 database is locked。所以先读后判断，已经是 WAL 就不去动它
+# journal_mode 切换不受 busy_timeout 保护，因此另设有限重试。
 WAL_SWITCH_ATTEMPTS = 5
 WAL_SWITCH_DELAY_SECONDS = 0.2
 
@@ -171,7 +153,7 @@ def _ensure_wal(con) -> None:
             con.execute("PRAGMA journal_mode=WAL")
             return
         except sqlite3.OperationalError:
-            # 建库瞬间两个进程可能同时切换。只要对端切成功了，这边读到 WAL 就收工
+            # 并发建库时，另一个连接可能已切换成功。
             if str(con.execute("PRAGMA journal_mode").fetchone()[0]).upper() == "WAL":
                 return
             if attempt == WAL_SWITCH_ATTEMPTS - 1:
@@ -185,18 +167,8 @@ def _now() -> str:
 
 def build_match_query(raw: str) -> str | None:
     """
-    把用户输入转成安全的 FTS5 MATCH 表达式。
-
-    直接把原始输入喂给 MATCH 会炸：文件名里的 `.` 触发语法错误，
-    `-` 会让后半段被当成列名（no such column）。逐词包成字符串字面量，
-    内部双引号翻倍转义。词与词之间留空格——FTS5 里这仍是 AND，
-    不会退化成 OR，也不会变成要求相邻的短语。
-
-    全空白输入返回 None，调用方直接返回空结果（MATCH '' 会报错）。
-
-    代价：FTS5 的前缀通配 `*` 会被当成字面字符，`report_2026*` 搜不到东西。
-    trigram 本身就是子串匹配（搜 `report_2026` 即可命中），所以不算损失，
-    但用户习惯性加星号时得不到提示，这里记一笔。
+    逐词引用并转义双引号，避免文件名标点被 MATCH 当成语法，保留词间 AND。
+    空白返回 None，避免 MATCH '' 报错；* 按字面处理，trigram 已支持子串搜索。
     """
     terms = [t for t in raw.split() if t]
     if not terms:
@@ -205,7 +177,7 @@ def build_match_query(raw: str) -> str | None:
 
 
 def _add_missing_columns(con) -> None:
-    """按 PRAGMA table_info 检测缺列再 ALTER。新库上是 no-op，因此天然幂等。"""
+    """先检查缺列再 ALTER，使新旧库都可安全执行。"""
     for table, columns in MIGRATION_COLUMNS.items():
         existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
         for name, decl in columns:
@@ -219,19 +191,16 @@ def _migrate_v1(con) -> None:
     _add_missing_columns(con)
     for statement in FTS_DROP_STATEMENTS + FTS_CREATE_STATEMENTS:
         con.execute(statement)
-    # external content FTS：DROP 不动 messages 表，rebuild 从 content table 重填
+    # 外部内容仍在 messages 中，重建索引后需回填已有行。
     con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
     logger.info("迁移：messages_fts 索引列已切换并重建")
 
 
-# (版本号, 迁移函数)，按版本号升序。加列本身幂等，
-# user_version 存在的唯一理由是让 FTS 重建这类非幂等步骤只跑一次
+# 按版本升序迁移，避免每次启动都重建 FTS。
 MIGRATIONS = [(1, _migrate_v1)]
 
 
-# files / messages 的插入语句与参数装配。三个写入口（record_file / record_message /
-# record_archived）共用同一份 —— 否则「原子写」就成了 SQL 的第二份拷贝，
-# 加一列要改两处、漏一处只在某一条路径上错
+# 独立写入与原子归档共用 SQL 和参数装配，避免增列时漏改某条路径。
 _FILES_INSERT = """INSERT OR IGNORE INTO files
        (file_unique_id, sha256, size, archived_chat_id, archived_message_id,
         source, source_channel, first_seen_at, file_name, mime_type, media_kind)
@@ -270,9 +239,7 @@ def _messages_params(*, source_chat_id, source_message_id, source_channel_title,
     )
 
 
-# delete_message.py 的删除路径。列清单与两条 DELETE/UPDATE 单独成常量：
-# find_messages_by_source_ids / purge_messages 共用，set_checkpoint / delete_failure
-# 与 purge 共用 —— 同一条 SQL 两处内联，改 schema 时就会漏一边
+# 预览与删除共用列清单；事务内操作复用 SQL，不能调用另开连接的公开写方法。
 _MESSAGES_BY_SOURCE_COLUMNS = ("id, source_message_id, file_unique_id, "
                                "source_chat_id, caption, sender, sent_at")
 _FAILURE_DELETE = "DELETE FROM archive_failures WHERE source_chat_id=? AND source_message_id=?"
@@ -280,8 +247,6 @@ _CHECKPOINT_UPDATE = "UPDATE channels SET last_message_id=?, last_run_at=? WHERE
 
 
 class PurgeSummary(NamedTuple):
-    """purge_messages 的结果，供调用方打印。"""
-
     deleted_messages: int
     deleted_files: list[str]                    # file_unique_id（无其他消息引用才删）
     cleared_failures: list[tuple[str, int]]     # (入口 chat_id, 入口 message_id)
@@ -289,8 +254,6 @@ class PurgeSummary(NamedTuple):
 
 
 class Stats(NamedTuple):
-    """归档统计。供 bot `/stats` 回复。"""
-
     total_files: int              # files 行数 = 登记过的唯一文件数（含去重命中）
     message_count: int            # messages 行数 = 归档的消息条目数
     dedup_hits: int               # 命中 SHA-256 去重、只登记文件没上传的条数
@@ -299,17 +262,13 @@ class Stats(NamedTuple):
 
 
 class RetrySummary(NamedTuple):
-    """retry_skipped 的结果，供脚本与 bot 打印。"""
-
     reset_entries: list[tuple[str, int]]     # 被重置的 (入口 chat_id, 入口 message_id)
-    rollback: dict[str, tuple[int, int]]     # 真回退了 checkpoint 的 chat_id → (旧, 新)
+    rollback: dict[str, tuple[int, int]]     # 实际回退的 chat_id → (旧 checkpoint, 新 checkpoint)
 
 
 class ClearSummary(NamedTuple):
-    """clear_failures 的结果，供 bot 打印。"""
-
-    deleted: int                 # 实删行数（同一 source_message_id 跨多个 chat 会 > 命中 id 数）
-    matched_ids: list[int]       # 指定 id 时实际命中的 source_message_id；清全部时为空，调用方据此报「未找到」
+    deleted: int                 # 实删行数；跨 chat 的同一入口 id 可对应多行
+    matched_ids: list[int]       # 指定 id 时实际命中的入口 id；清全部时为空
 
 
 def _fetch_messages_by_source(con, source_message_ids: list[int]) -> list[sqlite3.Row]:
@@ -331,9 +290,7 @@ class ArchiveDB:
     def _migrate(self, con) -> None:
         if con.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
             return
-        # 先拿写锁再读版本号。WAL 下「先读后写」的连接无法升级成写事务，
-        # 两个服务同时启动会有一个直接吃到 SQLITE_BUSY——busy_timeout 对
-        # 锁升级无效。BEGIN IMMEDIATE 一开始就取写锁，慢的那个改为等待。
+        # 先拿写锁再读版本，避免并发迁移时读事务升级失败。
         con.execute("BEGIN IMMEDIATE")
         try:
             current = con.execute("PRAGMA user_version").fetchone()[0]
@@ -351,9 +308,9 @@ class ArchiveDB:
     @contextmanager
     def _connect(self):
         con = sqlite3.connect(self._path, timeout=30)
-        # 遇到锁时等待 30 秒而非立即报 SQLITE_BUSY，容忍两个服务同时写入的瞬间冲突
+        # 容忍主服务与运维脚本的短暂写锁竞争。
         con.execute("PRAGMA busy_timeout=30000")
-        # WAL 模式：读不阻塞写，写不阻塞读——两个服务共享同一个 db 文件的基础
+        # WAL 允许查询与写入并行。
         _ensure_wal(con)
         try:
             yield con
@@ -486,20 +443,9 @@ class ArchiveDB:
         origin_type=None,
     ):
         """
-        files + messages 在同一个事务里写完。归档成功后的唯一写入口。
-
-        分两次调用（两个连接、两个事务）时，第二次失败会留下「files 有行、messages
-        没行」的库：去重说这个文件见过，搜索里它从不存在，而回填脚本按
-        `origin_type IS NULL` 从 messages 选行，救不了没有 messages 行的文件。
-
-        触发路径不是进程被杀（两次调用之间没有 await，窗口只有微秒），而是第二次
-        写本身抛异常 —— 例如另一个写者（回填脚本）占着写锁超过 busy_timeout=30000，
-        `sqlite3.OperationalError` 冒到管道的兜底 except 记一次失败等下轮重试，而下轮
-        `find_by_unique_id` 已经命中那条已提交的 files 行，于是被当成去重跳过、
-        打上 ✅、推进 checkpoint —— 那条 messages 永远不会被写。
-
-        代价：写失败时整笔回滚，下轮重新下载重传，备份频道会多一份副本。这个交换是
-        刻意的 —— 多出来的副本看得见、删得掉，「有文件没记录」既静默又不可修复。
+        归档成功只走此入口，files 与 messages 同一事务提交。
+        分开写会让 files 去重命中阻止补写失败的 messages，搜索与回填都无法恢复。
+        写失败时整笔回滚；接受重传副本，以保住完整记录。
         """
         with self._connect() as con:
             con.execute(_FILES_INSERT, _files_params(
@@ -519,12 +465,7 @@ class ArchiveDB:
             ))
 
     def rows_missing_origin(self, limit: int | None = None):
-        """
-        待回填的行：origin_type IS NULL 才算「还没回填过」。
-
-        'original'（原创直发）和 'unknown'（查不到原消息）都已经是终态，
-        必须排除，否则每轮回填都会把它们重新拉一遍。
-        """
+        """仅 NULL 表示未回填；original/unknown 是终态，避免反复拉取。"""
         sql = ("SELECT id, source_chat_id, source_message_id, file_unique_id "
                "FROM messages WHERE origin_type IS NULL ORDER BY id")
         params: tuple = ()
@@ -546,7 +487,6 @@ class ArchiveDB:
         file_name=None,
         media_kind=None,
     ):
-        """回填单行 messages 的来源与文件身份。"""
         with self._connect() as con:
             con.execute(
                 """UPDATE messages SET
@@ -572,7 +512,7 @@ class ArchiveDB:
         mime_type=None,
         media_kind=None,
     ):
-        """回填 files 的文件身份。COALESCE 保住已有非空值，回填不覆盖好数据。"""
+        """COALESCE 保留已有非空值，避免回填覆盖有效文件身份。"""
         with self._connect() as con:
             con.execute(
                 """UPDATE files SET
@@ -593,14 +533,8 @@ class ArchiveDB:
 
     def stats(self) -> Stats:
         """
-        聚合统计。四个数各自一条 SQL，别为了「一次查询」把它们拼成子查询迷宫。
-
-        dedup_hits = files 行数 − messages 行数：归档成功写 1 条 files + 1 条 messages，
-        而 SHA-256 命中的重复只写 files（pipeline._record_dedup_file，没有新消息可记），
-        差值就是「去重命中、没上传」的条数。file_unique_id 快速通道的命中不写任何行，
-        库里数不出来，不在这个口径里。
-        老库可能有 record_archived 之前的写入路径残留（messages 多于 files），
-        差值钳到 0，别回一个负数出去。
+        dedup_hits 按 files - messages 计：SHA-256 命中只写 files，快速去重不入库。
+        旧库两表可能失衡，差值钳到 0。
         """
         with self._connect() as con:
             total_files = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
@@ -618,12 +552,7 @@ class ArchiveDB:
         )
 
     def list_failures(self, status: str | None = None):
-        """
-        列失败账行（可按 status 过滤），按入口 message id 排序 —— 运维看的是
-        「哪几条还没救回来」，与 checkpoint 的 id 空间一致才好对照。
-
-        只读，不加锁：WAL 下读不阻塞写，bot 的 /failures 与扫描轮可以并行。
-        """
+        """按入口 id 排序以便对照 checkpoint；WAL 下只读查询无需扫描锁。"""
         sql = ("SELECT source_chat_id, source_message_id, failure_stage, last_error, "
                "attempt_count, status, last_failed_at FROM archive_failures")
         with self._connect() as con:
@@ -656,7 +585,7 @@ class ArchiveDB:
             ).fetchone()
 
     def increment_failure(self, source_chat_id, source_message_id: int, failure_stage: str, last_error: str):
-        """累计一次失败；不存在则插入。返回该消息当前的累计次数。"""
+        """按入口累计失败，返回供跳过阈值判断的次数。"""
         with self._connect() as con:
             con.execute(
                 """INSERT INTO archive_failures
@@ -688,18 +617,10 @@ class ArchiveDB:
 
     def retry_skipped(self, source_message_ids: list[int] | None = None) -> RetrySummary:
         """
-        把 status='skipped' 的行重排回重试队列，并把 checkpoint 回退到各入口 chat 的
-        min(source_message_id) - 1 —— 一个事务写完。
-
-        必须是一个事务：先重置后回退，中间崩掉 = 行变回 retrying 而 checkpoint 没退，
-        那几条媒体永远不再被重扫，失败账里躺着一堆再也不会被碰的行。
-        回退规则与 purge_messages 一致：只退不进（new >= old 不动）、按入口 chat 分组。
-
-        source_message_ids=None 处理全部 skipped；否则只处理与 skipped 行的交集
-        （传了 retrying 或不存在的 id 一律忽略）。清零 attempt_count 是必须的 ——
-        残留的计数会让重来的那次一失败就再次跳过，「重排回队列」只兑现一半。
-
-        写库走调用方那把 asyncio.Lock（bot `/retry` 与脚本各自持有），本方法只管事务。
+        重置 skipped 与回退 checkpoint 必须原子提交，否则重置行可能永远不再扫描。
+        每个入口 chat 退至最小入口 id - 1，只退不进；清零次数避免重试后立即跳过。
+        None 处理全部 skipped，列表只取 skipped 交集，空列表不操作。
+        bot 写操作由调用方与扫描共用 asyncio.Lock；离线脚本不受该锁保护。
         """
         with self._connect() as con:
             con.row_factory = sqlite3.Row
@@ -743,7 +664,7 @@ class ArchiveDB:
                 cp_row = con.execute(
                     "SELECT last_message_id FROM channels WHERE chat_id=?", (chat_id,)
                 ).fetchone()
-                # 频道行不存在 = 从没跑过 ensure_channel，无 checkpoint 可回退
+                # 未登记的频道没有 checkpoint 可回退。
                 if cp_row is None:
                     continue
                 old_cp = cp_row[0]
@@ -759,12 +680,8 @@ class ArchiveDB:
 
     def clear_failures(self, source_message_ids: list[int] | None = None) -> ClearSummary:
         """
-        清失败账。None = 清全部；给了 id 列表则按 source_message_id 清（跨 chat 匹配，
-        与 /retry、/delete 的 id 语义一致）。**空列表是空操作，绝不当成「清全部」** ——
-        否则 /failures clear 后面跟一串被过滤光的参数会误删整张表。
-
-        只删 archive_failures 行：不重试、不动 checkpoint、不碰 messages/files。清 skipped
-        行 = 永久丢掉那条唯一的失败线索。单连接即单事务，与其余写方法一致。
+        None 清全部，入口 id 跨 chat 匹配；空列表必须不操作，避免过滤空参数后误清全表。
+        仅清失败账，不触发重扫；清 skipped 会失去该入口的失败线索。
         """
         with self._connect() as con:
             if source_message_ids is None:
@@ -783,12 +700,7 @@ class ArchiveDB:
             return ClearSummary(cur.rowcount, matched)
 
     def pending_failures(self) -> set[tuple[str, int]]:
-        """
-        仍在重试中的失败消息，返回 {(入口 chat_id, 入口 message_id)}。
-
-        返回复合键本身而不是 'chat:msg' 字符串：调用方不必再 split 一次，
-        也就不存在「chat_id 里出现分隔符」这种解析问题。
-        """
+        """以 (入口 chat_id, 入口 message_id) 阻塞对应 checkpoint，不能用真实来源 id。"""
         with self._connect() as con:
             rows = con.execute(
                 "SELECT source_chat_id, source_message_id FROM archive_failures WHERE status='retrying'"
@@ -796,7 +708,7 @@ class ArchiveDB:
             return {(str(r[0]), r[1]) for r in rows}
 
     def find_messages_by_source_ids(self, source_message_ids: list[int]) -> list[sqlite3.Row]:
-        """按入口 id 查 messages 行。delete_message.py 的预览与跨度守卫用。"""
+        """按入口 id 查找，供删除预览与 checkpoint 回退跨度检查。"""
         if not source_message_ids:
             return []
         with self._connect() as con:
@@ -805,18 +717,9 @@ class ArchiveDB:
 
     def purge_messages(self, source_message_ids: list[int], *, rollback: bool = True) -> PurgeSummary:
         """
-        一个事务内删掉这些入口的全部痕迹：messages、无其他消息引用的 files、
-        失败账，并（当 rollback=True 时）把 checkpoint 回退到各 chat 的
-        min(source_message_id) - 1。rollback=False 时跳过 checkpoint 回退，其余照删
-        —— 用于「只删库不重扫」的纯删除。
-
-        必须是一个事务，两种拆法都有静默坏窗口：先删行后回退，中间崩掉 =
-        行没了而 checkpoint 没退，那些消息永远不被重扫；先回退后删，中间崩掉 =
-        下轮扫描撞上还活着的 files 行，file_unique_id 命中被当去重跳过，
-        messages 永远补不回来（去重路径不写 messages）。
-
-        checkpoint 只退不进（new >= old 不动），回退规则与 delete_message.py
-        的历史行为一致。FTS 索引由触发器在同一事务里自动清理。
+        messages、孤儿 files、失败账与 checkpoint 回退必须同一事务提交。
+        拆开会漏重扫，或被残留 files 去重挡住；FTS 由触发器在同一事务清理。
+        按入口 chat 退至最小入口 id - 1，只退不进；rollback=False 用于删除而不重扫。
         """
         if not source_message_ids:
             return PurgeSummary(0, [], [], {})
@@ -831,7 +734,7 @@ class ArchiveDB:
                 f"DELETE FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
             deleted_messages = cur.rowcount
 
-            # 无其他消息引用的 file_unique_id 连同 files 行删掉
+            # 保留仍被其他 messages 引用的 files，避免破坏去重。
             deleted_files = []
             for fuid in {row["file_unique_id"] for row in rows if row["file_unique_id"]}:
                 refs = con.execute(
@@ -863,7 +766,7 @@ class ArchiveDB:
                     cp_row = con.execute(
                         "SELECT last_message_id FROM channels WHERE chat_id=?", (chat_id,)
                     ).fetchone()
-                    # 频道行不存在 = 从没跑过 ensure_channel，无 checkpoint 可回退
+                    # 未登记的频道没有 checkpoint 可回退。
                     if cp_row is None:
                         continue
                     old_cp = cp_row[0]
@@ -875,14 +778,8 @@ class ArchiveDB:
 
     def backup_to(self, dest_path: str) -> None:
         """
-        用 VACUUM INTO 打一份一致的单文件快照到 dest_path。
-
-        WAL 模式下 VACUUM INTO 安全：产出的是包含全部已提交数据的独立 db 文件，
-        可直接拿去查。VACUUM 不能在事务里跑；本方法只发这一条语句，_connect
-        不会为它开隐式事务（sqlite3 只在 DML 前隐式开事务），所以直接执行即可。
-
-        纯 DB 操作：不读环境变量、不碰 Telegram。调用方（listener）负责计时、
-        保留份数与可选上传，也负责把这个同步阻塞调用放进 asyncio.to_thread。
+        VACUUM INTO 生成含全部已提交数据的独立快照，不可包在事务内。
+        本方法仅发此语句，不触发 DML 的隐式事务；异步调用方须用 to_thread 避免阻塞。
         """
         with self._connect() as con:
             con.execute("VACUUM INTO ?", (dest_path,))

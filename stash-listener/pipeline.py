@@ -1,17 +1,8 @@
 """
-归档管道：一批条目进来，下载→校验→去重→转换→上传→写库，产出 Outcome。
+归档管道产出 Outcome；checkpoint、失败账与告警由 listener 按入口结算。
 
-依赖全部构造时注入（client / db / downloader / 标记回调 / 配置），模块导入期
-没有任何副作用。管道不知道 checkpoint、失败记账、告警的存在 —— 那些是
-「扫描一轮接收频道」的职责，留在 listener.py，由它按 Outcome 结算。
-
-依赖注入的由来见 docs/superpowers/specs/2026-08-31-pipeline-extraction-design.md：
-模块级全局让主路径几乎测不动（测一条要 monkeypatch app/db/tdl_downloader 三个全局，
-外加四个环境变量）。tdl_downloader.py 的 runner 参数是同一路子的先例。
-
-media_ops 一律用模块限定调用（media_ops.probe_video(...)），不用 from-import：
-测试要能 monkeypatch media_ops 上的函数而不必知道是谁在调用它。
-（`MediaKind` 是类型别名，不是可替换的函数，所以按名字 import 不违反这条。）
+依赖在构造时注入，避免导入时初始化服务。media_ops 函数通过模块调用，
+使测试替换函数时不依赖调用方。关键约束见 docs/pipeline-invariants.md。
 """
 
 from __future__ import annotations
@@ -43,46 +34,25 @@ logger = logging.getLogger(__name__)
 
 
 class MediaFile(Protocol):
-    """
-    Pyrogram 的 Document / Video / Photo / ... 没有公共基类，但它们都有 file_unique_id。
-
-    只标这一个必需属性：其余（file_name / mime_type / file_size / duration ...）各类型
-    有无不一，一律 getattr 带默认值取。标成 object 会让 file_unique_id 也取不到，
-    标成 Any 等于什么都不检查。
-    """
+    """Pyrogram 媒体没有公共基类；只要求共有的 file_unique_id，其余属性可缺省。"""
 
     file_unique_id: str
 
 
 @dataclass(frozen=True)
 class MediaKindSpec:
-    """
-    一种媒体类型的上传形状。
+    """发送能力集中在一处，避免新增媒体类型时漏改分派规则。"""
 
-    这四件事以前分散在 SEND_METHOD / INPUT_MEDIA_CLASS / CAPTIONLESS_KINDS 三张表
-    加若干处 `kind == "video"` 里，加一种类型要同时想起四个地方，漏一个不会有任何
-    静态错误 —— video_note 的 caption 缺陷就是这么来的。现在一种类型一行。
-    """
-
-    # Client 上的发送方法名，单条上传用
     send_method: str
-    # send_media_group 用的 InputMedia 类；None 表示不能编组，只能单发
+    # None 表示 Telegram 不支持编组，只能单发。
     input_media: type | None = None
-    # send_* 是否接受 caption。send_video_note 是唯一不接受的 —— Telegram 的圆形视频
-    # 在协议层就没有 caption 字段（对比 voice：messageVoiceNote 有 caption，
-    # send_voice 也接受），不是 Pyrogram 的疏漏。源消息因此也不可能带文字：
-    # video_note 走到 _send_media 时 caption 恒为空串。这个开关照样必需 ——
-    # 不被接受的关键字传空串也是 TypeError
+    # send_video_note 不接受 caption，传空串也会抛 TypeError。
     accepts_caption: bool = True
-    # 是否走 _prepare_video（压缩 / ffprobe / 缩略图）并按视频形状上传
-    # （duration / width / height / thumb）。video_note 今天是 False，于是它拿不到
-    # duration 与 length —— 见 CLAUDE.md 里记的已知限制。要修就从这一行开始，
-    # 但 send_video_note 不接受 width/height，届时这个标志要拆成两个
+    # video_note 不接受 width/height，不能直接套用这组视频参数。
     video_meta: bool = False
 
 
-# 取值表以 media_ops.MediaKind 为准，test_pipeline.py 的
-# test_media_kind_vocabulary_matches 盯着两边一致
+# 媒体类型以 media_ops.MediaKind 为准，所有发送能力只在此处分派。
 MEDIA_KINDS: dict[MediaKind, MediaKindSpec] = {
     "document": MediaKindSpec("send_document", InputMediaDocument),
     "video": MediaKindSpec("send_video", InputMediaVideo, video_meta=True),
@@ -93,20 +63,15 @@ MEDIA_KINDS: dict[MediaKind, MediaKindSpec] = {
     "video_note": MediaKindSpec("send_video_note", accepts_caption=False),
 }
 
-# 标记回调：(媒体消息, 是否去重命中) -> None。listener 注入，pipeline 不管它怎么发
+# listener 注入标记回调，管道不决定回复方式。
 MarkProcessed = Callable[[Message, bool], Awaitable[None]]
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
     """
-    今天散在 listener 模块级的那些常量。测试里想关掉冷却就传 0。
-
-    构造时必填的四个值（冷却、压缩阈值、CRF、编码线程数）没有默认值：生产由 listener
-    从环境变量读出后显式传入，那里才是唯一的真相。测试的默认值由 conftest 的
-    make_pipeline 提供。
-    （别把这几个叫「风控三件套」—— CLAUDE.md 里那个词专指 BATCH_SIZE /
-    UPLOAD_COOLDOWN_SECONDS / SCAN_INTERVAL_SECONDS，后三个压缩参数只是调参。）
+    冷却、压缩阈值、CRF 与线程数必须显式注入，避免生产默认值多处定义。
+    环境变量及默认值由 runtime_config.py 管理；测试由 make_pipeline 提供。
     """
 
     upload_cooldown_seconds: int
@@ -119,30 +84,23 @@ class PipelineConfig:
 
 @dataclass
 class _DownloadTask:
-    """阶段一产出、阶段二三消费。取代原先 5 元素的 tuple。"""
-
     item: ArchiveItem
     kind: MediaKind
-    msg_dir: str      # 回退下载的落点；tdl 命中 batch_dir 时阶段三会 rmdir 掉
+    msg_dir: str      # Pyrogram 回退落点；tdl 成功后可删除空目录
     dl_name: str
     media: MediaFile
 
 
 @dataclass
 class _PendingUpload:
-    """阶段三产出、阶段四消费的待上传条目。取代原先 9 元素的 tuple。"""
-
     item: ArchiveItem
     kind: MediaKind
-    # 媒体对象顺着条目一起传下来。写库时别再 get_media(item.media) 推一遍：
-    # 重新推导除了多一次遍历，还要在结果上 assert 非空，等于把「已经知道的事」
-    # 又变成一次运行期断言
+    # 保留已识别的媒体，写库时无需重新推导并断言。
     media: MediaFile
     sha256: str
     size: int
     local_path: str
-    # 缩略图真的可能没有（make_thumbnail 失败返回 None），这个 None 是诚实的；
-    # meta 则恒为 dict：非视频是空 dict，视频由 _prepare_video 填满
+    # 缩略图失败不阻止归档；非视频的 meta 为空 dict。
     thumb_path: str | None = None
     meta: dict = field(default_factory=dict)
 
@@ -153,12 +111,10 @@ class _Planned(NamedTuple):
 
 
 class _ItemResult(NamedTuple):
-    """一条条目走完「校验→SHA-256→格式修正→去重→视频处理」之后的结论。"""
-
-    pending: _PendingUpload | None   # 可以上传了
-    outcome: Outcome | None          # 已有确定结论（校验失败 / 去重命中），不必上传
-    groupable: bool = False          # 该类型能进 send_media_group，决定上传形状
-    duplicate: bool = False          # SHA-256 命中 —— 调用方要按「重复」打标记
+    pending: _PendingUpload | None
+    outcome: Outcome | None          # 校验失败或去重命中，无需上传
+    groupable: bool = False
+    duplicate: bool = False          # 调用方须按重复打标记
 
 
 class _Processed(NamedTuple):
@@ -170,7 +126,7 @@ class _Processed(NamedTuple):
 
 class _Uploaded(NamedTuple):
     outcomes: list[Outcome]
-    aborted: bool   # 上传失败：后续条目本轮不再尝试，等价于原先那个 early return
+    aborted: bool   # 上传失败，后续条目留待下轮
 
 
 def sender_name(message: Message) -> str:
@@ -182,7 +138,7 @@ def sender_name(message: Message) -> str:
 
 
 def _file_identity(kind: MediaKind, media: MediaFile) -> dict:
-    """files 表的文件身份三件套。Photo 类型没有 file_name / mime_type，取不到就是 None。"""
+    """Photo 缺少 file_name/mime_type，保留为 None。"""
     return {
         "file_name": getattr(media, "file_name", None),
         "mime_type": getattr(media, "mime_type", None),
@@ -192,21 +148,14 @@ def _file_identity(kind: MediaKind, media: MediaFile) -> dict:
 
 def _safe_dl_name(raw: str | None) -> str | None:
     """
-    把 Telegram 自带的 file_name 收成一个纯文件名；收不出来返回 None，调用方自己兜。
-
-    file_name 由上传者控制，可以是 `../../../db/archive.db` 或绝对路径。它会被拼成
-    Pyrogram 回退下载的落点（`download_media` 只做 `os.path.split` + `makedirs`，
-    不校验穿越段），于是一个恶意命名的文档足以让 `open(..., "wb")` 落到 msg_dir 之外，
-    把 archive.db 整个截断。只取最后一段并挡掉纯点名字，落点就恒在 msg_dir 内。
-    tdl 主路径不受影响（DOWNLOAD_TEMPLATE 走 filenamify），这里补的是回退那一路。
-
-    分隔符两种都切：来源平台未知，POSIX 上 `os.path.basename` 不认 `\\`。
-    盘符交给 `splitdrive`（POSIX 上是空操作，Windows 上挡掉 `C:x` 这种盘符相对路径）。
+    上传者可控的 file_name 必须限制在 msg_dir 内，防止 Pyrogram 回退下载覆盖库文件。
+    来源平台未知，需同时处理两种分隔符；splitdrive 防止 Windows 盘符相对路径。
+    无有效文件名时返回 None，由调用方兜底；tdl 主路径另有文件名清洗。
     """
     if not raw:
         return None
     name = os.path.splitdrive(raw.replace("\\", "/"))[1].rsplit("/", 1)[-1]
-    # NUL 会让 open 直接抛 ValueError，顺手去掉
+    # NUL 会让 open 抛 ValueError。
     name = name.replace("\x00", "").strip()
     if name in ("", ".", ".."):
         return None
@@ -215,10 +164,8 @@ def _safe_dl_name(raw: str | None) -> str | None:
 
 def _cleanup_temp_files(temp_files: list[str]) -> None:
     """
-    删除临时文件，并尽力清理其所在的空目录。
-
-    单个文件删不掉不能中断整轮清理，也不能让异常冒出去：这个函数只在 finally 里被调用，
-    从那里抛出的异常会顶掉已经算好的 Outcome，并绕过 listener 的失败记账与熔断。
+    尽力清理文件与空目录；删除失败不能中断后续清理。
+    在 finally 中抛出清理异常会覆盖已有 Outcome，破坏 listener 的结算。
     """
     for path in temp_files:
         if not os.path.exists(path):
@@ -236,12 +183,8 @@ def _cleanup_temp_files(temp_files: list[str]) -> None:
 
 def _collect_captions(items: list[ArchiveItem]) -> list[str]:
     """
-    媒体组的全部文字，去重且保序。
-
-    媒体组的 caption 由 Telegram 只存在第一条消息上。提前抓取，
-    以防第一条被去重/下载失败/校验失败过滤后 caption 丢失。
-    转发到频道的文档类消息，文本可能在 text 而非 caption 字段。
-    多条转发消息被 Telegram 编组后，各自可能带独立文字，全部收集。
+    过滤条目前收集文字，避免带 caption 的消息被跳过后丢失组说明。
+    文档文字也可能在 text；保留各条独立文字并去重、保序。
     """
     caps: list[str] = []
     for it in items:
@@ -253,12 +196,7 @@ def _collect_captions(items: list[ArchiveItem]) -> list[str]:
 
 def _first_unconcluded_failure(items: list[ArchiveItem], outcomes: list[Outcome],
                                error: Exception) -> Outcome | None:
-    """
-    非预期异常 → 给本轮尚无结论的第一条条目产出一条失败结论。
-
-    与整组上传失败的既有约定一致：一次故障只产出一条结论。路径一的媒体组里
-    每条媒体各是自己的入口，给每条都产结论会变成 N 条告警。全都有结论了就不补。
-    """
+    """只给首个尚无结论的条目记失败，避免一次组故障触发多条入口告警。"""
     concluded = {o.item.media.id for o in outcomes}
     for it in items:
         if it.media.id not in concluded:
@@ -267,8 +205,6 @@ def _first_unconcluded_failure(items: list[ArchiveItem], outcomes: list[Outcome]
 
 
 class ArchivePipeline:
-    """一批条目进来，归档掉，产出 Outcome。"""
-
     def __init__(
         self,
         *,
@@ -289,24 +225,21 @@ class ArchivePipeline:
         self._archive_chat = archive_chat
         self._receive_chat = receive_chat
         self._download_dir = download_dir
-        # 并发下载数上限，MTProto 单连接慢，2 个并行可有效提速
+        # 只限制媒体组的 Pyrogram 回退下载；tdl 并发由下载器控制。
         self._dl_sem = asyncio.Semaphore(2)
 
     async def _mark_processed(self, message: Message, *, duplicate: bool) -> None:
         await self._mark(message, duplicate)
 
     def _entry_chat(self, entry) -> str:
-        """入口所在频道。入口恒来自接收频道，chat 缺失时兜底到 receive_chat。"""
+        """入口来自接收频道，chat 缺失时仍用入口频道兜底。"""
         return entry.chat_id or str(self._receive_chat)
 
     def _record_dedup_file(self, item: ArchiveItem, kind: MediaKind, media: MediaFile,
                            sha256: str, size: int, dup) -> None:
         """
-        SHA-256 去重命中：文件已在备份频道，只补一条指向它的 files 记录。
-
-        这里不写 messages —— 没有新的归档消息可记。但文件身份和 source 必须照写，
-        否则去重命中的行会永久缺 file_name/mime_type/media_kind，而且回填脚本救不了：
-        它按 messages.origin_type IS NULL 选行，这些行没有对应的 messages 记录。
+        SHA-256 命中只补 files：复用归档落点，没有新 messages 可记。
+        文件身份与路径仍须写全，回填脚本无法修复没有 messages 的去重行。
         """
         self._db.record_file(
             file_unique_id=media.file_unique_id,
@@ -323,15 +256,9 @@ class ArchivePipeline:
         self, upload: _PendingUpload, sent: Message, caption: str,
     ) -> None:
         """
-        记录已上传文件及其来源消息 —— files 与 messages 一个事务写完。
-
-        入口（item.entry）落到 messages.source_* 与 files.source，delete_message.py
-        靠前者回退 checkpoint；来源（item.media）落到 origin_*。两者混用会让路径二的
-        记录落在错误的 id 空间 —— 源频道的消息 id 被当成接收频道的 id 去回退 checkpoint。
-
-        走 record_archived 而不是 record_file + record_message：两次调用是两个事务，
-        第二次失败会留下「files 有行、messages 没行」的库，而下轮重试会因为
-        file_unique_id 命中被当成去重跳过，那条 messages 永远补不上。
+        messages.source_* 存入口，origin_* 存真实来源；checkpoint 只能按入口回退。
+        files.source 存归档路径（Entry.route），不是来源位置。
+        files 与 messages 必须原子写入，否则去重会阻止补写缺失的消息记录。
         """
         assert sent.id is not None
         item = upload.item
@@ -376,7 +303,7 @@ class ArchivePipeline:
                 self._config.video_compress_enabled,
                 self._config.video_compress_min_size_mb,
                 self._config.video_compress_crf,
-                # 媒体组整组文件同在 batch_dir，产物名必须按消息 id 区分，否则互相覆盖
+                # 组文件共享目录，产物名必须带消息 id，避免覆盖。
                 tag=message_id,
                 threads=self._config.video_compress_threads,
             )
@@ -400,10 +327,7 @@ class ArchivePipeline:
                      message_id, meta["duration"], meta["width"], meta["height"])
 
         logger.debug("生成缩略图 %s ...", message_id)
-        # 产物写源文件所在目录并带上消息 id：媒体组 tdl 命中时文件在 batch_dir，
-        # msg_dir 已被 rmdir，写进去必然失败（还要白跑四档画质重试）；整组文件同在
-        # batch_dir，固定名会被 ffmpeg -y 互相覆盖。与 compressed_{tag}.mp4 同一套约定。
-        # dirname 必须在压缩之后取：压缩成功时 local_path 已经换成产物路径
+        # 压缩后从实际路径取目录：msg_dir 可能已删除；消息 id 避免组内产物覆盖。
         thumb_path = os.path.join(os.path.dirname(local_path), f"thumb_{message_id}.jpg")
         thumb_path = await asyncio.to_thread(media_ops.make_thumbnail, local_path, thumb_path)
         if thumb_path:
@@ -422,15 +346,7 @@ class ArchivePipeline:
         thumb_path: str | None = None,
         meta: dict,
     ) -> Message | None:
-        """
-        上传单个媒体；照片格式不被 Telegram 接受时回退为 document。
-
-        方法名与关键字全部由 MEDIA_KINDS 那一行决定，这里不再有 `kind == "video"`：
-        新增类型只改表。
-
-        meta 必填：唯一的调用方 _upload_one 恒从 _PendingUpload.meta 取，
-        那个字段恒为 dict（非视频是空 dict）。
-        """
+        """照片格式被拒时仅回退本条；发送方法与参数能力由 MEDIA_KINDS 决定。"""
         spec = MEDIA_KINDS[kind]
         send = getattr(self._client, spec.send_method)
 
@@ -438,10 +354,7 @@ class ArchivePipeline:
         if spec.accepts_caption:
             kwargs["caption"] = caption
         elif caption:
-            # 不接受 caption 的类型不能传这个关键字（空串也不行，传了就是 TypeError）。
-            # 今天不可达：唯一 accepts_caption=False 的 video_note 在协议层就没有
-            # caption 字段，源消息带不了文字。留着只为哪天 Telegram 给圆形视频加上
-            # caption 时有一行日志，而不是静默丢掉
+            # 若协议以后允许源消息带文字，也不能静默丢弃不支持上传的 caption。
             logger.warning("%s 不支持 caption，文字只留在 DB 里（FTS 仍可搜到）", kind)
         if spec.video_meta:
             kwargs |= {
@@ -461,24 +374,16 @@ class ArchivePipeline:
     async def _prepare_item(self, task: _DownloadTask, local_path: str,
                             temp_files: list[str]) -> _ItemResult:
         """
-        下载产物 → 待上传条目。两条路径共用，唯一的一份实现。
-
-        temp_files 由调用方持有，且下载产物已由调用方登记：本方法只往后追加自己造出来的
-        新文件（格式修正后的新路径、压缩产物、缩略图），从不替换已有条目。因此这里不再有
-        「最后一项必须是本条的下载产物」那个契约 —— 它曾经要求替换动作排在 _prepare_video
-        之前（之后 temp_files[-1] 已经是缩略图了）。
-
-        不产出 Outcome.failure("download")：下载归调用方 —— 单条与整组的批次形状不同。
-        视频处理留在这里：产物命名依赖 local_path 所在目录（见 CLAUDE.md「临时产物命名」），
-        这条约束必须只有一处实现。
+        单条与整组共用唯一的校验、哈希、格式修正、去重和视频处理实现。
+        下载形状由调用方决定，下载失败也由调用方判定。
+        调用方登记下载产物并在 finally 清理；这里只追加新产物，不替换追踪项。
         """
         it, kind, media = task.item, task.kind, task.media
         message = it.media
         logger.debug("下载完成 %s → %s (%s bytes)",
                      message.id, local_path, os.path.getsize(local_path))
 
-        # 校验只包住 verify_download_size 自己：把整段包在 except RuntimeError 里
-        # 会把别处的 RuntimeError 也误报成校验失败
+        # 仅捕获校验自身的 RuntimeError，避免误报其他处理阶段的异常。
         try:
             media_ops.verify_download_size(
                 local_path, getattr(media, "file_size", None),
@@ -488,20 +393,15 @@ class ArchivePipeline:
             return _ItemResult(pending=None, outcome=Outcome.failure(it, "verify", e))
         logger.debug("校验通过 %s", message.id)
 
-        # 整文件哈希与图片转码都是同步的重活，必须丢线程池：几 GB 的视频在事件循环里
-        # 哈希会一并卡住 Pyrogram 的 ping（session.PING_INTERVAL=5s，
-        # 服务端的 disconnect_delay 是 WAIT_TIMEOUT+10=25s），慢盘上足以掉线重连。
-        # 旁边的压缩 / ffprobe / 抽帧本来就在 to_thread 里，这里的形状要一致
+        # sha256/size 必须认转换、压缩前的下载产物；重活放线程池，避免阻塞心跳。
         sha256 = await asyncio.to_thread(media_ops.sha256_of_file, local_path)
         size = os.path.getsize(local_path)
         logger.debug("SHA-256 %s: %s", message.id, sha256[:16])
 
-        # 文件格式转换（如 WebP→JPEG），让 Telegram 可以内联展示
+        # 修正格式以便 Telegram 内联展示；图片转码同样不能阻塞事件循环。
         fixed_path = await asyncio.to_thread(media_ops.fix_media_format, local_path, kind)
         if fixed_path != local_path:
-            # 追加而不是替换：fix_media_format 换路径时已经把原文件删掉/改名了，
-            # 旧条目留在列表里只会在 _cleanup_temp_files 的 exists 检查上落空。
-            # 这样就不必维持「temp_files[-1] 必须是本条的下载产物」那个契约
+            # 追加可保留整组追踪；已删除的旧路径会被清理函数跳过。
             temp_files.append(fixed_path)
         local_path = fixed_path
 
@@ -510,7 +410,7 @@ class ArchivePipeline:
             self._record_dedup_file(it, kind, media, sha256, size, dup)
             return _ItemResult(pending=None, outcome=Outcome.success(it), duplicate=True)
 
-        # 视频：（可选）压缩 → ffprobe 探测真实元数据（三层回退） → ffmpeg 生成缩略图
+        # 去重命中已返回，避免为重复视频跑压缩、探测和抽帧。
         spec = MEDIA_KINDS[kind]
         thumb_path = None
         meta: dict = {}
@@ -527,11 +427,7 @@ class ArchivePipeline:
         )
 
     async def _upload_one(self, upload: _PendingUpload, caption: str) -> Outcome:
-        """
-        单条上传 + 写库，产出结论。archive_one、拆组分支、不可编组条目共用。
-
-        不含冷却：调用方在成功后自己 sleep —— 打包上传整组只睡一次，逐条上传每条都睡。
-        """
+        """单条、拆组与不可编组条目共用；冷却由调用方控制，整组一次、单发每条一次。"""
         message = upload.item.media
         logger.debug("上传 %s %s ...", upload.kind, message.id)
         try:
@@ -549,14 +445,9 @@ class ArchivePipeline:
 
     async def archive_one(self, item: ArchiveItem) -> Outcome:
         """
-        处理单条媒体消息，返回该条目的结论。
-
-        失败不就地记账 —— 调用方用 _settle_all 按入口统一结算。
-        去重跳过算 ok：文件已在备份频道，没有待重试的事。
-
-        中间那段（校验→SHA-256→格式修正→去重→视频处理）走 _prepare_item，与整组路径
-        共用唯一一份实现；这里只负责单条的下载形状（自己的 msg_dir、无 Semaphore）
-        与单条的上传形状（_send_media，PhotoExtInvalid 只回退这一条）。
+        单条使用独立下载目录且不加组回退限流；照片回退只影响本条。
+        媒体处理共用 _prepare_item，下载与上传形状保留独立流程。
+        去重算成功；失败交回 listener 按入口结算。
         """
         message = item.media
         mark = item.entry.route == ROUTE_FORWARD
@@ -574,7 +465,6 @@ class ArchivePipeline:
             task = planned.tasks[0]
             logger.info("开始处理 %s (%s)", message.id, task.kind)
 
-            # 下载：tdl 并行分块，失败自动回退 Pyrogram；下载失败不推进 checkpoint
             links = {message.id: item.link} if item.link else None
             try:
                 paths = await self._downloader.download(
@@ -618,13 +508,9 @@ class ArchivePipeline:
 
     async def archive_batch(self, items: list[ArchiveItem]) -> list[Outcome]:
         """
-        媒体组：并行下载（最多 2 个）→ 顺序处理 → 打包成 send_media_group 上传。
-
-        返回每个有确定结论的条目的 Outcome。任一阶段的非预期异常都在这里翻译成
-        一条失败结论（只给本轮尚无结论的第一条），交回 listener 记账/熔断 ——
-        阶段方法保持「出错就抛」，不在内部就地降级。整组上传失败同样只有第一条
-        产出失败结论，其余条目本轮无结论（根本没被尝试），由调用方留到下轮 ——
-        给每条都产结论会让路径一的媒体组变成 N 条告警。
+        媒体组共用下载目录，只有 Pyrogram 回退下载最多并发两条。
+        阶段方法的非预期异常在此记给首个尚无结论的条目，交回 listener 结算。
+        整组上传失败也只记一条，避免一次故障触发多条告警；其余留待重试。
         """
         outcomes: list[Outcome] = []
         temp_files: list[str] = []
@@ -636,8 +522,7 @@ class ArchivePipeline:
             planned = self._plan(items)
             outcomes.extend(Outcome.success(it) for it in planned.duplicates)
             paths = await self._download(planned.tasks)
-            # 下载产物一落盘就登记：_process_each 中途抛异常时，还没轮到的那几条
-            # 也得被 finally 清掉（否则永久留在 batch_dir）
+            # 整批登记，保证处理中途抛异常时，未处理的下载产物也由 finally 清理。
             temp_files.extend(paths.values())
             processed = await self._process_each(planned.tasks, paths, temp_files)
             outcomes.extend(processed.outcomes)
@@ -652,12 +537,12 @@ class ArchivePipeline:
 
             for upload in processed.singles:
                 single_msg = upload.item.media
-                # 不可编组的条目各带自己的文字：它们本来就不在一个媒体组的 caption 里
+                # 复用已下载产物，不能回调 archive_one；上传失败不阻止后续单发。
                 caption = single_msg.caption or single_msg.text or ""
                 outcome = await self._upload_one(upload, caption)
                 outcomes.append(outcome)
                 if outcome.ok:
-                    # 就地标记 + 就地冷却，与原先回调 archive_one 时的顺序一致
+                    # 单发成功即标记、冷却；可编组条目等整组上传完成后统一标记。
                     if mark:
                         await self._mark_processed(single_msg, duplicate=False)
                     await asyncio.sleep(self._config.upload_cooldown_seconds)
@@ -673,9 +558,7 @@ class ArchivePipeline:
                 logger.warning("媒体组处理失败，记录待重试", exc_info=True)
                 outcomes.append(failure)
             else:
-                # 所有条目都已有结论（异常发生在结算之后，例如统一打标记那一段）：
-                # 没有条目能承载这个失败，_settle_all 会按全成功结算并推进 checkpoint，
-                # 这个异常就此消失 —— 只剩这行日志
+                # 所有条目已有结论，仍交给 listener 结算；收尾异常只能记日志。
                 logger.exception("媒体组收尾出错，本轮已无条目可记账，checkpoint 仍会推进")
         finally:
             _cleanup_temp_files(temp_files)
@@ -703,15 +586,12 @@ class ArchivePipeline:
         return _Planned(tasks=tasks, duplicates=duplicates)
 
     async def _download(self, tasks: list[_DownloadTask]) -> dict[int, str]:
-        """阶段二：tdl 并行分块下载；缺失或失败的文件回退 Pyrogram（Semaphore 限流）。"""
+        """组下载失败或缺失时回退 Pyrogram；Semaphore 只限制回退并发。"""
         if not tasks:
             return {}
         first_msg = tasks[0].item.media
         chat = first_msg.chat
-        # Kurigram 把 chat 与 chat.id 都声明成 Optional。这里没有配置值可以顶替：
-        # 路径二的媒体来自任意源频道，self._receive_chat 是入口频道而不是它的频道。
-        # 缺 chat 说明消息对象本身不完整，抛出去由 archive_batch 兜成 'process' 失败账
-        # （tdl_downloader 拿到这批消息后同样 assert，这里只是让它提前且带类型）
+        # 媒体可能来自任意源频道，缺 chat 时不能拿入口 receive_chat 顶替。
         assert chat is not None and chat.id is not None
         batch_dir = os.path.join(
             self._download_dir,
@@ -721,8 +601,7 @@ class ArchivePipeline:
         fallback_paths = {
             t.item.media.id: os.path.join(t.msg_dir, t.dl_name) for t in tasks
         }
-        # 只有链接指向的那一条带 link，推出来正好一个 URL，tdl 才会加 --group
-        # 一次拉整组（tdl_downloader.py:113）。给每条都编链接会改掉下载语义
+        # 只保留原链接，单个 URL 才触发 tdl 的 --group 整组下载。
         links = {t.item.media.id: t.item.link for t in tasks if t.item.link} or None
 
         async def _fallback(message, path):
@@ -739,13 +618,7 @@ class ArchivePipeline:
 
     async def _process_each(self, tasks: list[_DownloadTask], paths: dict[int, str],
                             temp_files: list[str]) -> _Processed:
-        """阶段三：顺序处理（校验 / SHA-256 / 去重 / 格式转换 / ffprobe / 缩略图）。
-
-        临时文件登记在调用方的 temp_files 里：本方法抛异常时 archive_batch 的
-        finally 仍然要清得掉它们。下载产物由调用方在 _download 返回后一次登记完
-        （本方法中途抛异常时，还没轮到的条目也已经落盘了）；本方法只让 _prepare_item
-        往后追加它自己造出来的文件。
-        """
+        """共用 _prepare_item 准备上传形状；临时文件始终由 archive_batch 持有和清理。"""
         pending: list[_PendingUpload] = []
         duplicates: list[ArchiveItem] = []
         singles: list[_PendingUpload] = []
@@ -789,8 +662,7 @@ class ArchivePipeline:
         """阶段四：多条各带独立文字则拆组单发，否则 send_media_group 打包。"""
         outcomes: list[Outcome] = []
 
-        # 多条消息各有独立文字（转发文档被 Telegram 编组）→ 拆组单独上传，
-        # 每条带自己的 caption，还原 "文件A+文字A、文件B+文字B" 的原始布局
+        # 拆组保留每条独立文字；与不可编组的 singles 不同，首次失败即停止。
         if len(caps) > 1:
             for upload in pending:
                 message = upload.item.media
@@ -803,7 +675,7 @@ class ArchivePipeline:
             logger.info("归档媒体组（拆组）%s 条", len(pending))
             return _Uploaded(outcomes, aborted=False)
 
-        # 普通媒体组：共用一条 caption，send_media_group 打包上传
+        # 共用组说明只挂第一条，避免重复文字。
         input_media = []
         for i, upload in enumerate(pending):
             caption = group_caption if i == 0 else ""
@@ -827,8 +699,7 @@ class ArchivePipeline:
             try:
                 sent_list = await self._client.send_media_group(self._archive_chat, input_media)
             except PhotoExtInvalid:
-                # WebP 等格式不能作为 photo 编组，回退到全部作为 document 的媒体组
-                # thumb/meta 在 InputMediaDocument 中无效，丢弃即可
+                # 照片被拒时整组回退 document，保留编组和组说明。
                 logger.debug("PhotoExtInvalid，回退整组 send_document")
                 input_media = [
                     InputMediaDocument(p.local_path, caption=group_caption if i == 0 else "")
@@ -836,16 +707,12 @@ class ArchivePipeline:
                 ]
                 sent_list = await self._client.send_media_group(self._archive_chat, input_media)  # type: ignore[arg-type]
         except Exception as e:
-            # 整组上传失败：只有第一条产出失败结论，其余条目本轮无结论
-            # （它们根本没被尝试）。给每条都产结论会让路径一变成 N 条告警
+            # 一次组故障只记一条失败，避免多条入口告警。
             logger.warning("媒体组上传失败，记录待重试", exc_info=True)
             outcomes.append(Outcome.failure(pending[0].item, "upload", e))
             return _Uploaded(outcomes, aborted=True)
 
-        # strict=True：sent_list 比 pending 短就抛，而不是静默漏记。少记一条等于
-        # 「文件已在备份频道、DB 里没有任何行」，而那一条也拿不到 Outcome，
-        # _settle_all 会跳过它、checkpoint 照常推进 —— 永久的去重盲区。
-        # 抛出来则由 archive_batch 的兜底记进失败账
+        # 数量不符必须抛给 archive_batch，避免文件已上传却漏写库、漏结算。
         for upload, sent in zip(pending, sent_list, strict=True):
             self._record_archived_media(upload, sent, group_caption)
             outcomes.append(Outcome.success(upload.item))
