@@ -8,11 +8,9 @@ from io import BytesIO
 
 import pytest
 from PIL import Image
-from support import RECEIVE, SOURCE, Harness, item, message
-from tgstash.archive.entry import ROUTE_LINK, Entry
-from tgstash.archive.links import process_link_message
+from support import ARCHIVE, RECEIVE, SOURCE, Harness, item, message
 from tgstash.media import ops
-from tgstash.runtime.listener import _settle_all, scan_once
+from tgstash.runtime.listener import scan_once
 
 
 def png_payload(seed):
@@ -31,10 +29,15 @@ def test_single_archive_preserves_original_identity_and_deduplicates(tmp_path):
     stored = h.db.find_by_unique_id("U41")
     assert stored["sha256"] == hashlib.sha256(payload).hexdigest()
     assert stored["size"] == len(payload)
+    assert stored["archived_message_id"] == h.client.sent_ids[0]
+    assert stored["archived_chat_id"] == str(ARCHIVE)
     assert h.client.uploads[0][1] != payload
     with Image.open(BytesIO(h.client.uploads[0][1])) as uploaded:
         assert uploaded.format == "JPEG"
-    assert h.db.search("归档核心内容")[0]["source_message_id"] == 41
+    row = h.db.search("归档核心内容")[0]
+    assert row["source_message_id"] == 41
+    assert row["archived_message_id"] == stored["archived_message_id"]
+    assert row["archived_chat_id"] == str(ARCHIVE)
 
     assert asyncio.run(h.pipeline.archive_one(item(msg))).ok
     assert len(h.downloader.calls) == 1
@@ -80,12 +83,15 @@ def test_album_preserves_all_items_captions_and_upload_shape(tmp_path, shape):
     rows = h.db.find_messages_by_source_ids([41, 42])
     assert {r["source_message_id"] for r in rows} == {41, 42}
     assert all(h.db.find_by_unique_id(f"U{mid}")["archived_message_id"] is not None for mid in [41, 42])
+    assert [h.db.find_by_unique_id(f"U{mid}")["archived_message_id"] for mid in [41, 42]] == h.client.sent_ids
     assert len(h.downloader.calls) == 1
     if shape == "split":
         assert [upload[2]["caption"] for upload in h.client.uploads] == ["第一份内容", "第二份内容"]
+        assert [upload[1] for upload in h.client.uploads] == [b"a" * 2048, b"b" * 2048]
     elif shape == "mixed":
         assert [upload[0] for upload in h.client.uploads] == ["group", "send_video_note"]
         assert "caption" not in h.client.uploads[-1][2]
+        assert h.client.uploads[0][1] == [b"a" * 2048] and h.client.uploads[1][1] == b"b" * 2048
     else:
         assert h.client.uploads[-1][2]["captions"] == ["第一份内容", ""]
         if shape == "photo_fallback":
@@ -104,14 +110,15 @@ def test_album_preserves_all_items_captions_and_upload_shape(tmp_path, shape):
 @pytest.mark.parametrize("fault", ["verify", "process", "upload", "short_response"])
 def test_album_failures_are_settled_and_downloads_are_cleaned(tmp_path, monkeypatch, fault):
     h = Harness(tmp_path)
-    h.downloader.payloads = {41: b"x" if fault == "verify" else b"a" * 2048, 42: b"b" * 2048}
+    h.downloader.payloads = {41: b"a" * 2048, 42: b"b" * 2048}
     if fault == "process":
         def fail(path):
             raise OSError("hash unavailable")
         monkeypatch.setattr(ops, "sha256_of_file", fail)
     h.client.upload_error = fault == "upload"
     h.client.short_group = fault == "short_response"
-    group = [message(41, group="album"), message(42, group="album")]
+    group = [message(41, group="album", size=4096 if fault == "verify" else 2048),
+             message(42, group="album")]
     h.client.groups[41] = group
     h.client.history = [*group, message(43, None, caption="")]
     asyncio.run(scan_once(h.ctx))
@@ -155,10 +162,9 @@ def test_link_album_uses_entry_identity_and_keeps_sibling_failure(tmp_path):
     h.client.sources[41] = first
     h.client.groups[41] = [second, first]
     h.downloader.payloads = {41: b"a" * 2048, 42: b"broken"}
-    entry = Entry(entry_message, ROUTE_LINK)
-
-    outcomes = asyncio.run(process_link_message(h.client, h.pipeline, entry))
-    assert not asyncio.run(_settle_all(h.ctx, outcomes))
+    h.client.history = [entry_message]
+    asyncio.run(scan_once(h.ctx))
+    assert h.db.get_checkpoint(RECEIVE) == 0
     assert h.db.get_failure(RECEIVE, 300)["attempt_count"] == 1
     assert h.db.get_failure(SOURCE, 42) is None
     row = h.db.search("归档核心内容")[0]
@@ -168,8 +174,8 @@ def test_link_album_uses_entry_identity_and_keeps_sibling_failure(tmp_path):
     assert h.client.edits[0][:2] == (RECEIVE, 300)
 
     h.downloader.payloads[42] = b"b" * 2048
-    outcomes = asyncio.run(process_link_message(h.client, h.pipeline, entry))
-    assert asyncio.run(_settle_all(h.ctx, outcomes))
+    asyncio.run(scan_once(h.ctx))
+    assert h.db.get_checkpoint(RECEIVE) == 300
     assert h.db.list_failures() == []
     assert len(h.db.find_messages_by_source_ids([300])) == 2
     h.empty_downloads()

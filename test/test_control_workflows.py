@@ -96,6 +96,14 @@ def test_bot_authorization_confirmation_and_execution_scope(tmp_path):
         assert h.db.get_checkpoint(RECEIVE) == 500
         assert len(h.db.find_messages_by_source_ids([888, 999])) == 2
 
+        record(h.db, 200)
+        rollback = BotMessage("/delete 200 rollback", mid=4000)
+        await handle_message(ctx, rollback)
+        await handle_callback(ctx, Callback("del:ok", 4001))
+        assert h.db.find_messages_by_source_ids([200]) == []
+        assert h.db.get_checkpoint(RECEIVE) == 199
+        assert len(h.db.find_messages_by_source_ids([888, 999])) == 2
+
     asyncio.run(scenario())
 
 

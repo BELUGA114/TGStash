@@ -69,12 +69,15 @@ class Telegram:
         self.upload_error = False
         self.short_group = False
         self.next_id = 900
+        self.sent_ids = []
 
     def _sent(self):
         self.next_id += 1
+        self.sent_ids.append(self.next_id)
         return SimpleNamespace(id=self.next_id)
 
     async def _send(self, method, chat, path, **kwargs):
+        assert chat == ARCHIVE
         # 用真实 RPC 签名约束桩，避免桩接受 Telegram 会拒绝的参数。
         inspect.signature(getattr(Client, method)).bind(None, chat, path, **kwargs)
         self.uploads.append((method, Path(path).read_bytes(), kwargs))
@@ -97,6 +100,7 @@ class Telegram:
         return await self._send("send_video_note", chat, path, **kwargs)
 
     async def send_media_group(self, chat, media):
+        assert chat == ARCHIVE
         self.uploads.append(("group", [Path(m.media).read_bytes() for m in media],
                              {"captions": [m.caption for m in media],
                               "types": [type(m).__name__ for m in media]}))
