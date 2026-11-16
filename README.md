@@ -128,7 +128,18 @@ docker compose exec stash-listener python search.py 关键词
 
 FTS5 + trigram 分词器，每个关键词至少 3 个字符。2 字及更短的词不产生 token，多个关键词之间是 AND。输出包含时间、媒体类型、真实来源、发送者、caption、原始文件名，以及可点击的备份频道链接
 
-## 调试工具
+## 本地开发
+
+测试使用 pytest，用例在 `test/`，测试覆盖数据库事务与迁移、去重与搜索、来源归一化、单条及媒体组归档、媒体处理回退、失败结算与 checkpoint、管理操作确认、配置装配与备份
+
+测试不连接 Telegram
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+### 调试工具
 
 `scripts/` 目录下的辅助脚本（容器内运行）：
 
@@ -139,27 +150,13 @@ docker compose run --rm stash-listener python scripts/backfill_metadata.py --dry
 docker compose run --rm stash-listener python scripts/retry_skipped.py --dry-run   # 预览把 skipped 救回重试
 ```
 
-> 回填脚本和主服务共用 `/data/session` 里那份 Pyrogram session，跑之前先
-> `docker compose stop stash-listener`，跑完再 `docker compose up -d`。
+> 回填脚本和主服务共用 `/data/session` 的 Pyrogram session
 
-- **get_chat_ids.py** — 列出当前账号加入的所有频道 ID 和标题，用于填写 `.env`
-- **delete_message.py** — 按 `source_message_id`（入口 id，即接收频道那条消息）删除数据库记录并回退 checkpoint，支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
-- **backfill_metadata.py** — 回填历史消息的来源（`origin_*`）与文件身份（文件名/mime/类型）。只处理 `origin_type IS NULL` 的行，从接收频道重新读原消息，靠 `file_unique_id` 自证匹配防止写错；查不到或不匹配的行标记 `unknown` 不再重试。支持 `--dry-run` 预览、`--limit N` 限量、`--db` 指定路径
-- **retry_skipped.py** — 把 `archive_failures` 中 `status='skipped'` 的行重排回重试队列（置 `retrying`、清零 `attempts`），并把接收频道 checkpoint 回退到选中行最小 id - 1，让下轮扫描重扫。省略 id = 全部 skipped；传入口 id 只处理交集。支持 `--dry-run` 预览、`--db` 指定路径。双层去重保证已归档的不重复上传。与 backfill 同约束：运行前 `docker compose stop stash-listener`，跑完 `up -d`
+- **get_chat_ids.py**：列出当前账号加入的所有频道 ID 和标题，用于填写 `.env`
+- **delete_message.py**：按 `source_message_id`（入口 id，即接收频道那条消息）删除数据库记录并回退 checkpoint，支持 `--dry-run` 预览、`--db` 指定路径、多个 ID
+- **backfill_metadata.py** ：回填历史消息的来源（`origin_*`）与文件身份（文件名/mime/类型）。只处理 `origin_type IS NULL` 的行，从接收频道重新读原消息，靠 `file_unique_id` 自证匹配防止写错；查不到或不匹配的行标记 `unknown` 不再重试。支持 `--dry-run` 预览、`--limit N` 限量、`--db` 指定路径
+- **retry_skipped.py**：把 `archive_failures` 中 `status='skipped'` 的行重排回重试队列，并把接收频道 checkpoint 回退到选中行最小 id - 1，让下轮扫描重扫。省略 id = 全部 skipped。支持 `--dry-run` 预览、`--db` 指定路径
 
-## 本地开发
-
-测试使用 pytest，用例都在 `test/`（`pyproject.toml` 里 `testpaths = ["test"]`，被测模块靠 `pythonpath` 指向 `stash-listener/` 与 `scripts/`）
-
-保留 9 个核心流程测试，参数化后共 15 个执行场景，取舍见 [test/README.md](test/README.md)。
-测试覆盖数据库事务与迁移、去重与搜索、来源归一化、单条及媒体组归档、媒体处理回退、
-失败结算与 checkpoint、管理操作确认、配置装配与备份。Telegram Client 与下载器使用注入的桩，
-测试不连接 Telegram。
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest
-```
 
 ## 目录结构
 
@@ -172,14 +169,12 @@ python -m pytest
 │   │   ├── bot/       # AdminOperations、PendingStore 与命令交互
 │   │   └── runtime/   # Runtime、配置、BackupService 与扫描生命周期
 │   └── *.py          # listener/search/login 命令行入口
-├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata/retry_skipped/healthcheck）
+├── scripts/           # 辅助脚本
 ├── test/              # 核心流程测试与外部 IO 桩
-├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
+├── data/              # 运行时
 ├── .env.example       # 配置模板
 └── docker-compose.yml
 ```
-
-主服务按职责分模块，以下路径相对于 `stash-listener/tgstash/`：
 
 | 模块 | 职责 |
 | --- | --- |
@@ -193,12 +188,9 @@ python -m pytest
 | `media/ops.py` / `media/compression.py` / `media/downloader.py` | 媒体处理与下载 |
 | `storage/db.py` / `archive/origin.py` / `storage/search.py` | 原子写库与迁移、来源归一化、搜索 |
 
-管理写操作与扫描共用一把锁。删除确认在拿锁后复核实际回退范围，数据库写入保持原子事务；
-归档管道只返回结果，checkpoint 只在 listener 的结算检查后推进。
-
 ## 许可证
 
-本项目整体以 [AGPL-3.0](LICENSE) 发布。第三方组件保留各自许可证：
+项目整体以 [AGPL-3.0](LICENSE) 发布。第三方组件保留各自许可证：
 
 | 组件             | 许可证               |
 | ---------------- | -------------------- |
