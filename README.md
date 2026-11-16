@@ -151,6 +151,7 @@ docker compose run --rm stash-listener python scripts/retry_skipped.py --dry-run
 
 测试使用 pytest，用例都在 `test/`（`pyproject.toml` 里 `testpaths = ["test"]`，被测模块靠 `pythonpath` 指向 `stash-listener/` 与 `scripts/`）
 
+保留 9 个核心流程测试，参数化后共 15 个执行场景，取舍见 [test/README.md](test/README.md)。
 测试覆盖数据库事务与迁移、去重与搜索、来源归一化、单条及媒体组归档、媒体处理回退、
 失败结算与 checkpoint、管理操作确认、配置装配与备份。Telegram Client 与下载器使用注入的桩，
 测试不连接 Telegram。
@@ -172,7 +173,7 @@ python -m pytest
 │   │   └── runtime/   # Runtime、配置、BackupService 与扫描生命周期
 │   └── *.py          # listener/search/login 命令行入口
 ├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata/retry_skipped/healthcheck）
-├── test/              # pytest 用例与共用 fixture（conftest.py）
+├── test/              # 核心流程测试与外部 IO 桩
 ├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
 ├── .env.example       # 配置模板
 └── docker-compose.yml

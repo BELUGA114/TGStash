@@ -34,10 +34,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: 安装 ffmpeg
-        # compress_video.compress_video() 第一步是 shutil.which("ffmpeg") 预检，
-        # 缺 ffmpeg 会挂 test_compress_video_success 和
-        # test_compress_video_failure_removes_half_product（两个用例只 patch 了
-        # subprocess.run，没 patch shutil.which）。不依赖 runner 是否自带
+        # 核心归档测试使用真实 ffprobe 和 ffmpeg，不依赖 runner 预装版本。
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
@@ -68,8 +65,7 @@ jobs:
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -r requirements-dev.txt
 
-      # 只做 lint，不做 ruff format：这套代码从没被格式化过，
-      # 一次 format 会重排 590 多行，集中在 listener.py 上
+      # 保留现有格式，避免检查引入与行为无关的重排。
       - run: .venv/bin/python -m ruff check --output-format=github .
 
       # 基线是 0 错。standard 模式盯的是 Kurigram 边界（chat / chat.id 这类
