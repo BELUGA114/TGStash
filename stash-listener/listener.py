@@ -31,14 +31,15 @@ from datetime import UTC, datetime
 from typing import NamedTuple
 from urllib.parse import urlparse
 
+from admin_operations import AdminOperations
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
 from bot_commands import (
     BotContext,
-    PendingStore,
     parse_admin_ids,
     register_command_menu,
     register_handlers,
 )
+from bot_pending import PendingStore
 from db import ArchiveDB
 from logging_setup import configure_logging
 from media_ops import get_media
@@ -694,8 +695,7 @@ async def _serve_bot(bot: Client, ctx: ListenerContext, lock: asyncio.Lock) -> N
     async with bot:
         # handler 在 client.start() 之后再挂：dispatcher 那时才在跑
         register_handlers(bot, BotContext(
-            db=ctx.db,
-            lock=lock,
+            operations=AdminOperations(ctx.db, lock),
             admin_ids=BOT_ADMIN_IDS,
             run_backup=lambda: _run_backup(ctx, time.time()),
             pending=PendingStore(),

@@ -2,16 +2,18 @@
 import asyncio
 from types import SimpleNamespace
 
+import admin_operations
 import bot_commands
+import bot_views
 import pytest
-from bot_commands import (
-    BotContext,
+from admin_operations import (
+    AdminOperations,
     DeletePreview,
     PendingClearAll,
     PendingDelete,
-    PendingStore,
-    format_delete_preview,
-    format_purge,
+)
+from bot_commands import (
+    BotContext,
     handle_callback,
     handle_message,
     parse_admin_ids,
@@ -20,6 +22,8 @@ from bot_commands import (
     parse_delete_args,
     user_allowed,
 )
+from bot_pending import PendingStore
+from bot_views import format_delete_preview, format_purge
 from db import ClearSummary, PurgeSummary, RetrySummary, Stats
 
 ADMIN = 111
@@ -88,8 +92,9 @@ def _ctx(*, db=None, lock=None, admin_ids=frozenset({ADMIN}), run_backup=None,
         return "/data/db/backups/archive-20260920-030405.db"
 
     return BotContext(
-        db=db if db is not None else SimpleNamespace(),
-        lock=lock if lock is not None else _RecordingLock(),
+        operations=AdminOperations(
+            db=db if db is not None else SimpleNamespace(),
+            lock=lock if lock is not None else _RecordingLock()),
         admin_ids=admin_ids,
         run_backup=run_backup or default_backup,
         pending=pending if pending is not None else PendingStore(),
@@ -422,7 +427,7 @@ class TestSearchCommand:
         asyncio.run(handle_message(_ctx(db=SimpleNamespace(
             search=lambda q, limit: rows)), msg))
 
-        assert len(msg.sent[0]) <= bot_commands.TELEGRAM_TEXT_LIMIT
+        assert len(msg.sent[0]) <= bot_views.TELEGRAM_TEXT_LIMIT
         assert msg.sent[0].endswith("…")
 
 
@@ -629,7 +634,7 @@ class TestPendingStore:
     def test_take_none_when_expired(self, monkeypatch):
         store: PendingStore[PendingDelete] = PendingStore(ttl_seconds=10)
         clock = [1000.0]
-        monkeypatch.setattr("bot_commands.time.monotonic", lambda: clock[0])
+        monkeypatch.setattr("bot_pending.time.monotonic", lambda: clock[0])
         store.put(7, PendingDelete(found_ids=(100,), rollback=False), requester_id=111)
         clock[0] = 1011.0                                # 超过 ttl
 
@@ -914,18 +919,18 @@ class TestRollbackDrift:
     """确认时回退跨度漂移判定：以确认时实际回退计划为准，对比预览警告过的 chat。"""
 
     def test_actual_crosses_and_preview_did_not_warn_refuses(self):
-        assert bot_commands._rollback_drift((), [("c", 101, 0)]) is not None
+        assert admin_operations._rollback_drift((), [("c", 101, 0)]) is not None
 
     def test_boundary_preview_100_not_warned_then_confirm_101_refuses(self):
         # 预览 span=100（未越线、没警告），确认 span=101 → 拦
-        assert bot_commands._rollback_drift((("c", 100, 0),), [("c", 101, 0)]) is not None
+        assert admin_operations._rollback_drift((("c", 100, 0),), [("c", 101, 0)]) is not None
 
     def test_preview_already_warned_proceeds(self):
         # 预览 span=200（已警告），确认 span=300 更大 → 放行（知情选择）
-        assert bot_commands._rollback_drift((("c", 200, 0),), [("c", 300, 0)]) is None
+        assert admin_operations._rollback_drift((("c", 200, 0),), [("c", 300, 0)]) is None
 
     def test_actual_within_threshold_proceeds(self):
-        assert bot_commands._rollback_drift((), [("c", 100, 0)]) is None
+        assert admin_operations._rollback_drift((), [("c", 100, 0)]) is None
 
     def test_no_actual_rollback_proceeds(self):
-        assert bot_commands._rollback_drift((), []) is None
+        assert admin_operations._rollback_drift((), []) is None
