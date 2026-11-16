@@ -1,301 +1,48 @@
-"""
-两条路径共享同一个接收频道，每 SCAN_INTERVAL_SECONDS 扫描一次：
+"""按入口统一结算失败账，再推进 checkpoint，避免成功条目掩盖同入口的失败。"""
 
-路径一（转发媒体）：
-  1. min_id + reverse=True 拉取 checkpoint 之后的新消息（旧到新）
-  2. media_group 整组处理，单条单独处理
-  3. file_unique_id 判重（快速通道）→ 下载 → SHA-256 判重（精确通道）
-  4. 新文件上传备份频道 + 写 DB，重复文件跳过上传只记录
-  5. 原消息 caption 加 "✅ 已归档" 标记
-  6. 每处理完一条推进 checkpoint，异常中断下次从成功处继续
-
-路径二（转发 t.me 链接）：
-  1. 检测文本消息中的 t.me 链接
-  2. parse_message_link() 解析出 chat + message_id
-  3. Pyrogram get_messages() 获取消息（你是成员，可直接下载）
-  4. 媒体组 → get_media_group() 整组处理；单条 → archive_single()
-  5. 复用路径一的 file_unique_id/SHA-256 双层去重 → 上传 → 写 DB
-  6. 原消息文本末尾追加 "✅ 已归档"
-"""
+from __future__ import annotations
 
 import asyncio
-import functools
 import logging
-import os
-import re
 import shutil
 import sys
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import NamedTuple
-from urllib.parse import urlparse
 
 from admin_operations import AdminOperations
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
+from backups import BackupService
+from bootstrap import build_runtime
 from bot_commands import (
     BotContext,
-    parse_admin_ids,
     register_command_menu,
     register_handlers,
 )
 from bot_pending import PendingStore
 from db import ArchiveDB
+from links import has_tme_link, process_link_message
 from logging_setup import configure_logging
 from media_ops import get_media
-from pipeline import ArchivePipeline, PipelineConfig
+from pipeline import ArchivePipeline
 from pyrogram.client import Client
 from pyrogram.types import Message, ReplyParameters
-from tdl_downloader import TDLDownloader
-
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
-# 每轮最多处理的消息数。宁可慢不可冒险——账号比速度重要
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
-# 每次上传文件后等待的秒数，降低 Telegram 服务端感知频率
-UPLOAD_COOLDOWN_SECONDS = int(os.environ.get("UPLOAD_COOLDOWN_SECONDS", "5"))
-HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
-TDL_NAMESPACE = os.environ.get("TDL_NAMESPACE", "archiver")
-TDL_THREADS = int(os.environ.get("TDL_THREADS", "4"))
-TDL_LIMIT = int(os.environ.get("TDL_LIMIT", "2"))
-TDL_DELAY_SECONDS = int(os.environ.get("TDL_DELAY_SECONDS", "1"))
-TDL_TIMEOUT_SECONDS = int(os.environ.get("TDL_TIMEOUT_SECONDS", "0"))
-# 同一条消息累计失败多少次后跳过/剔除（满 N 轮告警并推进，避免卡住 checkpoint）
-RETRY_MAX_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "3"))
-# 视频压缩：默认关闭；体积超过阈值才转码，压缩产物比原始小才用压缩版
-VIDEO_COMPRESS_ENABLED = os.environ.get("VIDEO_COMPRESS_ENABLED", "false").lower() == "true"
-VIDEO_COMPRESS_MIN_SIZE_MB = int(os.environ.get("VIDEO_COMPRESS_MIN_SIZE_MB", "100"))
-VIDEO_COMPRESS_CRF = int(os.environ.get("VIDEO_COMPRESS_CRF", "28"))
-# x264 编码线程上限。它默认按核心数×1.5 开线程，高核数机器上初始化时内存暴增可能被
-# OOM 杀死；0 表示不限制
-VIDEO_COMPRESS_THREADS = int(os.environ.get("VIDEO_COMPRESS_THREADS", "4"))
-# DB 备份：未设 = 默认 24h（升级后不改 .env 也有基本保护）；0 = 显式关闭自动备份，
-# 留给未来 TG 命令手动触发。0 与未设区分明确
-DB_BACKUP_INTERVAL_SECONDS = int(os.environ.get("DB_BACKUP_INTERVAL_SECONDS", "86400"))
-# 本地保留份数，超出删最旧
-DB_BACKUP_KEEP = int(os.environ.get("DB_BACKUP_KEEP", "7"))
-# 是否把新快照也上传到备份频道（异地容灾）
-DB_BACKUP_UPLOAD = os.environ.get("DB_BACKUP_UPLOAD", "false").lower() == "true"
-# TG bot 命令：未设 token = 整个 bot 功能关闭，main() 只跑 userbot，行为与加 bot 之前一致
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-# bot admin 白名单，逗号分隔的 user id；未设/空 = 谁都不授权
-BOT_ADMIN_IDS = parse_admin_ids(os.environ.get("BOT_ADMIN_IDS", ""))
-
-# 容器内默认 /data；测试和本机可用 DATA_DIR 覆盖
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
-SESSION_DIR = os.path.join(DATA_DIR, "session")
-DB_PATH = os.path.join(DATA_DIR, "db", "archive.db")
-DOWNLOAD_DIR = os.path.join(DATA_DIR, "tmp", "listener")
-BACKUP_DIR = os.path.join(DATA_DIR, "db", "backups")
-HEARTBEAT_PATH = os.path.join(DATA_DIR, "tmp", "heartbeat")
+from runtime_config import ScanConfig, load_config
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class ListenerContext:
-    """
-    一轮扫描要用到的运行时依赖。
-
-    只装「可替换的协作者」与「必填配置」。带默认值的环境变量常量
-    （RETRY_MAX_ATTEMPTS、BATCH_SIZE、SCAN_INTERVAL_SECONDS ...）留在模块级：
-    它们是纯读取，没有导入期副作用，进 ctx 只会让所有调用点变长。
-    """
-
     client: Client
     db: ArchiveDB
     pipeline: ArchivePipeline
     receive_chat: int
-    archive_chat: int
-
-
-def _build_client(api_id: int, api_hash: str) -> Client:
-    """构造 Pyrogram Client。单独拆出来是为了测试能替掉它（它会碰 workdir）。"""
-    kwargs = {"api_id": api_id, "api_hash": api_hash, "workdir": SESSION_DIR,
-              "max_concurrent_transmissions": 2}
-    if HTTP_PROXY:
-        u = urlparse(HTTP_PROXY)
-        kwargs["proxy"] = {"scheme": u.scheme, "hostname": u.hostname, "port": u.port}
-    return Client("listener", **kwargs)
-
-
-def _build_bot_client(api_id: int, api_hash: str) -> Client | None:
-    """
-    bot 模式 Client（bot_token 登录，独立 session 名 'bot'）。TG_BOT_TOKEN 未设时
-    返回 None —— 整个 bot 功能关闭，main() 只跑 userbot。
-
-    api_id/api_hash 必传：即使用 bot_token 登录，Pyrogram 建立新授权时仍要求
-    API key，缺了会在 load_session 抛「The API key is required for new
-    authorizations」。与 userbot 复用同一对凭证（同一个 app）。
-
-    与 _build_client 同样单独拆出来：测试要能替掉它（它会碰 workdir）。
-    这里不学 _build_client 攒 kwargs 字典：全部是字符串值时 pyright 推成
-    dict[str, str]，再往里塞 proxy 字典会报类型错（_build_client 里混了个 int，
-    正好躲过这一条，那不是可以照抄的理由）。
-    """
-    if not TG_BOT_TOKEN:
-        return None
-    if not HTTP_PROXY:
-        return Client("bot", api_id=api_id, api_hash=api_hash,
-                      bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR)
-    u = urlparse(HTTP_PROXY)
-    return Client("bot", api_id=api_id, api_hash=api_hash,
-                  bot_token=TG_BOT_TOKEN, workdir=SESSION_DIR,
-                  proxy={"scheme": u.scheme, "hostname": u.hostname, "port": u.port})
-
-
-def _build_context() -> ListenerContext:
-    """
-    组装运行时依赖。必填环境变量在这里读、目录在这里建、库在这里开、
-    client 在这里构造 —— import listener 不该有任何副作用，否则「测一条归档」
-    先得凑齐四个环境变量和一个可写的数据目录。
-    """
-    # chat_id 必须 int：字符串会触发 Pyrogram 的解析路径 bug
-    api_id = int(os.environ["TG_API_ID"])
-    api_hash = os.environ["TG_API_HASH"]
-    receive_chat = int(os.environ["RECEIVE_CHAT_ID"])
-    archive_chat = int(os.environ["ARCHIVE_CHAT_ID"])
-
-    os.makedirs(SESSION_DIR, exist_ok=True)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-    archive_db = ArchiveDB(DB_PATH)
-    client = _build_client(api_id, api_hash)
-    downloader = TDLDownloader(
-        namespace=TDL_NAMESPACE,
-        threads=TDL_THREADS,
-        limit=TDL_LIMIT,
-        delay=TDL_DELAY_SECONDS,
-        timeout=TDL_TIMEOUT_SECONDS,
-        proxy=HTTP_PROXY,
-    )
-    pipeline = ArchivePipeline(
-        client=client,
-        db=archive_db,
-        downloader=downloader,
-        mark_processed=functools.partial(mark_processed, client),
-        config=PipelineConfig(
-            upload_cooldown_seconds=UPLOAD_COOLDOWN_SECONDS,
-            video_compress_enabled=VIDEO_COMPRESS_ENABLED,
-            video_compress_min_size_mb=VIDEO_COMPRESS_MIN_SIZE_MB,
-            video_compress_crf=VIDEO_COMPRESS_CRF,
-            video_compress_threads=VIDEO_COMPRESS_THREADS,
-        ),
-        archive_chat=archive_chat,
-        receive_chat=receive_chat,
-        download_dir=DOWNLOAD_DIR,
-    )
-    return ListenerContext(client=client, db=archive_db, pipeline=pipeline,
-                           receive_chat=receive_chat, archive_chat=archive_chat)
-
-
-TME_LINK_RE = re.compile(r"https?://t\.me/\S+")
-# 链接尾部紧跟的句读不属于链接本身。全角那串是中文语境的常客：
-# 漏掉它们会让 parse_message_link 抛 ValueError，那条链接被 warning 掉，
-# 媒体永久不归档且无告警。合法链接以数字消息 id 或 ?single 结尾，剥这些字符安全
-LINK_TRAILING_PUNCT = ".,;:!?)]>" + "。，、；：！？）】》」』"
-
-
-def extract_tme_links(text: str) -> list[str]:
-    """
-    从消息文本里提取 t.me 链接，去掉尾部标点，保序去重。
-
-    只剥 LINK_TRAILING_PUNCT 里那几个字符。合法的 t.me 链接总以数字消息 id
-    （或 ?single 这类查询串）结尾，剥尾部标点不会伤到它。
-    """
-    links: list[str] = []
-    for raw in TME_LINK_RE.findall(text or ""):
-        link = raw.rstrip(LINK_TRAILING_PUNCT)
-        if link and link not in links:
-            links.append(link)
-    return links
-
-
-def entry_text(message: Message) -> str:
-    """
-    入口消息里承载文字的字段。
-
-    「这条消息有没有 t.me 链接」和「从它里面提取链接」必须用同一个定义：检测曾经读
-    text or caption、提取只读 text，一旦落进差集，入口会被判成有链接但提取出 0 条，
-    于是 _settle_all([]) 按全成功结清、checkpoint 静默推过，那条媒体永远不归档。
-    """
-    return message.text or message.caption or ""
-
-
-# Telegram 单条文本上限 4096（按字符算，与现有截断口径一致），超了整条编辑会被拒。
-# bot_commands.TELEGRAM_TEXT_LIMIT 是同一上限的另一份常量（那边 import 本模块会成环）
-TELEGRAM_TEXT_LIMIT = 4096
-LINK_ARCHIVED_MARK = "✅ 已归档"
-
-
-def marked_link_text(text: str) -> str:
-    """
-    链接入口归档后的新文本：原文在上，标记跟在末尾。
-
-    截断只砍原文、留住标记。写成 `f"{text}\\n{MARK}"[:4096]` 时，长文本上砍掉的
-    正好是末尾那行标记 —— 入口看着像没归档，下次人工核对会以为漏了。
-    """
-    suffix = f"\n{LINK_ARCHIVED_MARK}"
-    return text[:TELEGRAM_TEXT_LIMIT - len(suffix)] + suffix
-
-
-def parse_message_link(link: str) -> tuple[int | str, int]:
-    """
-    解析 t.me 链接，返回 (chat_identifier, message_id)
-
-    https://t.me/username/123    → ("@username", 123)
-    https://t.me/c/123456/123    → (-100123456, 123)
-
-    私有频道那一支必须是 int。Kurigram 的 resolve_peer 拿到字符串 peer 先剥掉
-    `+()-` 与空白，剩下全是数字就当电话号码：`"-1002680051096"` 剥成
-    `"1002680051096"`，于是走 contacts.ResolvePhone 查号码，回来一个
-    PHONE_NOT_OCCUPIED —— 路径二的每条 /c/ 链接都死在这里，重试三轮后被跳过，
-    媒体永久不归档。int 走的是另一条分支：storage 查不到就用 channels.GetChannels
-    补 access_hash（自己是成员的频道能补上），补不到才 PeerIdInvalid。
-    公开频道相反，必须留 "@username" 字符串，那条分支靠用户名解析。
-    """
-    link = link.strip().split("?")[0].rstrip("/")
-    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)$", link)
-    if m:
-        return (int(f"-100{m.group(1)}"), int(m.group(2)))
-    m = re.match(r"https?://t\.me/([^/]+)/(\d+)$", link)
-    if m:
-        return (f"@{m.group(1)}", int(m.group(2)))
-    raise ValueError(f"无法解析链接：{link}")
-
-
-def _list_backups(backup_dir: str) -> list[str]:
-    """列出备份目录里的快照文件全路径。目录不存在时返回空。"""
-    if not os.path.isdir(backup_dir):
-        return []
-    return [
-        os.path.join(backup_dir, name)
-        for name in os.listdir(backup_dir)
-        if name.startswith("archive-") and name.endswith(".db")
-    ]
-
-
-def _backup_filename(now: float) -> str:
-    """按 UTC 时间戳生成快照文件名。同一秒内重复备份会撞名，24h 间隔下不会发生。"""
-    return datetime.fromtimestamp(now, UTC).strftime("archive-%Y%m%d-%H%M%S.db")
-
-
-def backups_to_delete(paths: list[str], keep: int) -> list[str]:
-    """
-    保留最近 keep 份，返回其余待删路径。
-
-    快照文件名 archive-YYYYMMDD-HHMMSS.db 里时间戳是零填充的，按 basename
-    字典序排序等于按时间排序。入参顺序无关：函数内部自己排。
-    """
-    ordered = sorted(paths, key=os.path.basename)
-    if keep <= 0:
-        return ordered
-    return ordered[:-keep] if len(ordered) > keep else []
+    scan: ScanConfig
 
 
 async def mark_processed(client: Client, message: Message, duplicate: bool):
-    """回复原消息标记处理状态（转发的消息无法编辑，用回复形式）"""
+    """转发消息无法编辑，只能回复标记；标记失败不撤销已完成的归档。"""
     chat = message.chat
     if chat is None:
         return
@@ -309,7 +56,6 @@ async def mark_processed(client: Client, message: Message, duplicate: bool):
 
 
 async def alert_failure(client: Client, entry: Entry, text: str):
-    """在接收频道回复入口消息提醒归档失败。尽力而为，失败仅记日志。"""
     if entry.chat_id is None:
         return
     try:
@@ -322,27 +68,19 @@ async def alert_failure(client: Client, entry: Entry, text: str):
 
 
 def _entry_chat(ctx: ListenerContext, entry: Entry) -> str:
-    """入口所在频道。入口恒来自接收频道，chat 缺失时兜底到接收频道 id。"""
     return entry.chat_id or str(ctx.receive_chat)
 
 
 async def _record_failure(ctx: ListenerContext, entry: Entry, stage: str, error: str) -> str:
-    """
-    记录一次失败并决定后续动作。返回 'retry'（未满 N 轮，不推进 checkpoint）
-    或 'skip'（已满 N 轮，跳过/剔除）。
-
-    只接受 Entry：失败账、告警、checkpoint 一律以入口为准。路径二若拿源频道
-    那条消息记账，行会落在另一个 id 空间，pending_failures() 永远读不到，
-    等于既不重试也不阻塞 checkpoint。
-    """
+    """只按入口记账；链接源频道的 id 无法阻塞接收频道 checkpoint。"""
     chat_id = _entry_chat(ctx, entry)
     msg_id = entry.message_id
     count = ctx.db.increment_failure(chat_id, msg_id, stage, error)
     if count == 1:
         await alert_failure(
             ctx.client, entry,
-            f"⚠️ 归档失败，将自动重试（共 {RETRY_MAX_ATTEMPTS} 次）。阶段: {stage}")
-    if count >= RETRY_MAX_ATTEMPTS:
+            f"⚠️ 归档失败，将自动重试（共 {ctx.scan.retry_max_attempts} 次）。阶段: {stage}")
+    if count >= ctx.scan.retry_max_attempts:
         ctx.db.mark_failure_skipped(chat_id, msg_id, f"重试 {count} 次仍失败: {stage}")
         await alert_failure(
             ctx.client, entry,
@@ -352,18 +90,11 @@ async def _record_failure(ctx: ListenerContext, entry: Entry, stage: str, error:
 
 
 def _clear_failure(ctx: ListenerContext, entry: Entry):
-    """归档成功后自愈：清除该入口的失败记录（如有）。"""
     ctx.db.delete_failure(_entry_chat(ctx, entry), entry.message_id)
 
 
 async def _settle(ctx: ListenerContext, entry: Entry, outcomes: list[Outcome]) -> bool:
-    """
-    结算一个入口：返回它是否已结清（可以推进 checkpoint）。
-
-    全部条目成功才清失败记录；任一条目失败就记一次失败。不能在每个条目成功时
-    就地清记录 —— 路径二一个入口对多个条目，先成功的会把后失败的那条刚写的
-    记录冲掉。
-    """
+    """全成功才清失败账，避免同入口的成功条目冲掉其他条目的失败记录。"""
     failed = [o for o in outcomes if not o.ok]
     if not failed:
         _clear_failure(ctx, entry)
@@ -375,12 +106,7 @@ async def _settle(ctx: ListenerContext, entry: Entry, outcomes: list[Outcome]) -
 
 
 async def _settle_all(ctx: ListenerContext, outcomes: list[Outcome]) -> bool:
-    """
-    按入口分组结算全部结果。返回是否所有入口都已结清。
-
-    没有 Outcome 的入口不参与结算 —— 它们本轮没有确定结论（例如整组上传失败时
-    后续条目根本没被尝试），清记录会丢掉往轮累计的重试次数。
-    """
+    """没有结果的入口保留往轮失败账，避免丢掉尚未尝试条目的重试次数。"""
     grouped: dict[tuple[str, int], tuple[Entry, list[Outcome]]] = {}
     for outcome in outcomes:
         entry = outcome.item.entry
@@ -395,12 +121,7 @@ async def _settle_all(ctx: ListenerContext, outcomes: list[Outcome]) -> bool:
 
 
 def _group_settled(ctx: ListenerContext, group: list[Message]) -> bool:
-    """
-    组内所有消息都不再处于重试状态。checkpoint 的推进交给 scan_once 统一负责。
-
-    以库里的 pending 为准而不是本轮的 Outcome：往轮残留的 'retrying' 行同样
-    必须挡住推进，否则那条消息永远不会被重试。
-    """
+    """往轮残留的 retrying 行也必须挡住推进，因此以数据库为准。"""
     ids = {m.id for m in group}
     chat_id = (str(group[0].chat.id) if group[0].chat and group[0].chat.id
                else str(ctx.receive_chat))
@@ -411,100 +132,15 @@ def _group_settled(ctx: ListenerContext, group: list[Message]) -> bool:
     return True
 
 
-async def process_link_message(ctx: ListenerContext, entry: Entry) -> list[Outcome]:
-    """
-    处理包含 t.me 链接的入口消息：Pyrogram 直接获取消息 → 复用路径一的去重+上传管道
-
-    你是频道成员，Pyrogram 可以直接下载（不能"转发"但能"读取+下载"）。
-    支持媒体组——检测到 media_group_id 后拉取整组，每张照片的 caption 一并保留。
-
-    返回每个条目的结论。永久性失败（链接解析不了、消息取不到、无媒体）只记
-    warning 不产出失败结论：重试无用，当成失败会让这条入口永久卡住 checkpoint。
-    """
-    message = entry.message
-    text = entry_text(message)
-    links = extract_tme_links(text)
-
-    outcomes: list[Outcome] = []
-    for link in links:
-        try:
-            chat, msg_id = parse_message_link(link)
-        except ValueError:
-            logger.warning("无法解析链接，跳过：%s", link)
-            continue
-
-        try:
-            msg = await ctx.client.get_messages(chat, msg_id)
-        except Exception as e:
-            logger.warning("获取链接消息 %s 失败，下轮重试", link, exc_info=True)
-            outcomes.append(Outcome.failure(
-                ArchiveItem(media=message, entry=entry, link=link), "download", e))
-            continue
-
-        if msg is None:
-            logger.warning("消息 %s 不可访问或已删除", link)
-            continue
-
-        # 媒体组：拉整组，复用 pipeline.archive_batch()
-        if msg.media_group_id:
-            try:
-                group = sorted(await ctx.client.get_media_group(chat, msg_id),
-                               key=lambda m: m.id)
-            except Exception as e:
-                logger.warning("获取媒体组 %s 失败，下轮重试", link, exc_info=True)
-                outcomes.append(Outcome.failure(
-                    ArchiveItem(media=msg, entry=entry, link=link), "download", e))
-                continue
-            # link 只挂在链接指向的那一条上：tdl 靠「多条消息只给一个 URL」
-            # 决定加 --group 一次拉整组（tdl_downloader.py:113）
-            items = [
-                ArchiveItem(media=m, entry=entry, link=link if m.id == msg.id else None)
-                for m in group
-            ]
-            outcomes.extend(await ctx.pipeline.archive_batch(items))
-            logger.info("链接 %s → 媒体组 %s 张", link, len(group))
-        else:
-            kind, _ = get_media(msg)
-            if kind is None:
-                logger.info("链接 %s → 无媒体", link)
-                continue
-            outcomes.append(await ctx.pipeline.archive_one(
-                ArchiveItem(media=msg, entry=entry, link=link)))
-            logger.info("链接 %s → %s", link, kind)
-
-    # 只有确实归档了文件才打标记（去重跳过也算——文件已在备份频道）
-    if any(o.ok for o in outcomes) and entry.chat_id is not None:
-        try:
-            await ctx.client.edit_message_text(
-                int(entry.chat_id), entry.message_id, marked_link_text(text))
-        except Exception:
-            logger.warning("编辑链接消息标记失败（已归档结果不受影响）：%s",
-                           entry.message_id, exc_info=True)
-
-    return outcomes
-
-
-def _has_tme_link(message: Message) -> bool:
-    """检查消息是否包含 t.me 链接。正则与文本字段都跟 extract_tme_links 共用。"""
-    return bool(TME_LINK_RE.search(entry_text(message)))
-
-
 class EntryResult(NamedTuple):
-    settled: bool     # 已结清，可以推进 checkpoint
-    advance_to: int   # checkpoint 推进到哪条消息 id
-    handled: int      # 本条入口实际处理的文件数，只用于冷却计时
+    settled: bool
+    advance_to: int
+    handled: int
 
 
 async def _handle_entry(ctx: ListenerContext, msg: Message, handled_groups: set) -> EntryResult:
-    """
-    处理接收频道的一条消息。三条路径统一成同一个返回形状，
-    checkpoint 的推进由 scan_once 一处负责。
-    """
     if msg.media_group_id:
-        # 入口恒来自接收频道（scan_once 只扫 ctx.receive_chat 一个），组也就在那里，
-        # chat_id 直接取配置值。msg.chat 在 Kurigram 里是 Optional，从消息上取等于
-        # 凭空多一条不可能的分支；拿它当 if 条件更糟 —— 条件不成立时整组会掉进下面的
-        # 单条路径，handled_groups 不登记、组级 checkpoint 那套逻辑全绕开
+        # 扫描只读接收频道，不以 Optional 的 msg.chat 决定是否处理整组。
         group = sorted(await ctx.client.get_media_group(ctx.receive_chat, msg.id),
                        key=lambda m: m.id)
         handled_groups.add(msg.media_group_id)
@@ -513,8 +149,6 @@ async def _handle_entry(ctx: ListenerContext, msg: Message, handled_groups: set)
             for m in group
         ]
         outcomes = await ctx.pipeline.archive_batch(items)
-        # _settle_all 负责写失败账；组是否结清以库里的 pending 为准，
-        # 这样往轮残留的 'retrying' 行也能挡住推进
         await _settle_all(ctx, outcomes)
         return EntryResult(_group_settled(ctx, group), max(m.id for m in group), len(group))
 
@@ -525,9 +159,9 @@ async def _handle_entry(ctx: ListenerContext, msg: Message, handled_groups: set)
         settled = await _settle_all(ctx, [outcome])
         return EntryResult(settled, msg.id, 1 if outcome.ok else 0)
 
-    if _has_tme_link(msg):
+    if has_tme_link(msg):
         entry = Entry(message=msg, route=ROUTE_LINK)
-        outcomes = await process_link_message(ctx, entry)
+        outcomes = await process_link_message(ctx.client, ctx.pipeline, entry)
         settled = await _settle_all(ctx, outcomes)
         return EntryResult(settled, msg.id, sum(1 for o in outcomes if o.ok))
 
@@ -539,16 +173,12 @@ async def scan_once(ctx: ListenerContext):
     last_id = ctx.db.get_checkpoint(ctx.receive_chat)
     new_messages: list[Message] = []
     has_more = False
-    # reverse=True 让消息从旧到新排列——配合 min_id checkpoint 机制，
-    # 每处理完一条就推进 checkpoint，中途崩溃可以从最后成功的那条继续
-    # min_id 在 Pyrogram 是包含边界 >=，+1 确保不重复拉取已 checkpoint 的消息
+    # 从旧到新扫描；min_id 包含边界，+1 排除已推进的消息。
     async for msg in ctx.client.get_chat_history(ctx.receive_chat, min_id=last_id + 1,
                                                  reverse=True):
         new_messages.append(msg)
-        # 攒够本轮的量就停。get_chat_history 每 100 条一次请求，积压几千条时
-        # 「先全拉下来再切片」等于每轮把整段历史重扫一遍，只为推进 BATCH_SIZE 条 ——
-        # 与本项目「宁可慢不可冒险」的取向相反。多收一条只为知道后面还有，随即丢掉
-        if len(new_messages) > BATCH_SIZE:
+        # 多取一条探测积压即可，避免每轮遍历全部历史。
+        if len(new_messages) > ctx.scan.batch_size:
             new_messages.pop()
             has_more = True
             break
@@ -567,11 +197,7 @@ async def scan_once(ctx: ListenerContext):
         try:
             result = await _handle_entry(ctx, msg, handled_groups)
         except Exception as e:
-            # 入口级兜底。_handle_entry 里 get_media_group / _settle_all 这些调用在
-            # 管道之外，它们抛的异常以前一路冒到 main() 的兜底 except：不记
-            # archive_failures、不告警、也没有满 N 轮跳过 —— 真碰上一个持续失败的入口
-            # 就是每轮炸一次、checkpoint 永远停在那里。这里补齐「每条失败都进失败账」
-            # 那条不变量。route 不参与失败记账（它只决定 files.source），取默认值即可
+            # 管道外获取或结算异常也要进入失败账，否则入口会永久卡住。
             logger.warning("入口 %s 处理出错，记入失败账", msg.id, exc_info=True)
             entry = Entry(message=msg, route=ROUTE_FORWARD)
             settled = await _settle(ctx, entry, [
@@ -580,8 +206,7 @@ async def scan_once(ctx: ListenerContext):
 
         processed += result.handled
         if not result.settled:
-            # 必须停止本轮：否则下一条消息会把 checkpoint 推过这个未结清的入口，
-            # 它永远不会被重试
+            # 停止本轮，避免后续消息把 checkpoint 推过仍需重试的入口。
             logger.info("入口 %s 未结清，本轮停止，不推进 checkpoint", msg.id)
             break
         ctx.db.set_checkpoint(ctx.receive_chat, result.advance_to)
@@ -591,120 +216,63 @@ async def scan_once(ctx: ListenerContext):
     return processed
 
 
-async def _run_backup(ctx: ListenerContext, now: float) -> str:
-    """打一份快照 → 保留最近 N 份 → 可选上传。同步 VACUUM 走 to_thread。
-    返回快照路径：bot 的 /backup 要把它回给 admin。"""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    dest = os.path.join(BACKUP_DIR, _backup_filename(now))
-    await asyncio.to_thread(ctx.db.backup_to, dest)
-    logger.info("DB 备份完成：%s", dest)
-
-    for path in backups_to_delete(_list_backups(BACKUP_DIR), DB_BACKUP_KEEP):
-        try:
-            os.remove(path)
-            logger.info("删除旧备份：%s", path)
-        except OSError:
-            logger.warning("删除旧备份失败：%s", path, exc_info=True)
-
-    if DB_BACKUP_UPLOAD:
-        await ctx.client.send_document(ctx.archive_chat, dest)
-        await asyncio.sleep(UPLOAD_COOLDOWN_SECONDS)
-        logger.info("备份快照已上传备份频道：%s", os.path.basename(dest))
-
-    return dest
-
-
-async def _maybe_backup(ctx: ListenerContext, now: float, state: dict) -> None:
-    """
-    备份计时闸门。到点才备份，独立于扫描计时。
-
-    先更新 last_backup_at 再执行：备份失败不应让下一轮立刻重试成紧循环，
-    等满一个间隔再来。任何一步失败只记 warning，绝不阻塞归档主流程。
-    """
-    if DB_BACKUP_INTERVAL_SECONDS <= 0:
-        return
-    if now - state["last_backup_at"] < DB_BACKUP_INTERVAL_SECONDS:
-        return
-    state["last_backup_at"] = now
+def _write_heartbeat(path: str, now: float) -> None:
+    """心跳写入失败只记日志，避免观测手段拖垮归档服务。"""
     try:
-        await _run_backup(ctx, now)
-    except Exception:
-        logger.warning("DB 备份失败，跳过本轮", exc_info=True)
-
-
-def _write_heartbeat(now: float) -> None:
-    """
-    写一行当前 epoch 秒到心跳文件，供 healthcheck 判活。
-
-    每轮循环无条件写（空闲轮也写）：没新消息不等于死，只在有消息时写会误报。
-    写失败只 warning，不影响主循环——心跳是观测手段，不该反过来拖垮被观测的进程。
-    """
-    try:
-        with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(str(int(now)))
     except OSError:
-        logger.warning("写心跳失败：%s", HEARTBEAT_PATH, exc_info=True)
+        logger.warning("写心跳失败：%s", path, exc_info=True)
 
 
-async def scan_loop(ctx: ListenerContext, lock: asyncio.Lock) -> None:
-    """
-    扫描主循环：每轮在 lock 内跑 scan_once 与备份闸门。
-
-    bot 的写命令（/retry、/backup）拿同一把锁，于是它们等当前扫描轮跑完才动手，
-    扫描也不会中途撞上被 /retry 改掉的 checkpoint。读命令不加锁：WAL 下读不阻塞写，
-    它们也不改状态。
-    """
+async def scan_loop(ctx: ListenerContext, lock: asyncio.Lock, backup: BackupService) -> None:
+    """扫描与管理写操作共用锁，防止一轮扫描中途被改动 checkpoint。"""
     last_processed_at = 0.0
-    # 备份计时独立于扫描：首启动即视为「刚备份过」，避免每次重启都立刻备份
-    backup_state = {"last_backup_at": time.time()}
+    # 重启视为刚备份过，避免频繁重启触发连续快照。
+    last_backup_at = time.time()
 
     while True:
         try:
             elapsed = time.time() - last_processed_at
-            if elapsed < SCAN_INTERVAL_SECONDS:
-                wait = SCAN_INTERVAL_SECONDS - elapsed
+            if elapsed < ctx.scan.interval_seconds:
+                wait = ctx.scan.interval_seconds - elapsed
                 logger.debug("冷却中，%.0fs 后扫描", wait)
                 await asyncio.sleep(wait)
 
             async with lock:
                 n = await scan_once(ctx)
-                # 备份闸门也放进锁内：它与 bot 的 /backup 共用 BACKUP_DIR 与快照命名，
-                # 两个 VACUUM INTO 没必要同时跑。代价是备份上传期间 bot 写命令要等它，
-                # 而下一轮扫描本来就在等（同一个 task）
-                await _maybe_backup(ctx, time.time(), backup_state)
+                # 自动与手动备份共用目录，锁内执行避免保留策略互相干扰。
+                last_backup_at = await backup.maybe_run(time.time(), last_backup_at)
 
-            # 心跳：scan_once 返回后无条件写，空闲轮也写。写在这里而不进
-            # scan_once，保持后者只管「扫描 + checkpoint」的职责边界
-            _write_heartbeat(time.time())
+            # 空闲轮也写心跳，避免把没有新消息误判为进程失活。
+            _write_heartbeat(ctx.scan.heartbeat_path, time.time())
             if n > 0:
                 last_processed_at = time.time()
 
             if n == 0:
-                logger.debug("无新消息，%ss 后再查", SCAN_INTERVAL_SECONDS)
-                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                logger.debug("无新消息，%ss 后再查", ctx.scan.interval_seconds)
+                await asyncio.sleep(ctx.scan.interval_seconds)
         except Exception:
             logger.exception("本轮扫描出错")
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+            await asyncio.sleep(ctx.scan.interval_seconds)
 
 
-async def _serve_bot(bot: Client, ctx: ListenerContext, lock: asyncio.Lock) -> None:
-    """
-    bot Client 与扫描循环并存：bot 的 dispatcher 由 Kurigram 自己起后台 task 驱动，
-    扫描协程充当进程存活锚点。两者同一个事件循环、共用同一个 ArchiveDB。
-    """
+async def _serve_bot(bot: Client, ctx: ListenerContext, lock: asyncio.Lock,
+                     backup: BackupService, admin_ids: frozenset[int]) -> None:
+    """Kurigram 自行驱动 bot dispatcher，扫描循环维持进程存活。"""
     async with bot:
         # handler 在 client.start() 之后再挂：dispatcher 那时才在跑
         register_handlers(bot, BotContext(
             operations=AdminOperations(ctx.db, lock),
-            admin_ids=BOT_ADMIN_IDS,
-            run_backup=lambda: _run_backup(ctx, time.time()),
+            admin_ids=admin_ids,
+            run_backup=lambda: backup.run(time.time()),
             pending=PendingStore(),
             pending_clear=PendingStore(),
         ))
         await register_command_menu(bot)
         logger.info("bot 命令已启用，admin 白名单：%s",
-                    ", ".join(str(i) for i in sorted(BOT_ADMIN_IDS)) or "（空——谁都不授权）")
-        await scan_loop(ctx, lock)
+                    ", ".join(str(i) for i in sorted(admin_ids)) or "（空——谁都不授权）")
+        await scan_loop(ctx, lock, backup)
 
 
 async def main():
@@ -714,25 +282,25 @@ async def main():
         logger.error("ffmpeg/ffprobe 未安装，退出")
         sys.exit(1)
 
-    ctx = _build_context()
-    # 写命令（bot 的 /retry、/backup）与扫描轮共用这一把锁。不做模块级全局：
-    # 与其余依赖一样在这里造、注入给两侧
+    config = load_config()
+    runtime = build_runtime(config, mark_processed)
+    ctx = ListenerContext(runtime.client, runtime.db, runtime.pipeline,
+                          config.receive_chat, config.scan)
+    # 同一把锁注入扫描和 bot，避免两侧各自加锁却无法互斥。
     db_lock = asyncio.Lock()
-    # bot Client 与 userbot 复用同一对 API 凭证（同一个 app），bot_token 只是登录方式
-    bot_client = _build_bot_client(int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+    bot_client = runtime.bot
 
     async with ctx.client:
         ctx.db.ensure_channel(ctx.receive_chat, "manual_forward")
         me = await ctx.client.get_me()
-        logger.info("已登录：%s (id=%s)，冷却间隔 %ss", me.first_name, me.id, SCAN_INTERVAL_SECONDS)
+        logger.info("已登录：%s (id=%s)，冷却间隔 %ss", me.first_name, me.id, ctx.scan.interval_seconds)
 
-        # 未设 TG_BOT_TOKEN：形态与加 bot 之前完全一致，只有扫描循环
         if bot_client is None:
             logger.info("未设 TG_BOT_TOKEN，bot 命令关闭")
-            await scan_loop(ctx, db_lock)
+            await scan_loop(ctx, db_lock, runtime.backup)
             return
 
-        await _serve_bot(bot_client, ctx, db_lock)
+        await _serve_bot(bot_client, ctx, db_lock, runtime.backup, config.admin_ids)
 
 
 if __name__ == "__main__":

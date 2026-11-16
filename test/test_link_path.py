@@ -8,43 +8,43 @@
 import asyncio
 from types import SimpleNamespace
 
-import listener
+import links
 import pytest
 from archive_entry import ROUTE_LINK, Entry, Outcome
 
 
 class TestExtractTmeLinks:
     def test_no_link_returns_empty(self):
-        assert listener.extract_tme_links("今天天气不错，没有链接") == []
+        assert links.extract_tme_links("今天天气不错，没有链接") == []
 
     def test_empty_text_returns_empty(self):
-        assert listener.extract_tme_links("") == []
+        assert links.extract_tme_links("") == []
 
     def test_plain_link(self):
-        assert listener.extract_tme_links(
+        assert links.extract_tme_links(
             "https://t.me/c/123456/78") == ["https://t.me/c/123456/78"]
 
     def test_strips_trailing_ascii_punctuation(self):
         """尾随的半角句读不是链接的一部分"""
         for punct in (".", ",", ";", ":", "!", "?", ")"):
-            assert listener.extract_tme_links(
+            assert links.extract_tme_links(
                 f"看这个 https://t.me/c/123456/78{punct}") == ["https://t.me/c/123456/78"]
 
     def test_markdown_wrapped_link(self):
-        assert listener.extract_tme_links(
+        assert links.extract_tme_links(
             "见 [这条](https://t.me/somechannel/12)") == ["https://t.me/somechannel/12"]
 
     def test_duplicate_links_collapse_and_keep_order(self):
         text = ("https://t.me/a/1 中间 https://t.me/b/2 又是 https://t.me/a/1")
-        assert listener.extract_tme_links(text) == ["https://t.me/a/1", "https://t.me/b/2"]
+        assert links.extract_tme_links(text) == ["https://t.me/a/1", "https://t.me/b/2"]
 
     def test_http_and_https_both_match(self):
-        assert listener.extract_tme_links("http://t.me/a/1 https://t.me/b/2") == [
+        assert links.extract_tme_links("http://t.me/a/1 https://t.me/b/2") == [
             "http://t.me/a/1", "https://t.me/b/2"]
 
     def test_query_string_is_kept_for_parse_to_strip(self):
         """?single 留给 parse_message_link 去掉 —— 提取阶段不该猜它的语义"""
-        assert listener.extract_tme_links(
+        assert links.extract_tme_links(
             "https://t.me/c/1/2?single") == ["https://t.me/c/1/2?single"]
 
     def test_strips_trailing_fullwidth_punctuation(self):
@@ -55,12 +55,12 @@ class TestExtractTmeLinks:
         那条媒体永久不被归档且无告警（checkpoint 照常推进）。
         """
         for punct in ("。", "，", "、", "；", "：", "！", "？", "）", "】", "》", "」", "』"):
-            assert listener.extract_tme_links(
+            assert links.extract_tme_links(
                 f"看这个 https://t.me/c/123456/78{punct}") == ["https://t.me/c/123456/78"]
 
     def test_strips_bracket_and_angle_wrappers(self):
-        assert listener.extract_tme_links("<https://t.me/a/1>") == ["https://t.me/a/1"]
-        assert listener.extract_tme_links("[https://t.me/a/1]") == ["https://t.me/a/1"]
+        assert links.extract_tme_links("<https://t.me/a/1>") == ["https://t.me/a/1"]
+        assert links.extract_tme_links("[https://t.me/a/1]") == ["https://t.me/a/1"]
 
 
 class TestParseMessageLink:
@@ -75,39 +75,39 @@ class TestParseMessageLink:
     """
 
     def test_private_channel_chat_is_int(self):
-        assert listener.parse_message_link("https://t.me/c/2680051096/413") == (
+        assert links.parse_message_link("https://t.me/c/2680051096/413") == (
             -1002680051096, 413)
 
     def test_private_channel_chat_is_not_str(self):
-        chat, _ = listener.parse_message_link("https://t.me/c/123456/78")
+        chat, _ = links.parse_message_link("https://t.me/c/123456/78")
         assert isinstance(chat, int), "字符串 chat 会被 resolve_peer 当成电话号码"
 
     def test_username_chat_stays_str(self):
         """公开频道靠用户名解析，int 化没有意义"""
-        assert listener.parse_message_link("https://t.me/somechannel/12") == (
+        assert links.parse_message_link("https://t.me/somechannel/12") == (
             "@somechannel", 12)
 
     def test_query_string_and_trailing_slash_are_stripped(self):
-        assert listener.parse_message_link("https://t.me/c/123456/78?single") == (
+        assert links.parse_message_link("https://t.me/c/123456/78?single") == (
             -100123456, 78)
-        assert listener.parse_message_link("https://t.me/somechannel/12/") == (
+        assert links.parse_message_link("https://t.me/somechannel/12/") == (
             "@somechannel", 12)
 
     def test_unparseable_link_raises(self):
         with pytest.raises(ValueError):
-            listener.parse_message_link("https://t.me/joinchat/AbCdEf")
+            links.parse_message_link("https://t.me/joinchat/AbCdEf")
 
 
 class TestMarkedLinkText:
     """归档标记跟在原文末尾，截断只砍原文。"""
 
     def test_mark_goes_after_the_text(self):
-        assert listener.marked_link_text("https://t.me/c/1/2") == (
+        assert links.marked_link_text("https://t.me/c/1/2") == (
             "https://t.me/c/1/2\n✅ 已归档")
 
     def test_long_text_keeps_the_mark(self):
         """整条 [:4096] 砍掉的正好是末尾那行标记，入口会看着像没归档"""
-        marked = listener.marked_link_text("补" * 5000)
+        marked = links.marked_link_text("补" * 5000)
 
         assert len(marked) == 4096
         assert marked.endswith("\n✅ 已归档")
@@ -181,18 +181,11 @@ class FakePipeline:
         return [self._outcome(it) for it in items]
 
 
-def _ctx(client, pipeline):
-    """db 给空桩：路径二不碰 DB，碰了就是 AttributeError（正是想要的）。"""
-    return listener.ListenerContext(client=client, db=SimpleNamespace(),
-                                   pipeline=pipeline, receive_chat=-1001234567890,
-                                   archive_chat=-1009876543210)
-
-
 def _run(client, text, pipeline=None):
     """跑一遍 process_link_message，返回 (入口, 结论列表)。"""
     pipeline = pipeline if pipeline is not None else FakePipeline()
     entry = Entry(message=_link_msg(text), route=ROUTE_LINK)
-    outcomes = asyncio.run(listener.process_link_message(_ctx(client, pipeline), entry))
+    outcomes = asyncio.run(links.process_link_message(client, pipeline, entry))
     return entry, outcomes
 
 
@@ -374,13 +367,13 @@ class TestEntryText:
         for msg in (self._msg(text="看 https://t.me/c/1/2"),
                     self._msg(caption="看 https://t.me/c/1/2"),
                     self._msg(text="", caption="https://t.me/abc/9")):
-            assert listener._has_tme_link(msg) is True
-            assert listener.extract_tme_links(listener.entry_text(msg)), (
+            assert links.has_tme_link(msg) is True
+            assert links.extract_tme_links(links.entry_text(msg)), (
                 "检测到链接却提取不出来")
 
     def test_no_link_detected_for_plain_text(self):
-        assert listener._has_tme_link(self._msg(text="今天天气不错")) is False
-        assert listener._has_tme_link(self._msg()) is False
+        assert links.has_tme_link(self._msg(text="今天天气不错")) is False
+        assert links.has_tme_link(self._msg()) is False
 
     def test_text_wins_over_caption(self):
-        assert listener.entry_text(self._msg(text="正文", caption="说明")) == "正文"
+        assert links.entry_text(self._msg(text="正文", caption="说明")) == "正文"

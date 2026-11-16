@@ -16,7 +16,6 @@ from bot_commands import (
     BotContext,
     handle_callback,
     handle_message,
-    parse_admin_ids,
     parse_callback,
     parse_command,
     parse_delete_args,
@@ -25,6 +24,7 @@ from bot_commands import (
 from bot_pending import PendingStore
 from bot_views import format_delete_preview, format_purge
 from db import ClearSummary, PurgeSummary, RetrySummary, Stats
+from runtime_config import parse_admin_ids
 
 ADMIN = 111
 

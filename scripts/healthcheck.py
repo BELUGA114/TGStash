@@ -14,7 +14,7 @@ listener 每轮循环无条件写一次心跳（epoch 秒）；本脚本读它�
 import os
 import sys
 
-# 与 listener.HEARTBEAT_PATH 同一约定。healthcheck 是独立进程，不 import listener
+# 与 runtime_config 的心跳路径保持一致；独立探活进程不装配归档依赖。
 # （那会连带触发它的模块级导入），只共享这条路径约定
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 HEARTBEAT_PATH = os.path.join(DATA_DIR, "tmp", "heartbeat")

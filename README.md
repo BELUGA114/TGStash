@@ -161,13 +161,30 @@ python -m pytest
 ## 目录结构
 
 ```
-├── stash-listener/    # 主服务（listener/pipeline/media_ops/archive_entry/tdl_downloader/compress_video/origin/login/search/db）
-├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata）
+├── stash-listener/    # 主服务
+├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata/retry_skipped/healthcheck）
 ├── test/              # pytest 用例与共用 fixture（conftest.py）
 ├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
 ├── .env.example       # 配置模板
 └── docker-compose.yml
 ```
+
+主服务按职责分模块，修改时可从对应入口开始：
+
+| 模块 | 职责 |
+| --- | --- |
+| `listener.py` | 扫描、按入口结算失败账、推进 checkpoint、运行两种 Client |
+| `runtime_config.py` / `bootstrap.py` | 启动时读取配置、装配 Client/DB/管道/备份依赖 |
+| `links.py` | t.me 链接解析、获取与归档，结果交给 listener 结算 |
+| `backups.py` | 数据库快照、保留策略、可选上传与自动备份间隔 |
+| `bot_commands.py` / `bot_views.py` | bot 鉴权、命令与按钮交互、回复格式 |
+| `admin_operations.py` / `bot_pending.py` | 管理写操作、删除确认复核、确认载荷生命周期 |
+| `pipeline.py` / `archive_entry.py` | 归档管道与入口、条目、结果数据 |
+| `media_ops.py` / `compress_video.py` / `tdl_downloader.py` | 媒体处理与下载 |
+| `db.py` / `origin.py` / `search.py` | 原子写库与迁移、来源归一化、搜索 |
+
+管理写操作与扫描共用一把锁。删除确认在拿锁后复核实际回退范围，数据库写入保持原子事务；
+归档管道只返回结果，checkpoint 只在 listener 的结算检查后推进。
 
 ## 许可证
 

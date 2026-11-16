@@ -5,14 +5,22 @@ import pytest
 
 
 @pytest.fixture
-def make_pipeline(tmp_path):
-    """
-    按需组装 ArchivePipeline：只传要断言的依赖，其余给不会被调用的空桩。
+def runtime_config(tmp_path, monkeypatch):
+    from runtime_config import load_config
 
-    PipelineConfig 构造时必填的四个值（冷却、压缩阈值、CRF、编码线程数）在这里给测试
-    默认值；生产的真相只有一处：listener.py 读环境变量那一段。冷却默认 0：测试不该真的
-    睡 5 秒，要验证冷却本身就显式传值。
-    """
+    for name, value in {
+        "TG_API_ID": "12345", "TG_API_HASH": "hash",
+        "RECEIVE_CHAT_ID": "-1001234567890", "ARCHIVE_CHAT_ID": "-1009876543210",
+        "DATA_DIR": str(tmp_path), "TG_BOT_TOKEN": "", "BOT_ADMIN_IDS": "",
+        "HTTP_PROXY": "",
+    }.items():
+        monkeypatch.setenv(name, value)
+    return load_config()
+
+
+@pytest.fixture
+def make_pipeline(tmp_path):
+    """测试冷却默认 0，避免真的等待；生产默认值只在 runtime_config.load_config 定义。"""
     from pipeline import ArchivePipeline, PipelineConfig
 
     async def _noop_mark(message, duplicate):
@@ -22,7 +30,6 @@ def make_pipeline(tmp_path):
               download_dir=None, archive_chat=-1009876543210,
               receive_chat=-1001234567890, **config_kwargs):
         config_kwargs.setdefault("upload_cooldown_seconds", 0)
-        # 生产默认值在 listener 那边（环境变量）；这里只给测试一个够用的值
         config_kwargs.setdefault("video_compress_min_size_mb", 100)
         config_kwargs.setdefault("video_compress_crf", 28)
         config_kwargs.setdefault("video_compress_threads", 4)

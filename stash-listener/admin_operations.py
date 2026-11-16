@@ -30,7 +30,6 @@ class PendingClearAll:
 
 
 class DeletePreview(NamedTuple):
-
     rows: list
     missing: list[int]
     rollback: bool
@@ -84,7 +83,6 @@ class AdminOperations:
                 if new_cp < old_cp:
                     cp_changes.append((c, old_cp, new_cp))
         return DeletePreview(rows, missing, rollback, cp_changes, cleared)
-
 
     async def confirm_delete(self, payload: PendingDelete) -> PurgeSummary:
         async with self.lock:

@@ -12,6 +12,7 @@ import listener
 import pytest
 from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
 from db import SCHEMA, ArchiveDB
+from runtime_config import ScanConfig
 
 
 @pytest.fixture
@@ -135,14 +136,14 @@ async def _noop_mark(*a, **k):
 
 
 def _ctx(db=None, *, client=None, pipeline=None, receive_chat=-1001234567890,
-         archive_chat=-1009876543210):
+         retry_max_attempts=3):
     """按需组装 ListenerContext：没传的给空桩，被意外调用会 AttributeError。"""
     return listener.ListenerContext(
         client=client if client is not None else SimpleNamespace(),
         db=db if db is not None else SimpleNamespace(),
         pipeline=pipeline if pipeline is not None else SimpleNamespace(),
         receive_chat=receive_chat,
-        archive_chat=archive_chat,
+        scan=ScanConfig(300, 10, retry_max_attempts, ""),
     )
 
 
@@ -173,7 +174,6 @@ class TestRecordFailure:
     def test_record_failure_at_max_skips(self, db: ArchiveDB, monkeypatch):
         """满 RETRY_MAX_ATTEMPTS：标记 skipped + 告警，返回 skip"""
         sent = []
-        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 3)
         ctx = _ctx(db, client=_sender(sent))
 
         entry = _entry(42)
@@ -191,8 +191,7 @@ class TestRecordFailure:
     def test_record_failure_midway_no_extra_alert(self, db: ArchiveDB, monkeypatch):
         """中间轮次不再告警（只首次和满 N 轮各一条）"""
         sent = []
-        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 5)
-        ctx = _ctx(db, client=_sender(sent))
+        ctx = _ctx(db, client=_sender(sent), retry_max_attempts=5)
 
         entry = _entry(42)
         for _ in range(3):
@@ -294,7 +293,6 @@ class TestSettle:
     def test_any_failure_records_once(self, db: ArchiveDB, monkeypatch):
         """一个入口多个条目：只记一次失败，不是每个失败条目记一次"""
         sent = []
-        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 3)
 
         entry = _entry(300, ROUTE_LINK)
         outcomes = [
@@ -321,13 +319,12 @@ class TestSettle:
 
     def test_skip_at_max_counts_as_settled(self, db: ArchiveDB, monkeypatch):
         """满 RETRY_MAX_ATTEMPTS 后算已结清，checkpoint 可以推进"""
-        monkeypatch.setattr(listener, "RETRY_MAX_ATTEMPTS", 2)
 
         db.increment_failure("-1001234567890", 100, "download", "第一轮")
         outcome = Outcome.failure(_item(100, _entry(100)), "download", "第二轮")
 
         assert asyncio.run(listener._settle_all(
-            _ctx(db, client=_sender([])), [outcome])) is True
+            _ctx(db, client=_sender([]), retry_max_attempts=2), [outcome])) is True
         assert db.get_failure("-1001234567890", 100)["status"] == "skipped"
 
     def test_separate_entries_settle_separately(self, db: ArchiveDB):
@@ -428,7 +425,7 @@ class TestScanOnceCheckpoint:
         )
         monkeypatch.setattr(listener, "alert_failure", _noop_mark)
 
-        async def fake_process_link(ctx, entry):
+        async def fake_process_link(client, pipeline, entry):
             return [Outcome.failure(_item(42, entry), "download", "err")]
 
         monkeypatch.setattr(listener, "process_link_message", fake_process_link)
@@ -616,10 +613,10 @@ class TestScanOnceEntryBoundary:
     def test_entry_exception_skips_after_max_attempts(self, db: ArchiveDB):
         """满 N 轮后标 skipped 并放行 checkpoint —— 否则这个入口永久卡住整个扫描"""
         db.ensure_channel(-1001234567890, "manual_forward")
-        for _ in range(listener.RETRY_MAX_ATTEMPTS - 1):
-            db.increment_failure("-1001234567890", 41, "process", "上几轮也失败")
         ctx = self._ctx_with_raising_group(
             db, ValueError("还是取不到"), [], [_group_message(41)])
+        for _ in range(ctx.scan.retry_max_attempts - 1):
+            db.increment_failure("-1001234567890", 41, "process", "上几轮也失败")
 
         asyncio.run(listener.scan_once(ctx))
 
@@ -656,4 +653,4 @@ class TestScanOnceHistoryBound:
         )
 
         assert asyncio.run(listener.scan_once(ctx)) == 0  # 全是非媒体消息
-        assert len(yielded) <= listener.BATCH_SIZE + 1, f"多拉了 {len(yielded)} 条"
+        assert len(yielded) <= ctx.scan.batch_size + 1, f"多拉了 {len(yielded)} 条"

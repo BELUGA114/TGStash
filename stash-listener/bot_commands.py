@@ -53,18 +53,6 @@ CommandHandler = Callable[[BotContext, Message, list[str]], Awaitable[None]]
 CallbackHandler = Callable[[BotContext, CallbackQuery, str], Awaitable[None]]
 
 
-def parse_admin_ids(raw: str) -> frozenset[int]:
-    """漏配白名单时拒绝所有用户；单个非法 id 不应阻止归档服务启动。"""
-    ids: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.add(int(part))
-        except ValueError:
-            logger.warning("BOT_ADMIN_IDS 里的 %r 不是整数，已忽略", part)
-    return frozenset(ids)
 
 
 def parse_command(text: str | None) -> tuple[str, list[str]] | None:

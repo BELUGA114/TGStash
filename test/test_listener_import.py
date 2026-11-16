@@ -25,6 +25,7 @@ def test_import_needs_no_env_and_touches_no_disk(tmp_path):
     env = {k: v for k, v in os.environ.items()
            if k not in ("TG_API_ID", "TG_API_HASH", "RECEIVE_CHAT_ID", "ARCHIVE_CHAT_ID")}
     env["DATA_DIR"] = str(data_dir)
+    env["BATCH_SIZE"] = "invalid-until-startup"
     env["PYTHONPATH"] = str(REPO_ROOT / "stash-listener")
 
     proc = subprocess.run([sys.executable, "-c", "import listener"],
@@ -35,26 +36,20 @@ def test_import_needs_no_env_and_touches_no_disk(tmp_path):
     assert not data_dir.exists(), "导入期建了目录"
 
 
-def test_build_context_creates_dirs_and_wires_pipeline(tmp_path, monkeypatch):
-    """装配路径本身也要有人看着：目录、库、pipeline 三者必须真的接上。"""
-    import listener
+def test_build_runtime_creates_dirs_and_wires_pipeline(tmp_path, monkeypatch, runtime_config):
+    import bootstrap
 
-    monkeypatch.setenv("TG_API_ID", "12345")
-    monkeypatch.setenv("TG_API_HASH", "hash")
-    monkeypatch.setenv("RECEIVE_CHAT_ID", "-1001234567890")
-    monkeypatch.setenv("ARCHIVE_CHAT_ID", "-1009876543210")
-    monkeypatch.setattr(listener, "SESSION_DIR", str(tmp_path / "session"))
-    monkeypatch.setattr(listener, "DOWNLOAD_DIR", str(tmp_path / "tmp"))
-    monkeypatch.setattr(listener, "DB_PATH", str(tmp_path / "db" / "archive.db"))
-    # BACKUP_DIR 也要改到 tmp：_build_context 会 makedirs 它，漏改就落到默认 /data，
-    # CI 的非 root 用户建不了 /data 直接 PermissionError（本机 Windows 恰好能建才没暴露）
-    monkeypatch.setattr(listener, "BACKUP_DIR", str(tmp_path / "db" / "backups"))
-    monkeypatch.setattr(listener, "_build_client", lambda api_id, api_hash: SimpleNamespace())
+    client = SimpleNamespace()
+    monkeypatch.setattr(bootstrap, "build_client", lambda config, bot=False: None if bot else client)
 
-    ctx = listener._build_context()
+    async def mark(client, message, duplicate):
+        pass
 
-    assert ctx.receive_chat == -1001234567890
-    assert (tmp_path / "session").is_dir() and (tmp_path / "tmp").is_dir()
+    runtime = bootstrap.build_runtime(runtime_config, mark)
+
+    assert runtime_config.receive_chat == -1001234567890
+    assert (tmp_path / "session").is_dir() and (tmp_path / "tmp" / "listener").is_dir()
     assert (tmp_path / "db" / "archive.db").exists()
     assert (tmp_path / "db" / "backups").is_dir()
-    assert ctx.pipeline is not None and ctx.db is not None
+    assert runtime.pipeline is not None and runtime.db is not None
+    assert runtime.client is client and runtime.bot is None
