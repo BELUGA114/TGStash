@@ -11,8 +11,8 @@
 import logging
 import os
 
-from logging_setup import configure_logging
 from pyrogram.client import Client
+from tgstash.runtime.logging_setup import configure_logging
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]

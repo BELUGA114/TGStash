@@ -28,7 +28,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stash-listener"))
-from db import ArchiveDB
+from tgstash.storage.db import ArchiveDB
 
 
 def main():

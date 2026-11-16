@@ -3,9 +3,9 @@
 from types import SimpleNamespace
 
 import pytest
-from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry
-from db import ArchiveDB
-from origin import ORIGIN_LINK
+from tgstash.archive.entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry
+from tgstash.archive.origin import ORIGIN_LINK
+from tgstash.storage.db import ArchiveDB
 
 
 @pytest.fixture
@@ -56,8 +56,8 @@ def _upload(item, sha256, size):
 
     写库不再自己 get_media 推一遍：媒体对象顺着 _PendingUpload 传下来。
     """
-    from media_ops import get_media
-    from pipeline import _PendingUpload
+    from tgstash.archive.pipeline import _PendingUpload
+    from tgstash.media.ops import get_media
 
     kind, media = get_media(item.media)
     return _PendingUpload(item=item, kind=kind, media=media, sha256=sha256, size=size,

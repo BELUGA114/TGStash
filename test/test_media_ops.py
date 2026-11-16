@@ -9,9 +9,9 @@ import os
 import subprocess
 from types import SimpleNamespace
 
-import media_ops
 import pytest
 from PIL import Image
+from tgstash.media import ops as media_ops
 
 
 class TestGetMedia:

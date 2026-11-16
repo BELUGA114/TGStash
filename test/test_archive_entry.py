@@ -4,7 +4,7 @@ import dataclasses
 from types import SimpleNamespace
 
 import pytest
-from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
+from tgstash.archive.entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
 
 
 def _msg(message_id, chat_id=-1001234567890, title="接收频道"):

@@ -1,46 +1,56 @@
-"""镜像冒烟：验证 COPY 清单完整、模块可导入、外部二进制齐备。
+"""递归对照宿主机模块清单，防止镜像漏复制入口或包内模块。"""
 
-用法（CI 里 bind mount 进容器，不进镜像）：
-    docker run --rm -e EXPECTED_MODULES=... \
-      -v $PWD/.github/smoke.py:/smoke.py:ro img python /smoke.py
-"""
+from __future__ import annotations
+
+import argparse
 import importlib
 import importlib.util
 import os
-import pathlib
 import sys
+from pathlib import Path
 
-APP = pathlib.Path("/app")
-sys.path.insert(0, str(APP))  # `python /smoke.py` 的 sys.path[0] 是 /，不是 /app
 
-# 1) 宿主机 stash-listener/*.py 必须全部落进镜像 /app。
-#    直接盯死历史上出过两次的 COPY 漏文件；结构化比对，改成通配 COPY 后依然有效
-expected = [n for n in os.environ["EXPECTED_MODULES"].split(",") if n]
-assert expected, "EXPECTED_MODULES 为空，冒烟脚本没拿到清单"
-missing = sorted(n for n in expected if not (APP / n).is_file())
-assert not missing, f"镜像里缺少模块（Dockerfile COPY 漏了）：{missing}"
+def source_modules() -> list[str]:
+    source = Path(__file__).resolve().parent.parent / "stash-listener"
+    return sorted(path.relative_to(source).as_posix() for path in source.rglob("*.py")
+                  if "__pycache__" not in path.parts)
 
-# 2) 真正 import 一遍，模块级代码必须跑通。
-#    login.py 例外：模块级 `with app:` 会真连 Telegram 并交互式要手机号
-NO_IMPORT = {"login.py"}
-for name in expected:
-    module = name[:-3]
-    if name in NO_IMPORT:
-        assert importlib.util.find_spec(module) is not None, f"{name} 在镜像里找不到"
-        continue
-    importlib.import_module(module)
 
-# 3) 运行时第三方依赖真的装进了 /usr/local（COPY --from=builder /install）
-import pyrogram  # noqa: F401
-from PIL import Image  # noqa: F401
+def verify(app: Path, expected: list[str]) -> None:
+    assert expected, "EXPECTED_MODULES 为空，冒烟脚本没拿到清单"
+    missing = sorted(name for name in expected if not (app / name).is_file())
+    assert not missing, f"镜像里缺少模块（Dockerfile COPY 漏了）：{missing}"
+    sys.path.insert(0, str(app))
 
-assert importlib.util.find_spec("tgcrypto") is not None, "TgCrypto 未装进镜像"
+    for name in expected:
+        parts = Path(name).with_suffix("").parts
+        module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+        # 登录入口会连接 Telegram 并交互，只验证能够定位到文件。
+        if name == "login.py":
+            assert importlib.util.find_spec(module) is not None, f"{name} 在镜像里找不到"
+        else:
+            importlib.import_module(module)
 
-# 4) scripts/ 下的辅助脚本（COPY scripts/ ./scripts/）。
-#    这些脚本自己 sys.path.insert 到 ../stash-listener——容器里模块被拍平到 /app，
-#    那个目录并不存在，靠 PYTHONPATH=/app 才 import 得到 db/origin。真跑一遍才算数
-sys.path.insert(0, str(APP / "scripts"))
-for helper in ("get_chat_ids", "delete_message", "backfill_metadata"):
-    importlib.import_module(helper)
+    importlib.import_module("pyrogram")
+    importlib.import_module("PIL.Image")
+    assert importlib.util.find_spec("tgcrypto") is not None, "TgCrypto 未装进镜像"
 
-print("smoke OK:", ", ".join(expected))
+    sys.path.insert(0, str(app / "scripts"))
+    for helper in ("get_chat_ids", "delete_message", "backfill_metadata", "retry_skipped", "healthcheck"):
+        importlib.import_module(helper)
+    print("smoke OK:", ", ".join(expected))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--app", type=Path, default=Path("/app"))
+    args = parser.parse_args()
+    if args.list:
+        print(",".join(source_modules()))
+        return
+    verify(args.app, [name for name in os.environ["EXPECTED_MODULES"].split(",") if name])
+
+
+if __name__ == "__main__":
+    main()

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from backups import (
+from tgstash.runtime.backups import (
     BackupConfig,
     BackupService,
     backup_filename,

@@ -151,7 +151,9 @@ docker compose run --rm stash-listener python scripts/retry_skipped.py --dry-run
 
 测试使用 pytest，用例都在 `test/`（`pyproject.toml` 里 `testpaths = ["test"]`，被测模块靠 `pythonpath` 指向 `stash-listener/` 与 `scripts/`）
 
-覆盖 `db.py`（schema/迁移/checkpoint/去重/FTS5/并发场景）、`origin.py`（forward_origin 五变体归一化）、归档管道 `pipeline.py`（注入假 client/db/downloader，覆盖媒体组拆组上传、`PhotoExtInvalid` 回退整组 document、视频元数据三层回退、临时产物命名）、`media_ops.py`（格式修正与 ffprobe/ffmpeg 失败回退）、入口/来源写入路径、失败重试与 checkpoint 推进、回填决策逻辑，以及 `tdl_downloader.py`（注入假 runner，不连接 Telegram）
+测试覆盖数据库事务与迁移、去重与搜索、来源归一化、单条及媒体组归档、媒体处理回退、
+失败结算与 checkpoint、管理操作确认、配置装配与备份。Telegram Client 与下载器使用注入的桩，
+测试不连接 Telegram。
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -161,7 +163,14 @@ python -m pytest
 ## 目录结构
 
 ```
-├── stash-listener/    # 主服务
+├── stash-listener/
+│   ├── tgstash/
+│   │   ├── archive/   # ArchivePipeline、Entry/ArchiveItem/Outcome 与链接归档
+│   │   ├── storage/   # ArchiveDB、迁移与搜索
+│   │   ├── media/     # TDLDownloader 与媒体处理
+│   │   ├── bot/       # AdminOperations、PendingStore 与命令交互
+│   │   └── runtime/   # Runtime、配置、BackupService 与扫描生命周期
+│   └── *.py          # listener/search/login 命令行入口
 ├── scripts/           # 辅助脚本（get_chat_ids/delete_message/backfill_metadata/retry_skipped/healthcheck）
 ├── test/              # pytest 用例与共用 fixture（conftest.py）
 ├── data/              # 运行时（session/tdl-session/db/tmp，需持久化 db/）
@@ -169,19 +178,19 @@ python -m pytest
 └── docker-compose.yml
 ```
 
-主服务按职责分模块，修改时可从对应入口开始：
+主服务按职责分模块，以下路径相对于 `stash-listener/tgstash/`：
 
 | 模块 | 职责 |
 | --- | --- |
-| `listener.py` | 扫描、按入口结算失败账、推进 checkpoint、运行两种 Client |
-| `runtime_config.py` / `bootstrap.py` | 启动时读取配置、装配 Client/DB/管道/备份依赖 |
-| `links.py` | t.me 链接解析、获取与归档，结果交给 listener 结算 |
-| `backups.py` | 数据库快照、保留策略、可选上传与自动备份间隔 |
-| `bot_commands.py` / `bot_views.py` | bot 鉴权、命令与按钮交互、回复格式 |
-| `admin_operations.py` / `bot_pending.py` | 管理写操作、删除确认复核、确认载荷生命周期 |
-| `pipeline.py` / `archive_entry.py` | 归档管道与入口、条目、结果数据 |
-| `media_ops.py` / `compress_video.py` / `tdl_downloader.py` | 媒体处理与下载 |
-| `db.py` / `origin.py` / `search.py` | 原子写库与迁移、来源归一化、搜索 |
+| `runtime/listener.py` | 扫描、按入口结算失败账、推进 checkpoint、运行两种 Client |
+| `runtime/config.py` / `runtime/bootstrap.py` | 启动时读取配置、装配 Client/DB/管道/备份依赖 |
+| `archive/links.py` | t.me 链接解析、获取与归档，结果交给 listener 结算 |
+| `runtime/backups.py` | 数据库快照、保留策略、可选上传与自动备份间隔 |
+| `bot/commands.py` / `bot/views.py` | bot 鉴权、命令与按钮交互、回复格式 |
+| `bot/operations.py` / `bot/pending.py` | 管理写操作、删除确认复核、确认载荷生命周期 |
+| `archive/pipeline.py` / `archive/entry.py` | 归档管道与入口、条目、结果数据 |
+| `media/ops.py` / `media/compression.py` / `media/downloader.py` | 媒体处理与下载 |
+| `storage/db.py` / `archive/origin.py` / `storage/search.py` | 原子写库与迁移、来源归一化、搜索 |
 
 管理写操作与扫描共用一把锁。删除确认在拿锁后复核实际回退范围，数据库写入保持原子事务；
 归档管道只返回结果，checkpoint 只在 listener 的结算检查后推进。

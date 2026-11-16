@@ -8,11 +8,11 @@ import os
 import tempfile
 from types import SimpleNamespace
 
-import listener
 import pytest
-from archive_entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
-from db import SCHEMA, ArchiveDB
-from runtime_config import ScanConfig
+from tgstash.archive.entry import ROUTE_FORWARD, ROUTE_LINK, ArchiveItem, Entry, Outcome
+from tgstash.runtime import listener
+from tgstash.runtime.config import ScanConfig
+from tgstash.storage.db import SCHEMA, ArchiveDB
 
 
 @pytest.fixture

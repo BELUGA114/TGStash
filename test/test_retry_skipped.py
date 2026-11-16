@@ -1,6 +1,6 @@
 """设计 B：retry_skipped 脚本编排测试。"""
 import retry_skipped
-from db import ArchiveDB
+from tgstash.storage.db import ArchiveDB
 
 CHAT = "-1001234567890"
 

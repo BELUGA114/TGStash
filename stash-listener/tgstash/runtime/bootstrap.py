@@ -8,13 +8,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from backups import BackupService
-from db import ArchiveDB
-from pipeline import ArchivePipeline
 from pyrogram.client import Client
 from pyrogram.types import Message
-from runtime_config import RuntimeConfig
-from tdl_downloader import TDLDownloader
+
+from tgstash.archive.pipeline import ArchivePipeline
+from tgstash.media.downloader import TDLDownloader
+from tgstash.runtime.backups import BackupService
+from tgstash.runtime.config import RuntimeConfig
+from tgstash.storage.db import ArchiveDB
 
 
 @dataclass(frozen=True)

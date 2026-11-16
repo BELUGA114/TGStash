@@ -59,7 +59,7 @@ jobs:
       - name: Python 模块导入冒烟
         run: |
           set -euo pipefail
-          EXPECTED=$(cd stash-listener && modules=(*.py) && IFS=, && echo "${modules[*]}")
+          EXPECTED=$(python .github/smoke.py --list)
           echo "期望模块：$EXPECTED"
           docker run --rm \
             -e EXPECTED_MODULES="$EXPECTED" \
@@ -71,6 +71,5 @@ jobs:
             tgstash:smoke python /smoke.py
 
       - name: 辅助脚本在容器里可用
-        # 依赖 ENV PYTHONPATH=/app：镜像里模块拍平到 /app，而
-        # delete_message.py 插入的 ../stash-listener 在容器里不存在
+        # 运维脚本从 PYTHONPATH=/app 导入 tgstash，不依赖宿主机目录结构。
         run: docker run --rm tgstash:smoke python scripts/delete_message.py --help

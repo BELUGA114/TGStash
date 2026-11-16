@@ -14,12 +14,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple, Protocol
 
-import media_ops
-from archive_entry import ROUTE_FORWARD, ArchiveItem, Outcome
-from compress_video import maybe_compress_video
-from db import ArchiveDB
-from media_ops import MediaKind
-from origin import normalize_origin, origin_from_link
 from pyrogram.client import Client
 from pyrogram.errors import PhotoExtInvalid
 from pyrogram.types import (
@@ -29,6 +23,13 @@ from pyrogram.types import (
     InputMediaVideo,
     Message,
 )
+
+from tgstash.archive.entry import ROUTE_FORWARD, ArchiveItem, Outcome
+from tgstash.archive.origin import normalize_origin, origin_from_link
+from tgstash.media import ops as media_ops
+from tgstash.media.compression import maybe_compress_video
+from tgstash.media.ops import MediaKind
+from tgstash.storage.db import ArchiveDB
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ MarkProcessed = Callable[[Message, bool], Awaitable[None]]
 class PipelineConfig:
     """
     冷却、压缩阈值、CRF 与线程数必须显式注入，避免生产默认值多处定义。
-    环境变量及默认值由 runtime_config.py 管理；测试由 make_pipeline 提供。
+    环境变量及默认值由 runtime/config.py 管理；测试由 make_pipeline 提供。
     """
 
     upload_cooldown_seconds: int

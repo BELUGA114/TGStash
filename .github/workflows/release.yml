@@ -73,7 +73,7 @@ jobs:
       - name: Python 模块导入冒烟
         run: |
           set -euo pipefail
-          EXPECTED=$(cd stash-listener && modules=(*.py) && IFS=, && echo "${modules[*]}")
+          EXPECTED=$(python .github/smoke.py --list)
           echo "期望模块：$EXPECTED"
           docker run --rm \
             -e EXPECTED_MODULES="$EXPECTED" \

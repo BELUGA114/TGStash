@@ -33,7 +33,7 @@ def test_threshold_boundary(span):
 
 def _seed(tmp_path, *, entry_id=300, chat="-1001234567890"):
     """建一个只有「入口 entry_id 归档过一次、且留了失败账」的库。"""
-    from db import ArchiveDB
+    from tgstash.storage.db import ArchiveDB
 
     path = str(tmp_path / "archive.db")
     db = ArchiveDB(path)
@@ -93,7 +93,7 @@ def test_purge_is_atomic_on_failure(tmp_path, monkeypatch):
     """
     _path, db = _seed(tmp_path)
 
-    import db as db_module
+    from tgstash.storage import db as db_module
 
     # _now 在 checkpoint 回退（最后一步）才被调用：patch 它让删除全部生效后事务崩掉
     def boom():

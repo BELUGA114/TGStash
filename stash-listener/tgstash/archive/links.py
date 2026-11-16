@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import re
 
-from archive_entry import ArchiveItem, Entry, Outcome
-from media_ops import get_media
-from pipeline import ArchivePipeline
 from pyrogram.client import Client
 from pyrogram.types import Message
+
+from tgstash.archive.entry import ArchiveItem, Entry, Outcome
+from tgstash.archive.pipeline import ArchivePipeline
+from tgstash.media.ops import get_media
 
 logger = logging.getLogger(__name__)
 

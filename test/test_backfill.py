@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from backfill_metadata import plan_updates
-from db import ArchiveDB
+from tgstash.storage.db import ArchiveDB
 
 
 @pytest.fixture

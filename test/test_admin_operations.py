@@ -4,7 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from admin_operations import AdminOperations, DeleteStateChanged, PendingDelete
+from tgstash.bot.operations import AdminOperations, DeleteStateChanged, PendingDelete
 
 
 def test_delete_rechecks_checkpoint_after_waiting_for_scan():

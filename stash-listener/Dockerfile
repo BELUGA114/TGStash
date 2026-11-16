@@ -22,10 +22,9 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY --from=tdl /usr/bin/tdl /usr/local/bin/tdl
 COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
-# 模块被拍平到 /app，scripts/ 下的脚本靠 PYTHONPATH 才能 import 到 db 等模块
+# 独立运维脚本也需从 /app 导入 tgstash 包。
 ENV PYTHONPATH=/app
-# 通配而非逐个列举：历史上两次漏文件导致容器启动 ModuleNotFoundError。
-# .dockerignore 已排除 __pycache__/ 和 *.pyc
 COPY stash-listener/*.py ./
+COPY stash-listener/tgstash/ ./tgstash/
 COPY scripts/ ./scripts/
 CMD ["python", "-u", "listener.py"]

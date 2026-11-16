@@ -7,7 +7,7 @@ import asyncio
 import os
 from types import SimpleNamespace
 
-from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
+from tgstash.archive.entry import ROUTE_FORWARD, ArchiveItem, Entry
 
 
 def msg_stub(msg_id, kind: str | None = "document", *, chat_id=-1001234567890, caption="",
@@ -156,7 +156,7 @@ class TestDownloadNameSanitizing:
     """回归：file_name 由上传者控制，回退下载的落点必须留在 msg_dir 内。"""
 
     def test_safe_dl_name_keeps_only_the_last_segment(self):
-        from pipeline import _safe_dl_name
+        from tgstash.archive.pipeline import _safe_dl_name
 
         assert _safe_dl_name("photo.jpg") == "photo.jpg"
         assert _safe_dl_name("../../../db/archive.db") == "archive.db"
@@ -199,7 +199,7 @@ class TestThumbnailPath:
         修复前 thumb_dir 传的是 msg_dir，而 tdl 命中时 msg_dir 已被 rmdir，
         ffmpeg 写不进去 —— 四档画质白跑一轮，媒体组视频永远没有缩略图。
         """
-        import media_ops
+        from tgstash.media import ops as media_ops
 
         thumb_calls = []
 
@@ -350,7 +350,7 @@ class TestGroupUploadShapes:
 
 class TestVideoMetadataFallback:
     def _run(self, tmp_path, make_pipeline, monkeypatch, probe_result):
-        import media_ops
+        from tgstash.media import ops as media_ops
 
         client = FakeClient()
         monkeypatch.setattr(media_ops, "probe_video", lambda p: probe_result)
@@ -388,7 +388,7 @@ def test_upload_cooldown_comes_from_config(tmp_path, make_pipeline, monkeypatch)
 
     风控相关，值本身不能改；这里只验证配置真的被用上。
     """
-    import pipeline as pipeline_mod
+    from tgstash.archive import pipeline as pipeline_mod
 
     slept = []
 
@@ -542,7 +542,7 @@ class TestSingleVsGroupDifferences:
         真 fix_media_format 要靠 Pillow 认出 WebP；这里用假的模拟「改名换路径」，
         断言的是管道对返回值的追踪，不是 Pillow。
         """
-        import media_ops
+        from tgstash.media import ops as media_ops
 
         def fake_fix(path, kind):
             new_path = path + ".jpg"
@@ -576,7 +576,7 @@ class TestSingleVsGroupDifferences:
         新契约是「往 temp_files 追加新路径」而不是「替换最后一项」：替换在 ≥2 条的组里
         会把前一条的追踪抹掉（只有一条时 [-1] 恰好是它自己，看不出问题）。
         """
-        import media_ops
+        from tgstash.media import ops as media_ops
 
         def fake_fix(path, kind):
             new_path = path + ".jpg"
@@ -673,7 +673,7 @@ class TestSingleVsGroupDifferences:
     def test_cooldown_once_per_group_but_per_item_when_split(self, tmp_path, make_pipeline,
                                                              monkeypatch):
         """表行 12：打包上传整组只睡一次冷却，拆组每条各睡一次"""
-        import pipeline as pipeline_mod
+        from tgstash.archive import pipeline as pipeline_mod
 
         slept = []
 
@@ -867,7 +867,7 @@ def test_video_thumb_is_tracked_and_cleaned(tmp_path, make_pipeline, monkeypatch
     统一清掉 —— 漏登记的缩略图会永久留在 /data/tmp（下载产物由调用方登记，
     这里钉的是「本条自己造出来的文件也算」那一半）。
     """
-    import media_ops
+    from tgstash.media import ops as media_ops
 
     def fake_make_thumbnail(video_path, thumb_path, timestamp="00:00:01"):
         with open(thumb_path, "wb") as f:
@@ -983,7 +983,7 @@ class TestGroupExceptionBoundary:
         修复前 temp_files 随异常一起丢掉（它是 _process_each 的返回值），
         下载好的文件永久留在 /data/tmp。
         """
-        import media_ops
+        from tgstash.media import ops as media_ops
 
         def boom(path):
             raise OSError("磁盘读挂了")
@@ -1006,7 +1006,7 @@ class TestGroupExceptionBoundary:
         修复前 temp_files 是在 _process_each 的循环体内逐条登记的，还没轮到的
         条目永久留在 batch_dir。
         """
-        import media_ops
+        from tgstash.media import ops as media_ops
 
         def boom(path):
             raise OSError("磁盘读挂了")
@@ -1030,7 +1030,7 @@ def test_single_process_exception_becomes_failure_and_cleans_up(tmp_path, make_p
 
     修复前它冒到 main() 的兜底 except：不计次、不告警，下一轮同样炸。
     """
-    import media_ops
+    from tgstash.media import ops as media_ops
 
     def boom(path):
         raise OSError("磁盘读挂了")
@@ -1074,7 +1074,7 @@ def test_pipeline_config_requires_explicit_values():
     写两遍就会有人改错一边；另三个压缩参数只是调参。
     """
     import pytest
-    from pipeline import PipelineConfig
+    from tgstash.archive.pipeline import PipelineConfig
 
     with pytest.raises(TypeError):
         # 少传就是本用例要断言的事，pyright 的 reportCallIssue 在这一行是预期的
@@ -1091,8 +1091,8 @@ def test_media_kind_vocabulary_matches():
     """
     from typing import get_args
 
-    from media_ops import MEDIA_ATTRS, MediaKind
-    from pipeline import MEDIA_KINDS
+    from tgstash.archive.pipeline import MEDIA_KINDS
+    from tgstash.media.ops import MEDIA_ATTRS, MediaKind
 
     assert set(get_args(MediaKind)) == set(MEDIA_KINDS)
     # MEDIA_ATTRS 直接从 MediaKind 推导，顺序即声明顺序（document 在 video 之前）
@@ -1119,8 +1119,8 @@ class TestVideoNoteUpload:
         """
         import inspect
 
-        from pipeline import MEDIA_KINDS
         from pyrogram.client import Client
+        from tgstash.archive.pipeline import MEDIA_KINDS
 
         for kind, spec in MEDIA_KINDS.items():
             params = inspect.signature(getattr(Client, spec.send_method)).parameters
@@ -1198,7 +1198,7 @@ def test_cleanup_survives_unremovable_entry(tmp_path):
     它只在 finally 里被调用，从那里抛出会顶掉已经算好的 Outcome 并绕过 listener 的
     失败记账与熔断：归档明明成功，结果既没有结论也没记账。
     """
-    from pipeline import _cleanup_temp_files
+    from tgstash.archive.pipeline import _cleanup_temp_files
 
     stuck = tmp_path / "not-a-file"
     stuck.mkdir()  # os.remove 对目录必然抛 OSError

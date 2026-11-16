@@ -7,21 +7,6 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from admin_operations import (
-    AdminOperations,
-    DeleteStateChanged,
-    PendingClearAll,
-    PendingDelete,
-)
-from bot_pending import PendingStore
-from bot_views import (
-    format_delete_preview,
-    format_failures,
-    format_purge,
-    format_retry,
-    format_stats,
-    truncate,
-)
 from pyrogram.client import Client
 from pyrogram.types import (
     BotCommand,
@@ -30,7 +15,23 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from search import format_result
+
+from tgstash.bot.operations import (
+    AdminOperations,
+    DeleteStateChanged,
+    PendingClearAll,
+    PendingDelete,
+)
+from tgstash.bot.pending import PendingStore
+from tgstash.bot.views import (
+    format_delete_preview,
+    format_failures,
+    format_purge,
+    format_retry,
+    format_stats,
+    truncate,
+)
+from tgstash.storage.search import format_result
 
 logger = logging.getLogger(__name__)
 

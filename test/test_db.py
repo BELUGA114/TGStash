@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from db import SCHEMA, SCHEMA_VERSION, ArchiveDB, build_match_query
+from tgstash.storage.db import SCHEMA, SCHEMA_VERSION, ArchiveDB, build_match_query
 
 
 @pytest.fixture
@@ -800,7 +800,7 @@ class TestRecordArchived:
         异常（例如另一个写者占着写锁超过 busy_timeout），下轮重试又会因为
         file_unique_id 命中被当成去重跳过 —— 那条 messages 永远补不上。
         """
-        import db as db_module
+        from tgstash.storage import db as db_module
 
         monkeypatch.setattr(db_module, "_MESSAGES_INSERT",
                             "INSERT INTO messages(没有这一列) VALUES (?)")

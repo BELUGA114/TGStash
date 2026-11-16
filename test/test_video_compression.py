@@ -5,8 +5,8 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import compress_video as cv
-import media_ops
+from tgstash.media import compression as cv
+from tgstash.media import ops as media_ops
 
 
 def test_build_command_has_key_params():
@@ -37,7 +37,7 @@ def test_compress_video_success(tmp_path):
     src = tmp_path / "src.mp4"
     dst = tmp_path / "dst.mp4"
     src.write_bytes(b"fake")
-    with patch("compress_video.subprocess.run") as m_run:
+    with patch("tgstash.media.compression.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 0)
         assert cv.compress_video(str(src), str(dst), crf=28, threads=4) is True
         m_run.assert_called_once()
@@ -50,7 +50,7 @@ def test_compress_video_failure_removes_half_product(tmp_path):
     dst = tmp_path / "dst.mp4"
     src.write_bytes(b"fake")
     dst.write_bytes(b"partial")  # 模拟 ffmpeg 已写出半成品
-    with patch("compress_video.subprocess.run") as m_run:
+    with patch("tgstash.media.compression.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 1)
         assert cv.compress_video(str(src), str(dst), crf=28, threads=4) is False
     assert not dst.exists()  # 半成品被删除
@@ -60,7 +60,7 @@ def test_compress_video_exception_is_caught(tmp_path):
     src = tmp_path / "src.mp4"
     dst = tmp_path / "dst.mp4"
     src.write_bytes(b"fake")
-    with patch("compress_video.subprocess.run", side_effect=FileNotFoundError("ffmpeg 缺失")):
+    with patch("tgstash.media.compression.subprocess.run", side_effect=FileNotFoundError("ffmpeg 缺失")):
         assert cv.compress_video(str(src), str(dst), crf=28, threads=4) is False
     assert not dst.exists()
 
@@ -86,7 +86,7 @@ def _stub_message(msg_id: int) -> object:
 def _run_single_archive(msg, src_video, fake_compress, monkeypatch, make_pipeline,
                         send_assert=None, *, compress_enabled=True, min_size_mb=0):
     """跑一遍 archive_one 视频路径，fake 下载返回 src_video，mock 压缩与上传。"""
-    from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
+    from tgstash.archive.entry import ROUTE_FORWARD, ArchiveItem, Entry
 
     sent = SimpleNamespace(id=7777)  # archive_one 需要 sent.id 落库
 
@@ -207,7 +207,7 @@ def test_compress_output_lands_in_source_dir(tmp_path):
             f.write(b"\x00" * 1024)
         return True
 
-    with patch("compress_video.compress_video", fake_compress):
+    with patch("tgstash.media.compression.compress_video", fake_compress):
         out = cv.maybe_compress_video(str(src), temp_files, True, 0, 28, tag=9001, threads=4)
     assert out == str(src.parent / "compressed_9001.mp4")
     assert temp_files == [str(src.parent / "compressed_9001.mp4")]
@@ -234,7 +234,7 @@ def test_compress_output_name_is_unique_per_message(tmp_path):
         src = batch / f"{mid}.mp4"
         src.write_bytes(bytes([mid]) * 2048)
         temp_files = []
-        with patch("compress_video.compress_video", _write_smaller):
+        with patch("tgstash.media.compression.compress_video", _write_smaller):
             outs.append(cv.maybe_compress_video(
                 str(src), temp_files, True, 0, 28, tag=mid, threads=4))
 
@@ -253,7 +253,7 @@ def test_media_group_two_videos_upload_distinct_files(monkeypatch, tmp_path, mak
 
     产物名固定时两条 InputMediaVideo 都指向后压的那一个，视频 A 的位置发出 B 的内容。
     """
-    from archive_entry import ROUTE_FORWARD, ArchiveItem, Entry
+    from tgstash.archive.entry import ROUTE_FORWARD, ArchiveItem, Entry
 
     # tdl 成功时整组文件都落在同一个 batch_dir —— 冲突的前提
     batch = tmp_path / "batch"

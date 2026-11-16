@@ -1,7 +1,7 @@
 """设计 C：心跳写入与 healthcheck 判定测试。"""
 import healthcheck
-import listener
 import pytest
+from tgstash.runtime import listener
 
 
 class TestWriteHeartbeat:

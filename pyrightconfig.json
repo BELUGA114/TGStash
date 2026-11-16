@@ -1,6 +1,5 @@
 {
-  // 扁平布局：stash-listener/ 与 scripts/ 不是包，靠 extraPaths 才 import 得到。
-  // pyproject.toml 里的 pythonpath 只管 pytest，pyright 不看那一处，两边要一起改
+  // tgstash 未安装到虚拟环境，类型检查需从源码目录解析；pytest 有独立配置。
   "include": ["stash-listener", "scripts", "test"],
   "extraPaths": ["stash-listener", "scripts"],
 

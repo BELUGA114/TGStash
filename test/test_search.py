@@ -1,6 +1,6 @@
-"""search.py 的链接拼装测试。私有频道 -100 前缀的处理容易写错，锁一下。"""
+"""tgstash.storage.search.py 的链接拼装测试。私有频道 -100 前缀的处理容易写错，锁一下。"""
 
-from search import archive_link, format_result
+from tgstash.storage.search import archive_link, format_result
 
 
 def test_private_channel_strips_100_prefix():

@@ -6,7 +6,7 @@ import asyncio
 import os
 from types import SimpleNamespace
 
-from tdl_downloader import TDLDownloader, make_tme_link
+from tgstash.media.downloader import TDLDownloader, make_tme_link
 
 
 def _msg(message_id, chat_id=-1001234567890):

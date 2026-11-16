@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from admin_operations import ROLLBACK_WARN_SPAN, DeletePreview, PendingDelete
-from db import PurgeSummary, RetrySummary, Stats
+from tgstash.bot.operations import ROLLBACK_WARN_SPAN, DeletePreview, PendingDelete
+from tgstash.storage.db import PurgeSummary, RetrySummary, Stats
 
 TELEGRAM_TEXT_LIMIT = 4096
 # 先显示总数，再限制明细，避免截断后连操作范围都看不见。

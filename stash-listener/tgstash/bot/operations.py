@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from db import ArchiveDB, ClearSummary, PurgeSummary, RetrySummary
+from tgstash.storage.db import ArchiveDB, ClearSummary, PurgeSummary, RetrySummary
 
 # 与离线删除工具使用同一警戒跨度；bot 通过预览确认表达知情选择。
 ROLLBACK_WARN_SPAN = 100

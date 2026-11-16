@@ -8,9 +8,9 @@
 import asyncio
 from types import SimpleNamespace
 
-import links
 import pytest
-from archive_entry import ROUTE_LINK, Entry, Outcome
+from tgstash.archive import links
+from tgstash.archive.entry import ROUTE_LINK, Entry, Outcome
 
 
 class TestExtractTmeLinks:

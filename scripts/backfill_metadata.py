@@ -24,10 +24,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "stash-listener"))
 
-from db import ArchiveDB
-from logging_setup import configure_logging
-from media_ops import get_media
-from origin import normalize_origin
+from tgstash.archive.origin import normalize_origin
+from tgstash.media.ops import get_media
+from tgstash.runtime.logging_setup import configure_logging
+from tgstash.storage.db import ArchiveDB
 
 # 每批拉取的消息数与批间等待秒数。账号安全优先，与主服务的保守取向一致
 BATCH_SIZE = 100

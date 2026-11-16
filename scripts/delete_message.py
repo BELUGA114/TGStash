@@ -35,7 +35,7 @@ import sqlite3
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stash-listener"))
-from db import ArchiveDB
+from tgstash.storage.db import ArchiveDB
 
 # 回退跨度超过这个值就拦下来要 --force。挑 100 的依据：默认 BATCH_SIZE=10、
 # SCAN_INTERVAL_SECONDS=300，100 条要重扫约 50 分钟，再大就该先确认是不是选错了行

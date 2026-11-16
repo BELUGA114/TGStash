@@ -4,10 +4,9 @@ import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
-import bootstrap
-import listener
 import pytest
-from runtime_config import ScanConfig
+from tgstash.runtime import bootstrap, listener
+from tgstash.runtime.config import ScanConfig
 
 
 class TestBuildBotClient:

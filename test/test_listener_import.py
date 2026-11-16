@@ -37,7 +37,7 @@ def test_import_needs_no_env_and_touches_no_disk(tmp_path):
 
 
 def test_build_runtime_creates_dirs_and_wires_pipeline(tmp_path, monkeypatch, runtime_config):
-    import bootstrap
+    from tgstash.runtime import bootstrap
 
     client = SimpleNamespace()
     monkeypatch.setattr(bootstrap, "build_client", lambda config, bot=False: None if bot else client)

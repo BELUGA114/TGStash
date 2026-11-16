@@ -2,17 +2,11 @@
 import asyncio
 from types import SimpleNamespace
 
-import admin_operations
-import bot_commands
-import bot_views
 import pytest
-from admin_operations import (
-    AdminOperations,
-    DeletePreview,
-    PendingClearAll,
-    PendingDelete,
-)
-from bot_commands import (
+from tgstash.bot import commands as bot_commands
+from tgstash.bot import operations as admin_operations
+from tgstash.bot import views as bot_views
+from tgstash.bot.commands import (
     BotContext,
     handle_callback,
     handle_message,
@@ -21,10 +15,16 @@ from bot_commands import (
     parse_delete_args,
     user_allowed,
 )
-from bot_pending import PendingStore
-from bot_views import format_delete_preview, format_purge
-from db import ClearSummary, PurgeSummary, RetrySummary, Stats
-from runtime_config import parse_admin_ids
+from tgstash.bot.operations import (
+    AdminOperations,
+    DeletePreview,
+    PendingClearAll,
+    PendingDelete,
+)
+from tgstash.bot.pending import PendingStore
+from tgstash.bot.views import format_delete_preview, format_purge
+from tgstash.runtime.config import parse_admin_ids
+from tgstash.storage.db import ClearSummary, PurgeSummary, RetrySummary, Stats
 
 ADMIN = 111
 
@@ -634,7 +634,7 @@ class TestPendingStore:
     def test_take_none_when_expired(self, monkeypatch):
         store: PendingStore[PendingDelete] = PendingStore(ttl_seconds=10)
         clock = [1000.0]
-        monkeypatch.setattr("bot_pending.time.monotonic", lambda: clock[0])
+        monkeypatch.setattr("tgstash.bot.pending.time.monotonic", lambda: clock[0])
         store.put(7, PendingDelete(found_ids=(100,), rollback=False), requester_id=111)
         clock[0] = 1011.0                                # 超过 ttl
 

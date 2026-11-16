@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from origin import (
+from tgstash.archive.origin import (
     ORIGIN_LINK,
     ORIGIN_ORIGINAL,
     normalize_origin,

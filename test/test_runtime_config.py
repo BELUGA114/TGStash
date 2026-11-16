@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from runtime_config import load_config
+from tgstash.runtime.config import load_config
 
 
 def test_runtime_defaults_and_channel_types(runtime_config):

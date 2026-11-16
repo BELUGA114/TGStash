@@ -6,7 +6,7 @@ import pytest
 
 @pytest.fixture
 def runtime_config(tmp_path, monkeypatch):
-    from runtime_config import load_config
+    from tgstash.runtime.config import load_config
 
     for name, value in {
         "TG_API_ID": "12345", "TG_API_HASH": "hash",
@@ -21,7 +21,7 @@ def runtime_config(tmp_path, monkeypatch):
 @pytest.fixture
 def make_pipeline(tmp_path):
     """测试冷却默认 0，避免真的等待；生产默认值只在 runtime_config.load_config 定义。"""
-    from pipeline import ArchivePipeline, PipelineConfig
+    from tgstash.archive.pipeline import ArchivePipeline, PipelineConfig
 
     async def _noop_mark(message, duplicate):
         return None

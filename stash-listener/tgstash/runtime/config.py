@@ -6,8 +6,8 @@ import logging
 import os
 from dataclasses import dataclass
 
-from backups import BackupConfig
-from pipeline import PipelineConfig
+from tgstash.archive.pipeline import PipelineConfig
+from tgstash.runtime.backups import BackupConfig
 
 logger = logging.getLogger(__name__)
 

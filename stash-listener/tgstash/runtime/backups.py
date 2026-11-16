@@ -6,8 +6,9 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from db import ArchiveDB
 from pyrogram.client import Client
+
+from tgstash.storage.db import ArchiveDB
 
 logger = logging.getLogger(__name__)
 
